@@ -246,6 +246,9 @@ include("test_multicomponent_widom.jl")
 # Include eKMC energy consistency test
 include("test_ekmc_energy_consistency.jl")
 
+# Electrostatics vs NIST SPC/E reference calculations (Ewald terms, LJ, tail; Wolf sanity)
+include("test_electrostatics_nist.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

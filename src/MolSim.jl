@@ -14,6 +14,7 @@ module MolSim
         include("MC/Observables.jl")
         include("MC/Widom.jl")
         include("MC/Molecules.jl")
+        include("MC/Electrostatics.jl")
         include("MC/Fluctuations.jl")
     include("MC/eKMC.jl")
         include("MC/MD.jl")
