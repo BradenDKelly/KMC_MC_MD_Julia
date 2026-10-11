@@ -70,6 +70,9 @@ end
 
 LJ parameters per site type (Lorentz–Berthelot mixing, same tables as `LJParams`), site-based cutoff
 `rc` shared by LJ and Coulomb, and the Coulomb model (`:none` or `:wolf` with damping `α`).
+`shift_lj=true` uses the cut-and-shifted LJ, u(r) − u(rc), which is continuous at rc so that the
+virial pressure needs no impulsive correction (the `:shifted` model of `LJParams`); the tail
+corrections are those of the truncated potential in both cases.
 Energies are in units of ϵ when the charges are reduced (q* = q/√(4πε₀ σ ϵ), ke = 1).
 """
 struct SiteForceField
@@ -84,18 +87,22 @@ struct SiteForceField
     wolf::WolfParams
     use_lrc::Bool
     cap_overlaps::Bool
+    shift_lj::Bool
+    u_rc_mix::Matrix{Float64}   # LJ value at rc per type pair (subtracted when shift_lj)
 end
 
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
                         coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
-                        use_lrc::Bool=true, cap_overlaps::Bool=true)
+                        use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false)
     coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
     σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
     rcap2 = (OVERLAP_R_REDUCED .* σ_mix) .^ 2
     ucap = OVERLAP_U_REDUCED .* ϵ_mix
     wp = WolfParams(α, rc, ke; model=:wolf)
+    u_rc = [4.0 * ϵ_mix[a, b] * ((σ_mix[a, b] / rc)^12 - (σ_mix[a, b] / rc)^6)
+            for a in 1:length(σ_types), b in 1:length(σ_types)]
     return SiteForceField(length(σ_types), σ_mix, ϵ_mix, rcap2, ucap, rc, rc * rc, coulomb, wp,
-                          use_lrc, cap_overlaps)
+                          use_lrc, cap_overlaps, shift_lj, u_rc)
 end
 
 # ============================================================================
@@ -114,7 +121,7 @@ and the conversion constants (`σ_angstrom`, `ϵ_kelvin`, `q_scale`): T* = T/ϵ_
 ρ* = ρ[Å⁻³] σ_angstrom³, q* = q[e]·q_scale. Default Wolf parameters from dev/wolf_parameter_scan.jl.
 """
 function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
-                    use_lrc::Bool=true, cap_overlaps::Bool=true)
+                    use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false)
     σ_A = 3.16555789
     ϵ_K = 78.19743111
     q_H = 0.42380
@@ -129,7 +136,8 @@ function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
                          [-2 * q_H * q_scale, q_H * q_scale, q_H * q_scale],
                          [15.9994, 1.00794, 1.00794])
     ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=:wolf,
-                        α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps)
+                        α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
+                        shift_lj=shift_lj)
     return (template=tmpl, ff=ff, σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=q_scale)
 end
 
@@ -336,6 +344,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
                 σ2 = ff.σ_mix[tyn, tym]^2
                 s6 = (σ2 / r2)^3
                 u += 4.0 * ff.ϵ_mix[tyn, tym] * (s6 * s6 - s6)
+                ff.shift_lj && (u -= ff.u_rc_mix[tyn, tym])
             end
             qm = tj.site_q[m]
             if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
@@ -382,6 +391,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
                 s6 = (σ2 / r2)^3
                 ϵ = ff.ϵ_mix[tyn, tym]
                 u += 4.0 * ϵ * (s6 * s6 - s6)
+                ff.shift_lj && (u -= ff.u_rc_mix[tyn, tym])
                 fr += 24.0 * ϵ * (2.0 * s6 * s6 - s6)
             end
             qm = tj.site_q[m]
@@ -693,7 +703,8 @@ end
 
 NVT (Pext === nothing) or NPT Metropolis MC. One sweep = n_mol translation + n_mol rotation
 attempts (+ one volume trial every `vol_every` sweeps in NPT). Returns block averages of U/N
-(pair + tail), P, ρ and, if requested, the Widom ⟨exp(−βΔU)⟩.
+(pair + tail), P, ρ, V and, if requested, the Widom ⟨exp(−βΔU)⟩ (`widom`) and ⟨V exp(−βΔU)⟩
+(`widomV`; in NPT βμ_ex = −ln(⟨V e^{−βΔU}⟩/⟨V⟩), Frenkel & Smit §7.2.1, Kelly thesis Eq. A.133).
 """
 function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
@@ -704,6 +715,7 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
     U = total_energy(sys, ff)
     ba_U = BlockAverager(block_size); ba_P = BlockAverager(block_size)
     ba_rho = BlockAverager(block_size); ba_w = BlockAverager(block_size)
+    ba_V = BlockAverager(block_size); ba_wV = BlockAverager(block_size)   # NPT Widom: <V e^{-βΔU}>/<V>
     for sweep in 1:sweeps
         for _ in 1:N
             i = rand(sys.rng, 1:N)
@@ -719,13 +731,17 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             Up, W = total_pair_energy_virial(sys, ff)
             push!(ba_U, (Up + lrc_energy(sys, ff)) / N)
             push!(ba_P, pressure(sys, ff, W))
-            push!(ba_rho, N / sys.L^3)
+            V = sys.L^3
+            push!(ba_rho, N / V)
+            push!(ba_V, V)
             if widom_template > 0 && widom_per_sample > 0
-                push!(ba_w, widom_rigid(sys, ff, widom_template; ninsert=widom_per_sample))
+                w = widom_rigid(sys, ff, widom_template; ninsert=widom_per_sample)
+                push!(ba_w, w)
+                push!(ba_wV, V * w)
             end
         end
     end
-    return (U=ba_U, P=ba_P, rho=ba_rho, widom=ba_w, stats=st)
+    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st)
 end
 
 # ============================================================================
@@ -740,7 +756,9 @@ and the total rate R, kept consistent after every event (Tan 2017 Appendix 1).
 """
 mutable struct RigidEKMCState
     pair_u::Matrix{Float64}
+    pair_w::Matrix{Float64}     # molecular pair virials R_ij·F_ij, kept alongside the energies
     phi::Vector{Float64}
+    wsum::Vector{Float64}       # Σ_j w_ij; total virial W = ½ Σ_i wsum_i
     m::Vector{Float64}
     R::Float64
     debug_check_every::Int
@@ -749,19 +767,24 @@ end
 
 function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every::Int=0)
     N = sys.n_mol
-    ek = RigidEKMCState(zeros(N, N), zeros(N), zeros(N), 0.0, debug_check_every, 0)
+    ek = RigidEKMCState(zeros(N, N), zeros(N, N), zeros(N), zeros(N), zeros(N), 0.0, debug_check_every, 0)
     rebuild_rigid_ekmc!(ek, sys, ff)
     return ek
 end
 
-"Recompute all pair energies, φ, mobilities and R from scratch."
+"Total molecular virial from the maintained pair virials."
+ekmc_virial(ek::RigidEKMCState) = 0.5 * sum(ek.wsum)
+
+"Recompute all pair energies and virials, φ, mobilities and R from scratch."
 function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
     N = sys.n_mol
-    fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0)
+    fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0); fill!(ek.pair_w, 0.0); fill!(ek.wsum, 0.0)
     for i in 1:N-1, j in i+1:N
-        u = pair_energy(sys, ff, i, j)
+        u, w = pair_energy_virial(sys, ff, i, j)
         ek.pair_u[i, j] = u; ek.pair_u[j, i] = u
+        ek.pair_w[i, j] = w; ek.pair_w[j, i] = w
         ek.phi[i] += u; ek.phi[j] += u
+        ek.wsum[i] += w; ek.wsum[j] += w
     end
     R = 0.0
     for i in 1:N
@@ -772,20 +795,22 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     return nothing
 end
 
-"Appendix-1 update after molecule k has been moved: row/column k, all φ_j, all mobilities, R."
+"Appendix-1 update after molecule k has been moved: row/column k of energies and virials, all φ_j, Σ_j w_ij, mobilities, R."
 function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, k::Int)
     N = sys.n_mol
     β = sys.β
-    phik = 0.0
+    phik = 0.0; wk = 0.0
     @inbounds for j in 1:N
         j == k && continue
-        u_old = ek.pair_u[k, j]
-        u_new = pair_energy(sys, ff, k, j)
+        u_old = ek.pair_u[k, j]; w_old = ek.pair_w[k, j]
+        u_new, w_new = pair_energy_virial(sys, ff, k, j)
         ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
+        ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
         ek.phi[j] += u_new - u_old
-        phik += u_new
+        ek.wsum[j] += w_new - w_old
+        phik += u_new; wk += w_new
     end
-    ek.phi[k] = phik
+    ek.phi[k] = phik; ek.wsum[k] = wk
     R = 0.0
     @inbounds for j in 1:N
         ek.m[j] = exp(β * ek.phi[j]); R += ek.m[j]
@@ -830,13 +855,53 @@ function rigid_ekmc_step!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceFie
     update_rigid_ekmc_after_move!(ek, sys, ff, k)
     ek.events += 1
     if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
-        phi_saved = copy(ek.phi); R_saved = ek.R
+        phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
         rebuild_rigid_ekmc!(ek, sys, ff)
         err = maximum(abs.(phi_saved .- ek.phi))
         relR = abs(R_saved - ek.R) / ek.R
-        (err > 1e-8 || relR > 1e-8) && @warn "rigid eKMC bookkeeping drift" err relR
+        errW = abs(W_saved - ekmc_virial(ek))
+        (err > 1e-8 || relR > 1e-8 || errW > 1e-8 * max(1.0, abs(W_saved))) &&
+            @warn "rigid eKMC bookkeeping drift" err relR errW
     end
     return dt
+end
+
+"""
+    rigid_ekmc_newton_volume_move!(ek, sys, ff, Pext, max_dV, P̄, slope)
+
+Volume update of Kelly (PhD thesis, Guelph 2020, §3.2 Eq. 3.3; Kelly & Smith, Mol. Phys. 117 (2019)
+2778): solve P̄(V) = P_set by a Newton step, ΔV = (P_set − P̄)/(dP̄/dV), with the block-averaged
+(kMC-time-weighted) pressure P̄ of the block just finished. Kelly estimates the slope from the two
+previous blocks; here `run_rigid_ekmc!` passes the running least-squares slope of P̄ against V over
+all blocks so far, which makes the gain nearly independent of the noise in the current P̄ (a
+two-point secant gain is correlated with that noise and shifted the fixed point by ≈ ±6 % in P for 32
+LJ diatomics, dev experiment 2026-10-11). Safeguards: if the slope is not negative (noise) the step
+falls back to the Tan auxiliary-pressure move, and during the full-gain phase |ΔV| is capped at
+`max_dV`. `gain` < 1 implements the Robbins–Monro stochastic-approximation schedule
+(H. Robbins, S. Monro, Ann. Math. Statist. 22 (1951) 400) that `run_rigid_ekmc!` applies after
+`vol_equil_moves`: a_k = 1/(k − k0 + 1), so the volume converges to the root of ⟨P̄⟩(V) = P_set with
+vanishing controller noise instead of random-walking around it. A capped, constant-gain step pins a
+median-like statistic of the skewed P̄ distribution (⟨P⟩ 8 % above P* for 64 SPC/E at T* = 12), and
+Tan's threshold rule has a Jensen bias (E[P̄/(P̄+P*)] = 1/2 ⇒ ⟨P̄⟩ > P* whenever P̄ fluctuates; ρ 35–60 %
+too high for 32 LJ diatomics).
+"""
+function rigid_ekmc_newton_volume_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField,
+                                        Pext::Float64, max_dV::Float64, P̄::Float64, slope::Float64;
+                                        gain::Float64=1.0)
+    V = sys.L^3
+    if !(slope < 0.0) || !isfinite(slope)
+        return rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV; p=P̄)
+    end
+    dV = gain * (Pext - P̄) / slope
+    # the cap is an equilibration safeguard; once the gain decays the step is small anyway
+    gain >= 1.0 && (dV = clamp(dV, -max_dV, max_dV))
+    V_new = V + dV
+    V_new > 0.0 || (V_new = 0.5 * V)
+    L_new = cbrt(V_new)
+    sys.com .*= L_new / sys.L
+    sys.L = L_new
+    rebuild_rigid_ekmc!(ek, sys, ff)
+    return P̄
 end
 
 "Time-weighted block averager: blocks of `block_events` events, block mean = Σ x Δt / Σ Δt."
@@ -868,15 +933,24 @@ function stderr(b::TimeWeightedBlockAverager)
 end
 
 """
-    rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV) -> P_before
+    rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV; p=nothing) -> p used
 
 Tan et al. (2017) Eq. 12 auxiliary-pressure volume move: p_aux = n (p + p*), expand by n ΔV_max if
 p > p_aux else contract; COMs are rescaled, orientations kept, everything rebuilt (Appendix 1).
+`p` is the pressure compared with p*: the instantaneous virial pressure if not given, or the
+kMC-time-weighted partial average since the previous volume move ("partial average pressure",
+Tan, Do, Nicholson, Mol. Phys. 114 (2016) 186) supplied by `run_rigid_ekmc!`. The instantaneous
+choice is biased: configurations at volume-move events follow the jump-chain (event) distribution,
+which over-weights short-lived overlapping states with large virial pressure, so the volume settles
+where the event-averaged pressure, not the time (Boltzmann) average, equals p* (dev experiment
+2026-10-11: ρ 18 % too low for an LJ diatomic at T* = 2, P* = 0.1).
 """
 function rigid_ekmc_volume_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField,
-                                 Pext::Float64, max_dV::Float64)
-    _, W = total_pair_energy_virial(sys, ff)
-    p = pressure(sys, ff, W)
+                                 Pext::Float64, max_dV::Float64; p::Union{Nothing,Float64}=nothing)
+    if p === nothing
+        _, W = total_pair_energy_virial(sys, ff)
+        p = pressure(sys, ff, W)
+    end
     n = rand(sys.rng)
     p_aux = n * (p + Pext)
     V = sys.L^3
@@ -891,44 +965,81 @@ end
 
 """
     run_rigid_ekmc!(sys, ff; events, Pext=nothing, max_dV=0.0, vol_every_sweeps=10,
-                    sample_every=10, block_events=1000, pressure_every=50*sample_every,
-                    debug_check_every=0)
+                    sample_every=10, block_events=1000, debug_check_every=0,
+                    adapt_dV_moves=0, adapt_dV_window=100,
+                    vol_pressure=:partial_average, vol_scheme=:newton,
+                    vol_equil_moves=200, burnin_events=0)
 
-NVT (Pext === nothing) or NPT eKMC. Observables are time-weighted (Tan 2017 Eq. 5) with the
-residence time of the sampled configuration. U is taken from the maintained molecular energies
-(U = ½ Σ φ_i, free) every `sample_every` events; the pressure needs the O(N²) virial and is sampled
-every `pressure_every` events (its blocks hold `block_events ÷ pressure_every` samples). Returns block averages of U/N (pair + tail), P, ρ,
+NVT (Pext === nothing) or NPT eKMC. In NPT a volume move is made every `vol_every_sweeps`·N events
+with maximum change `max_dV`, using the kMC-time-weighted block average of the virial pressure over
+every event since the previous volume move (`vol_pressure = :partial_average`, Tan 2016;
+`:instantaneous` reproduces the biased variant, see `rigid_ekmc_volume_move!`). The virial is
+maintained incrementally with the pair energies, so the pressure costs nothing per event. With
+`vol_scheme = :newton` the first `vol_equil_moves` volume moves use the full Newton gain (capped at
+`max_dV`), after which the Robbins–Monro gain 1/(k − k0 + 1) lets the volume converge; observables
+are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N). `vol_scheme = :newton` (default) applies Kelly's secant
+update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
+threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
+half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
+volume moves during the first `adapt_dV_moves` moves (Tan 2017 Appendix 4). Use it only as a short
+burn-in and read the final value from `max_dV` in the result: because the volume walk's spread is
+itself set by ΔV_max, the feedback shrinks ΔV_max towards zero if left on (dev experiment
+2026-10-11: 10.4 → 0.01 in 15 windows). Observables are time-weighted (Tan 2017 Eq. 5)
+with the residence time of the sampled configuration. U = ½ Σ φ_i and W = ½ Σ_i Σ_j w_ij come from the
+maintained pair matrices, so U, P and ρ are all sampled every `sample_every` events for free. Returns block averages of U/N (pair + tail), P, ρ,
 the NVT chemical-potential accumulator (μ_ex = `mu_ex(acc, T)`), blocked R/N (`RN`, for
-μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`).
+μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`)
+plus blocked (R/N)/V (`RNV`) and V (`V`) so that μ_res = T ln(mean(RNV)·mean(V)) has a block error.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
-                         pressure_every::Int=50 * sample_every, debug_check_every::Int=0)
+                         debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
+                         vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
+                         vol_equil_moves::Int=200, burnin_events::Int=0)
     N = sys.n_mol
+    vol_pressure in (:partial_average, :instantaneous) ||
+        error("run_rigid_ekmc!: vol_pressure must be :partial_average or :instantaneous")
+    vol_scheme in (:newton, :auxiliary) ||
+        error("run_rigid_ekmc!: vol_scheme must be :newton (Kelly 2020 Eq. 3.3) or :auxiliary (Tan 2017 Eq. 12)")
+    # running least-squares regression of the block pressure P̄ on V for the Newton slope
+    reg_n = 0; reg_V = 0.0; reg_P = 0.0; reg_VV = 0.0; reg_VP = 0.0
+    p_part_sum = 0.0; p_part_t = 0.0
     ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every)
     acc = ChemicalPotentialAccumulator()
     acc_npt = NPTChemicalPotentialAccumulator()
     ba_U = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_P = TimeWeightedBlockAverager(max(1, block_events ÷ pressure_every))
+    ba_P = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_rho = TimeWeightedBlockAverager(block_events ÷ sample_every)
+    ba_V = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_RN = TimeWeightedBlockAverager(block_events ÷ sample_every)   # R/N for blocked μ errors
+    ba_RNV = TimeWeightedBlockAverager(block_events ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
     t_total = 0.0
+    # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`
+    # moves set ΔV_max to half the standard deviation of the kMC-time-weighted volume histogram
+    vol_moves = 0
+    t_since_vol = 0.0
+    win_V = Float64[]; win_t = Float64[]
+    max_dV_current = max_dV
+    dV_history = Float64[]
     for ev in 1:events
-        if ev % sample_every == 0
-            # weight of the current configuration: draw its Δt here and reuse it in the step
-            R = ek.R
-            u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
-            dt = log(1 / u) / R
-            V = sys.L^3
+        # weight of the current configuration: draw its Δt here and reuse it in the step
+        R = ek.R
+        u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
+        dt = log(1 / u) / R
+        V = sys.L^3
+        if Pext !== nothing
+            # pressure is free from the maintained virial; time-weight it over every event of the block
+            p_part_sum += pressure(sys, ff, ekmc_virial(ek)) * dt; p_part_t += dt
+        end
+        if ev % sample_every == 0 && ev > burnin_events
             Up = 0.5 * sum(ek.phi)
             push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
-            if ev % pressure_every == 0
-                _, W = total_pair_energy_virial(sys, ff)
-                push!(ba_P, pressure(sys, ff, W), dt)
-            end
+            push!(ba_P, pressure(sys, ff, ekmc_virial(ek)), dt)
             push!(ba_rho, N / V, dt)
+            push!(ba_V, V, dt)
             push!(ba_RN, R / N, dt)
+            push!(ba_RNV, R / N / V, dt)
             push!(acc_npt, R / N, V, dt)
             # perform the event with this dt (same statistics as rigid_ekmc_step!)
             acc.t_total += dt; RN = R / N
@@ -938,14 +1049,56 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
                           uniform_random_quaternion(sys.rng))
             update_rigid_ekmc_after_move!(ek, sys, ff, k)
-            ek.events += 1
-            t_total += dt
         else
-            t_total += rigid_ekmc_step!(ek, sys, ff, acc)
+            if ev > burnin_events
+                acc.t_total += dt; RN = R / N
+                acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
+            end
+            k = select_by_mobility(ek, sys.rng)
+            L = sys.L
+            set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
+                          uniform_random_quaternion(sys.rng))
+            update_rigid_ekmc_after_move!(ek, sys, ff, k)
+        end
+        ek.events += 1
+        t_total += dt
+        t_since_vol += dt
+        if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
+            phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
+            rebuild_rigid_ekmc!(ek, sys, ff)
+            (maximum(abs.(phi_saved .- ek.phi)) > 1e-8 || abs(R_saved - ek.R) / ek.R > 1e-8 ||
+             abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))) &&
+                @warn "rigid eKMC bookkeeping drift" maximum(abs.(phi_saved .- ek.phi)) abs(R_saved - ek.R) / ek.R
         end
         if Pext !== nothing && ev % (vol_every_sweeps * N) == 0
-            rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV)
+            if vol_moves < adapt_dV_moves
+                push!(win_V, sys.L^3); push!(win_t, t_since_vol)
+                if length(win_V) >= adapt_dV_window
+                    tw = sum(win_t)
+                    mV = sum(win_V .* win_t) / tw
+                    sdV = sqrt(max(sum(((win_V .- mV) .^ 2) .* win_t) / tw, 0.0))
+                    sdV > 0.0 && (max_dV_current = 0.5 * sdV)
+                    push!(dV_history, max_dV_current)
+                    empty!(win_V); empty!(win_t)
+                end
+            end
+            t_since_vol = 0.0
+            p_cmp = (vol_pressure === :partial_average && p_part_t > 0.0) ? p_part_sum / p_part_t : nothing
+            if vol_scheme === :newton && p_cmp !== nothing
+                V_now = sys.L^3
+                reg_n += 1; reg_V += V_now; reg_P += p_cmp; reg_VV += V_now * V_now; reg_VP += V_now * p_cmp
+                var = reg_VV - reg_V * reg_V / reg_n
+                slope = (reg_n >= 2 && var > 0.0) ? (reg_VP - reg_V * reg_P / reg_n) / var : NaN
+                # Robbins–Monro gain after the full-gain equilibration phase: a_k = 1/(k − k0 + 1)
+                gain = vol_moves < vol_equil_moves ? 1.0 : 1.0 / (vol_moves - vol_equil_moves + 1)
+                rigid_ekmc_newton_volume_move!(ek, sys, ff, Pext, max_dV_current, p_cmp, slope; gain=gain)
+            else
+                rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV_current; p=p_cmp)
+            end
+            p_part_sum = 0.0; p_part_t = 0.0
+            vol_moves += 1
         end
     end
-    return (U=ba_U, P=ba_P, rho=ba_rho, RN=ba_RN, mu=acc, mu_npt=acc_npt, t_total=t_total, ek=ek)
+    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, RN=ba_RN, RNV=ba_RNV, mu=acc, mu_npt=acc_npt,
+            t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history)
 end

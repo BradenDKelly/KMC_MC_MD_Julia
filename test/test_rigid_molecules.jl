@@ -199,3 +199,131 @@ if get(ENV, "MOLSIM_SLOW_TESTS", "0") == "1"
         @test within3σ(r.μ_widom, r.eμ_widom, r.μ_ek, r.eμ_ek)
     end
 end
+
+# ============================================================================
+# NPT eKMC for rigid molecules
+# ============================================================================
+
+@testset "NPT eKMC volume moves keep the pair bookkeeping consistent" begin
+    tmpl, ff = lj_diatomic_model()
+    N = 32
+    sys = MCm.RigidSystem([tmpl], fill(1, N), cbrt(N / 0.3), 1 / 2.5, Xoshiro(9))
+    MCm.random_rigid_system!(sys, ff)
+    ek = MCm.init_rigid_ekmc(sys, ff)
+    # maintained virial equals the direct one
+    _, W = MCm.total_pair_energy_virial(sys, ff)
+    @test abs(MCm.ekmc_virial(ek) - W) <= 1e-10 * max(1.0, abs(W))
+    acc = MCm.ChemicalPotentialAccumulator()
+    V0 = sys.L^3
+    for trial in 1:20
+        for _ in 1:50
+            MCm.rigid_ekmc_step!(ek, sys, ff, acc)
+        end
+        if isodd(trial)
+            MCm.rigid_ekmc_volume_move!(ek, sys, ff, 0.5, 0.05 * V0)          # Tan Eq. 12 rule
+        else
+            p̄ = MCm.pressure(sys, ff, MCm.ekmc_virial(ek))
+            MCm.rigid_ekmc_newton_volume_move!(ek, sys, ff, 0.5, 0.05 * V0, p̄, -1.0)   # Kelly Eq. 3.3 step
+        end
+        @test all(0.0 .<= sys.com .< sys.L)
+        phi = copy(ek.phi); wsum = copy(ek.wsum); R = ek.R
+        MCm.rebuild_rigid_ekmc!(ek, sys, ff)
+        @test maximum(abs.(phi .- ek.phi)) <= 1e-9 * max(1.0, maximum(abs.(ek.phi)))
+        @test maximum(abs.(wsum .- ek.wsum)) <= 1e-9 * max(1.0, maximum(abs.(ek.wsum)))
+        @test abs(R - ek.R) / ek.R <= 1e-9
+        Udirect = MCm.total_pair_energy(sys, ff)
+        @test abs(0.5 * sum(ek.phi) - Udirect) <= 1e-9 * max(1.0, abs(Udirect))
+    end
+end
+
+function mc_vs_ekmc_npt(templates, ff, N, T, Pext, seed; δ, δθ, equil_sweeps, sweeps, events,
+                        ρ0=0.3, vol_every_sweeps=10, sample_every=20, widom_per_sample=50)
+    sys = MCm.RigidSystem(templates, fill(1, N), cbrt(N / ρ0), 1 / T, Xoshiro(seed))
+    MCm.random_rigid_system!(sys, ff)
+    st = MCm.RigidMCStats()
+    for _ in 1:equil_sweeps
+        for _ in 1:N
+            MCm.mc_translate!(sys, ff, rand(sys.rng, 1:N), δ, st)
+            MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:N), δθ, st)
+        end
+        U = MCm.total_energy(sys, ff)
+        MCm.mc_volume_trial!(sys, ff, Pext, 0.1, st; U_current=U)
+    end
+    mc = MCm.run_rigid_mc!(deepcopy(sys), ff; sweeps=sweeps, δ=δ, δθ=δθ, Pext=Pext, max_dlnV=0.1,
+                           vol_every=1, sample_every=1, block_size=max(10, sweeps ÷ 40),
+                           widom_template=1, widom_per_sample=widom_per_sample)
+    V0 = sys.L^3
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=events, Pext=Pext, max_dV=0.05 * V0,
+                             vol_every_sweeps=vol_every_sweeps, sample_every=sample_every,
+                             block_events=events ÷ 25, debug_check_every=events ÷ 10)
+    V̄ = MCm.mean(mc.V); wV, ewV = MCm.mean(mc.widomV), MCm.stderr(mc.widomV)
+    rnv, ernv = MCm.mean(ek.RNV), MCm.stderr(ek.RNV)
+    Vm, eVm = MCm.mean(ek.V), MCm.stderr(ek.V)
+    return (rho_mc=MCm.mean(mc.rho), erho_mc=MCm.stderr(mc.rho), rho_ek=MCm.mean(ek.rho), erho_ek=MCm.stderr(ek.rho),
+            U_mc=MCm.mean(mc.U), eU_mc=MCm.stderr(mc.U), U_ek=MCm.mean(ek.U), eU_ek=MCm.stderr(ek.U),
+            P_mc=MCm.mean(mc.P), eP_mc=MCm.stderr(mc.P), P_ek=MCm.mean(ek.P), eP_ek=MCm.stderr(ek.P),
+            μ_widom=-T * log(wV / V̄), eμ_widom=T * ewV / wV,
+            μ_ek=T * log(rnv * Vm), eμ_ek=T * sqrt((ernv / rnv)^2 + (eVm / Vm)^2),
+            μ_ek_acc=MCm.mu_ex_npt(ek.mu_npt, T), vol_moves=ek.vol_moves)
+end
+
+@testset "Rigid LJ diatomic NPT: Metropolis MC vs eKMC (ρ, U, P) and NPT Widom vs Eq. A.132 μ" begin
+    # Cut-and-shifted LJ sites, no tail correction: the virial pressure is then exact, so <P> = P*
+    # in MC (the truncated-potential impulsive term and the energy-tail/virial-tail route
+    # inconsistency in NPT acceptance are both avoided; cf. repo commit e3eea0d for atoms).
+    # Supercritical state T* = 4, P* = 1 (dev experiment 2026-10-11: ρ* ≈ 0.21, both methods converge).
+    tmpl, ff = lj_diatomic_model()
+    ff = MCm.SiteForceField([1.0], [1.0]; rc=2.5, coulomb=:none, shift_lj=true, use_lrc=false)
+    T = 4.0; Pext = 1.0
+    r = mc_vs_ekmc_npt([tmpl], ff, 32, T, Pext, 3; δ=0.2, δθ=0.5, equil_sweeps=600, sweeps=4000,
+                       events=4_000_000)
+    @info "LJ diatomic NPT N=32 T*=4 P*=1" r
+    @test within3σ(r.P_mc, r.eP_mc, Pext, 0.0)            # MC NPT self-consistency
+    @test within3σ(r.P_ek, r.eP_ek, Pext, 0.0)            # eKMC volume controller pins <P> = P*
+    @test within3σ(r.rho_mc, r.erho_mc, r.rho_ek, r.erho_ek)
+    @test within3σ(r.U_mc, r.eU_mc, r.U_ek, r.eU_ek)
+    @test within3σ(r.μ_widom, r.eμ_widom, r.μ_ek, r.eμ_ek)
+    @test abs(r.μ_ek_acc - r.μ_ek) <= 3 * r.eμ_ek
+    @test r.vol_moves == 4_000_000 ÷ (10 * 32)
+end
+
+if get(ENV, "MOLSIM_SLOW_TESTS", "0") == "1"
+    @testset "SPC/E (Wolf) NPT, supercritical: Metropolis MC vs eKMC (slow)" begin
+        # N = 64, T* = 12 (938 K), P* = 3.0, cut-and-shifted LJ, no tail, Wolf r_c = 4.5 Å.
+        # Dev experiment 2026-10-11: MC ρ 0.3884(62), U/N −29.33(38), P 3.04(8), μ −12.46(36);
+        # eKMC (Newton + Robbins–Monro) ρ 0.3869, U/N −29.31(7), P 2.90(5), μ −13.28(7).
+        # The eKMC density after the Robbins–Monro phase has a controller uncertainty that the block
+        # error does not capture, so ρ is compared with the MC error only (DESIGN.md §3c, open item:
+        # a balanced volume move for eKMC).
+        m = MCm.spce_model(; rc_angstrom=4.5, use_lrc=false, shift_lj=true)
+        T = 12.0; Pext = 3.0; N = 64; events = 10_000_000
+        burn = 200 * 10 * N + events ÷ 5
+        sys = MCm.RigidSystem([m.template], fill(1, N), cbrt(N / 0.3), 1 / T, Xoshiro(7))
+        MCm.random_rigid_system!(sys, m.ff)
+        st = MCm.RigidMCStats()
+        for _ in 1:600
+            for _ in 1:N
+                MCm.mc_translate!(sys, m.ff, rand(sys.rng, 1:N), 0.15, st)
+                MCm.mc_rotate!(sys, m.ff, rand(sys.rng, 1:N), 0.4, st)
+            end
+            U = MCm.total_energy(sys, m.ff)
+            MCm.mc_volume_trial!(sys, m.ff, Pext, 0.1, st; U_current=U)
+        end
+        mc = MCm.run_rigid_mc!(deepcopy(sys), m.ff; sweeps=6000, δ=0.15, δθ=0.4, Pext=Pext, max_dlnV=0.1,
+                               vol_every=1, sample_every=1, block_size=150, widom_template=1, widom_per_sample=50)
+        V0 = sys.L^3
+        ek = MCm.run_rigid_ekmc!(sys, m.ff; events=events, Pext=Pext, max_dV=0.05 * V0, vol_every_sweeps=10,
+                                 sample_every=20, block_events=(events - burn) ÷ 25, vol_equil_moves=200,
+                                 burnin_events=burn, debug_check_every=events ÷ 10)
+        V̄ = MCm.mean(mc.V); wV, ewV = MCm.mean(mc.widomV), MCm.stderr(mc.widomV)
+        rnv, ernv = MCm.mean(ek.RNV), MCm.stderr(ek.RNV); Vm, eVm = MCm.mean(ek.V), MCm.stderr(ek.V)
+        μ_mc, eμ_mc = -T * log(wV / V̄), T * ewV / wV
+        μ_ek, eμ_ek = T * log(rnv * Vm), T * sqrt((ernv / rnv)^2 + (eVm / Vm)^2)
+        @info "SPC/E NPT N=64 T*=12 P*=3" MCm.mean(mc.rho) MCm.stderr(mc.rho) MCm.mean(ek.rho) MCm.mean(mc.U) MCm.stderr(mc.U) MCm.mean(ek.U) MCm.stderr(ek.U) MCm.mean(mc.P) MCm.stderr(mc.P) MCm.mean(ek.P) MCm.stderr(ek.P) μ_mc eμ_mc μ_ek eμ_ek
+        @test within3σ(MCm.mean(mc.P), MCm.stderr(mc.P), Pext, 0.0)
+        @test within3σ(MCm.mean(ek.P), MCm.stderr(ek.P), Pext, 0.0)
+        @test abs(MCm.mean(mc.rho) - MCm.mean(ek.rho)) <= 3 * MCm.stderr(mc.rho)
+        @test within3σ(MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(ek.U), MCm.stderr(ek.U))
+        @test within3σ(μ_mc, eμ_mc, μ_ek, eμ_ek)
+    end
+end
