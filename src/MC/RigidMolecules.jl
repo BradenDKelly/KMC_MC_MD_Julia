@@ -1,0 +1,951 @@
+"""
+RigidMolecules.jl — rigid, site-based molecules (LJ sites + partial charges) for Metropolis MC and
+for the equilibrium kinetic Monte Carlo (eKMC) scheme of Ustinov & Do / Tan et al.
+
+Additive module: `Molecules.jl` (CBMC/GCMC) is untouched; this file reuses its quaternion helpers
+(`quaternion_to_rotation_matrix`, `uniform_random_quaternion`) and the accumulators of `eKMC.jl`.
+
+Physics and provenance
+- Energy: U = Σ_{i<j} u_ij over molecule pairs, u_ij = Σ_{n∈i, m∈j} [LJ(r^{nm}) + Coulomb(r^{nm})] with a
+  site-based spherical cutoff r_c on every site pair; intramolecular terms are excluded (rigid).
+  Site vectors are built from the minimum-image COM separation plus body offsets, so a molecule is
+  never split between images (Allen & Tildesley, Computer Simulation of Liquids, §1.5/§5.2).
+- Coulomb: Wolf damped shifted potential with self and intramolecular-exclusion terms
+  (`Electrostatics.jl`; parameters by the Hens & Vlugt 2018 protocol, see dev/wolf_parameter_scan.jl).
+- Overlap rule (molecule-pair level, Tan et al. CEJ 316 (2017) Appendix 2; Kelly thesis 2020 §3.5):
+  if any LJ site pair is closer than r* = `OVERLAP_R_REDUCED`·σ_ab the whole molecule pair energy is
+  set to `OVERLAP_U_REDUCED`·ε_ab (the LJ eKMC uses the same constants).
+- Tail corrections: per site-species pair, U_tail = Σ_ab (8π/3)(N_a N_b/V) ε_ab σ_ab³ [(σ_ab/r_c)⁹/3 −
+  (σ_ab/r_c)³], P_tail = Σ_ab (16π/3)(N_a N_b/V²) ε_ab σ_ab³ [2(σ_ab/r_c)⁹/3 − (σ_ab/r_c)³]
+  (Allen & Tildesley Eqs. 2.136–2.137 summed over species; reduces to `LJLongRange.jl`).
+- Pressure: molecular virial, W = Σ_{i<j} R_ij · F_ij = Σ_{i<j} Σ_{nm} (R_ij · r^{nm}/|r^{nm}|)(−du/dr)
+  (Tan 2017 Eq. A3.3b; Allen & Tildesley Eq. 2.63), P = N_mol k T / V + W/(3V) + P_tail.
+- eKMC: mobility v_i = exp(β u_i) with u_i the removal energy of molecule i, total rate R = Σ v_i,
+  residence time Δt = ln(1/ξ)/R, Rosenbluth selection, the selected molecule is placed at a uniform
+  random position with a uniform random orientation (Shoemake quaternion) — Tan et al. CEJ 316 (2017)
+  §2.1–2.2 and Appendix 1; μ_ex = kT ln⟨R/N⟩ (Eq. 8); NPT via the auxiliary pressure (Eq. 12) and the
+  NPT reverse-Widom μ of Kelly's thesis Eq. (A.132).
+- Metropolis MC counterpart (for cross-validation): small translations, small rotations about a
+  random axis (symmetric proposal, Allen & Tildesley §4.7), uniform reorientations, ln V volume moves
+  (Frenkel & Smit §5.4.2), Widom insertion of a rigid molecule with uniform orientation (F&S §7.2.1).
+"""
+
+using Random
+using StaticArrays
+using LinearAlgebra: norm, cross, dot
+
+# ============================================================================
+# Templates and force field
+# ============================================================================
+
+"""
+    RigidTemplate(name, sites_body, site_type, site_q, site_mass)
+
+Rigid molecule: body-frame site coordinates (3 × n, relative to the centre of mass), LJ type per site
+(0 = no LJ site), partial charge and mass per site. The constructor re-centres the sites on the COM.
+"""
+struct RigidTemplate
+    name::String
+    n_sites::Int
+    sites_body::Matrix{Float64}
+    site_type::Vector{Int}
+    site_q::Vector{Float64}
+    site_mass::Vector{Float64}
+    function RigidTemplate(name::String, sites_body::Matrix{Float64}, site_type::Vector{Int},
+                           site_q::Vector{Float64}, site_mass::Vector{Float64})
+        n = size(sites_body, 2)
+        length(site_type) == n && length(site_q) == n && length(site_mass) == n ||
+            error("RigidTemplate: inconsistent site counts")
+        mtot = sum(site_mass)
+        mtot > 0.0 || error("RigidTemplate: total mass must be positive")
+        com = sites_body * site_mass ./ mtot
+        sb = sites_body .- com
+        new(name, n, sb, copy(site_type), copy(site_q), copy(site_mass))
+    end
+end
+
+"""
+    SiteForceField(σ_types, ϵ_types; rc, coulomb=:none, α=0.0, ke=1.0, use_lrc=true,
+                   cap_overlaps=true)
+
+LJ parameters per site type (Lorentz–Berthelot mixing, same tables as `LJParams`), site-based cutoff
+`rc` shared by LJ and Coulomb, and the Coulomb model (`:none` or `:wolf` with damping `α`).
+Energies are in units of ϵ when the charges are reduced (q* = q/√(4πε₀ σ ϵ), ke = 1).
+"""
+struct SiteForceField
+    n_types::Int
+    σ_mix::Matrix{Float64}
+    ϵ_mix::Matrix{Float64}
+    rcap2_mix::Matrix{Float64}
+    ucap_mix::Matrix{Float64}
+    rc::Float64
+    rc2::Float64
+    coulomb::Symbol
+    wolf::WolfParams
+    use_lrc::Bool
+    cap_overlaps::Bool
+end
+
+function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
+                        coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
+                        use_lrc::Bool=true, cap_overlaps::Bool=true)
+    coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
+    σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
+    rcap2 = (OVERLAP_R_REDUCED .* σ_mix) .^ 2
+    ucap = OVERLAP_U_REDUCED .* ϵ_mix
+    wp = WolfParams(α, rc, ke; model=:wolf)
+    return SiteForceField(length(σ_types), σ_mix, ϵ_mix, rcap2, ucap, rc, rc * rc, coulomb, wp,
+                          use_lrc, cap_overlaps)
+end
+
+# ============================================================================
+# SPC/E in reduced units
+# ============================================================================
+
+"Coulomb constant e²/(4π ε₀ k_B) in K·Å (CODATA 2010, as on the NIST SPC/E pages)."
+const KE_K_ANGSTROM_CODATA2010 = (1.602176565e-19)^2 / (4π * 8.854187817e-12 * 1.3806488e-23) * 1e10
+
+"""
+    spce_model(; α_per_angstrom=0.16, rc_angstrom=10.0)
+
+SPC/E water (Berendsen, Grigera, Straatsma, J. Phys. Chem. 91 (1987) 6269; NIST parameter values) in
+reduced units with σ_OO = ϵ_OO = k_B = 1. Returns a NamedTuple with the template, the force field,
+and the conversion constants (`σ_angstrom`, `ϵ_kelvin`, `q_scale`): T* = T/ϵ_kelvin,
+ρ* = ρ[Å⁻³] σ_angstrom³, q* = q[e]·q_scale. Default Wolf parameters from dev/wolf_parameter_scan.jl.
+"""
+function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
+                    use_lrc::Bool=true, cap_overlaps::Bool=true)
+    σ_A = 3.16555789
+    ϵ_K = 78.19743111
+    q_H = 0.42380
+    q_scale = sqrt(KE_K_ANGSTROM_CODATA2010 / (ϵ_K * σ_A))   # q* = q · q_scale, so ke* = 1
+    θ = 109.47 * π / 180
+    r_OH = 1.0 / σ_A
+    sites = zeros(Float64, 3, 3)
+    sites[:, 1] .= (0.0, 0.0, 0.0)                                   # O
+    sites[:, 2] .= (r_OH * sin(θ / 2), r_OH * cos(θ / 2), 0.0)       # H1
+    sites[:, 3] .= (-r_OH * sin(θ / 2), r_OH * cos(θ / 2), 0.0)      # H2
+    tmpl = RigidTemplate("SPC/E", sites, [1, 0, 0],
+                         [-2 * q_H * q_scale, q_H * q_scale, q_H * q_scale],
+                         [15.9994, 1.00794, 1.00794])
+    ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=:wolf,
+                        α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps)
+    return (template=tmpl, ff=ff, σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=q_scale)
+end
+
+# ============================================================================
+# System state
+# ============================================================================
+
+"""
+    RigidSystem
+
+`n_mol` rigid molecules in a cubic box of side `L`: COM positions (wrapped to [0, L)), orientation
+quaternions (w, x, y, z), and the rotated body offsets of every site (`site_off`, 3 × n_sites).
+`site_start[i]` is the index of the site before the first site of molecule i.
+"""
+mutable struct RigidSystem
+    n_mol::Int
+    L::Float64
+    β::Float64
+    templates::Vector{RigidTemplate}
+    tmpl::Vector{Int}
+    com::Matrix{Float64}
+    quat::Matrix{Float64}
+    site_off::Matrix{Float64}
+    site_start::Vector{Int}
+    n_sites_total::Int
+    rng::Xoshiro
+end
+
+function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Float64, β::Float64,
+                     rng::Xoshiro)
+    n_mol = length(tmpl)
+    site_start = zeros(Int, n_mol)
+    n = 0
+    for i in 1:n_mol
+        site_start[i] = n
+        n += templates[tmpl[i]].n_sites
+    end
+    sys = RigidSystem(n_mol, L, β, templates, copy(tmpl), zeros(3, n_mol), zeros(4, n_mol),
+                      zeros(3, n), site_start, n, rng)
+    for i in 1:n_mol
+        sys.quat[1, i] = 1.0
+        update_site_offsets!(sys, i)
+    end
+    return sys
+end
+
+"Rotate the body-frame sites of molecule i into the lab frame (offsets from the COM)."
+function update_site_offsets!(sys::RigidSystem, i::Int)
+    t = sys.templates[sys.tmpl[i]]
+    R = quaternion_to_rotation_matrix(view(sys.quat, :, i))
+    s0 = sys.site_start[i]
+    @inbounds for n in 1:t.n_sites
+        bx, by, bz = t.sites_body[1, n], t.sites_body[2, n], t.sites_body[3, n]
+        sys.site_off[1, s0 + n] = R[1, 1] * bx + R[1, 2] * by + R[1, 3] * bz
+        sys.site_off[2, s0 + n] = R[2, 1] * bx + R[2, 2] * by + R[2, 3] * bz
+        sys.site_off[3, s0 + n] = R[3, 1] * bx + R[3, 2] * by + R[3, 3] * bz
+    end
+    return nothing
+end
+
+@inline function _wrap01(x::Float64, L::Float64)
+    x -= L * floor(x / L)
+    return x >= L ? x - L : x
+end
+
+"Set COM (wrapped) and orientation of molecule i."
+function set_molecule!(sys::RigidSystem, i::Int, com::AbstractVector{Float64}, q::AbstractVector{Float64})
+    L = sys.L
+    @inbounds begin
+        sys.com[1, i] = _wrap01(com[1], L)
+        sys.com[2, i] = _wrap01(com[2], L)
+        sys.com[3, i] = _wrap01(com[3], L)
+        nq = sqrt(q[1]^2 + q[2]^2 + q[3]^2 + q[4]^2)
+        sys.quat[1, i] = q[1] / nq; sys.quat[2, i] = q[2] / nq
+        sys.quat[3, i] = q[3] / nq; sys.quat[4, i] = q[4] / nq
+    end
+    update_site_offsets!(sys, i)
+    return nothing
+end
+
+"Lab-frame site positions (3 × n_sites_total), COM + offset, not wrapped."
+function site_positions(sys::RigidSystem)
+    pos = similar(sys.site_off)
+    @inbounds for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]
+        for n in 1:t.n_sites
+            s = sys.site_start[i] + n
+            pos[1, s] = sys.com[1, i] + sys.site_off[1, s]
+            pos[2, s] = sys.com[2, i] + sys.site_off[2, s]
+            pos[3, s] = sys.com[3, i] + sys.site_off[3, s]
+        end
+    end
+    return pos
+end
+
+"Flat site arrays (pos, q, mol, σ, ϵ) for the routines in Electrostatics.jl (single LJ type per site)."
+function site_arrays(sys::RigidSystem, ff::SiteForceField)
+    pos = site_positions(sys)
+    n = sys.n_sites_total
+    q = zeros(n); mol = zeros(Int, n); σ = zeros(n); ϵ = zeros(n)
+    for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]
+        for k in 1:t.n_sites
+            s = sys.site_start[i] + k
+            q[s] = t.site_q[k]; mol[s] = i
+            ty = t.site_type[k]
+            if ty > 0
+                σ[s] = ff.σ_mix[ty, ty]; ϵ[s] = ff.ϵ_mix[ty, ty]
+            end
+        end
+    end
+    return pos, q, mol, σ, ϵ
+end
+
+"""
+    quaternion_from_rotation_matrix(R)
+
+Unit quaternion (w, x, y, z) of a proper rotation matrix (Shepperd's method).
+"""
+function quaternion_from_rotation_matrix(R::AbstractMatrix{Float64})
+    tr = R[1, 1] + R[2, 2] + R[3, 3]
+    if tr > 0
+        s = sqrt(tr + 1.0) * 2
+        w = 0.25 * s; x = (R[3, 2] - R[2, 3]) / s; y = (R[1, 3] - R[3, 1]) / s; z = (R[2, 1] - R[1, 2]) / s
+    elseif R[1, 1] > R[2, 2] && R[1, 1] > R[3, 3]
+        s = sqrt(1.0 + R[1, 1] - R[2, 2] - R[3, 3]) * 2
+        w = (R[3, 2] - R[2, 3]) / s; x = 0.25 * s; y = (R[1, 2] + R[2, 1]) / s; z = (R[1, 3] + R[3, 1]) / s
+    elseif R[2, 2] > R[3, 3]
+        s = sqrt(1.0 + R[2, 2] - R[1, 1] - R[3, 3]) * 2
+        w = (R[1, 3] - R[3, 1]) / s; x = (R[1, 2] + R[2, 1]) / s; y = 0.25 * s; z = (R[2, 3] + R[3, 2]) / s
+    else
+        s = sqrt(1.0 + R[3, 3] - R[1, 1] - R[2, 2]) * 2
+        w = (R[2, 1] - R[1, 2]) / s; x = (R[1, 3] + R[3, 1]) / s; y = (R[2, 3] + R[3, 2]) / s; z = 0.25 * s
+    end
+    q = MVector{4,Float64}(w, x, y, z)
+    q ./= norm(q)
+    return q
+end
+
+"""
+    molecule_from_sites!(sys, i, lab_sites)
+
+Set molecule i so that its sites coincide with the given lab-frame positions (3 × n_sites, in a
+consistent image). Fits the rotation by Kabsch/SVD-free orthogonal Procrustes using three sites or
+the COM frame; requires a non-linear molecule for a unique orientation.
+"""
+function molecule_from_sites!(sys::RigidSystem, i::Int, lab::AbstractMatrix{Float64})
+    t = sys.templates[sys.tmpl[i]]
+    m = t.site_mass
+    com = lab * m ./ sum(m)
+    A = lab .- com                      # lab offsets
+    B = t.sites_body                    # body offsets
+    # rotation R with A ≈ R B : build orthonormal frames from the first two independent offsets
+    function frame(M)
+        e1 = M[:, 2] - M[:, 1]; e1 /= norm(e1)
+        v = M[:, 3] - M[:, 1]; e2 = v - dot(v, e1) * e1; e2 /= norm(e2)
+        e3 = cross(e1, e2)
+        return hcat(e1, e2, e3)
+    end
+    t.n_sites >= 3 || error("molecule_from_sites!: need ≥ 3 sites for a unique orientation")
+    R = frame(A) * frame(B)'
+    set_molecule!(sys, i, com, quaternion_from_rotation_matrix(R))
+    return nothing
+end
+
+# ============================================================================
+# Pair energies
+# ============================================================================
+
+@inline function _min_image(d::Float64, L::Float64)
+    return d - L * round(d / L)
+end
+
+"""
+    pair_energy(sys, ff, i, j) -> u_ij
+
+Intermolecular energy of molecules i and j (site-based cutoff, overlap cap at the pair level).
+"""
+function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Float64
+    L = sys.L
+    @inbounds begin
+        Rx = _min_image(sys.com[1, j] - sys.com[1, i], L)
+        Ry = _min_image(sys.com[2, j] - sys.com[2, i], L)
+        Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
+    end
+    ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
+    si = sys.site_start[i]; sj = sys.site_start[j]
+    rc2 = ff.rc2
+    u = 0.0
+    @inbounds for n in 1:ti.n_sites
+        ox, oy, oz = sys.site_off[1, si + n], sys.site_off[2, si + n], sys.site_off[3, si + n]
+        tyn = ti.site_type[n]; qn = ti.site_q[n]
+        for m in 1:tj.n_sites
+            dx = Rx + sys.site_off[1, sj + m] - ox
+            dy = Ry + sys.site_off[2, sj + m] - oy
+            dz = Rz + sys.site_off[3, sj + m] - oz
+            r2 = dx * dx + dy * dy + dz * dz
+            r2 < rc2 || continue
+            tym = tj.site_type[m]
+            if tyn > 0 && tym > 0
+                if ff.cap_overlaps && r2 < ff.rcap2_mix[tyn, tym]
+                    return ff.ucap_mix[tyn, tym]
+                end
+                σ2 = ff.σ_mix[tyn, tym]^2
+                s6 = (σ2 / r2)^3
+                u += 4.0 * ff.ϵ_mix[tyn, tym] * (s6 * s6 - s6)
+            end
+            qm = tj.site_q[m]
+            if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
+                u += wolf_pair_u(sqrt(r2), qn, qm, ff.wolf)
+            end
+        end
+    end
+    return u
+end
+
+"""
+    pair_energy_virial(sys, ff, i, j) -> (u_ij, w_ij)
+
+As `pair_energy`, also returning the molecular virial contribution R_ij·F_ij (zero for capped pairs).
+"""
+function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)
+    L = sys.L
+    @inbounds begin
+        Rx = _min_image(sys.com[1, j] - sys.com[1, i], L)
+        Ry = _min_image(sys.com[2, j] - sys.com[2, i], L)
+        Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
+    end
+    ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
+    si = sys.site_start[i]; sj = sys.site_start[j]
+    rc2 = ff.rc2
+    u = 0.0; w = 0.0
+    α = ff.wolf.α; ke = ff.wolf.ke
+    @inbounds for n in 1:ti.n_sites
+        ox, oy, oz = sys.site_off[1, si + n], sys.site_off[2, si + n], sys.site_off[3, si + n]
+        tyn = ti.site_type[n]; qn = ti.site_q[n]
+        for m in 1:tj.n_sites
+            dx = Rx + sys.site_off[1, sj + m] - ox
+            dy = Ry + sys.site_off[2, sj + m] - oy
+            dz = Rz + sys.site_off[3, sj + m] - oz
+            r2 = dx * dx + dy * dy + dz * dz
+            r2 < rc2 || continue
+            tym = tj.site_type[m]
+            fr = 0.0                       # −du/dr · r  (site pair)
+            if tyn > 0 && tym > 0
+                if ff.cap_overlaps && r2 < ff.rcap2_mix[tyn, tym]
+                    return ff.ucap_mix[tyn, tym], 0.0
+                end
+                σ2 = ff.σ_mix[tyn, tym]^2
+                s6 = (σ2 / r2)^3
+                ϵ = ff.ϵ_mix[tyn, tym]
+                u += 4.0 * ϵ * (s6 * s6 - s6)
+                fr += 24.0 * ϵ * (2.0 * s6 * s6 - s6)
+            end
+            qm = tj.site_q[m]
+            if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
+                r = sqrt(r2)
+                u += wolf_pair_u(r, qn, qm, ff.wolf)
+                # −r du/dr of ke q q [erfc(αr)/r − erfc(α rc)/rc]
+                fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
+            end
+            # R_ij · r̂^{nm} (−du/dr) = (R·r)/r² · (−r du/dr)
+            w += (Rx * dx + Ry * dy + Rz * dz) / r2 * fr
+        end
+    end
+    return u, w
+end
+
+"Removal energy u_k = Σ_{j≠k} u_kj (the eKMC molecular energy, Tan 2017 Eq. 1a)."
+function removal_energy(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64
+    u = 0.0
+    for j in 1:sys.n_mol
+        j == k && continue
+        u += pair_energy(sys, ff, k, j)
+    end
+    return u
+end
+
+"Total intermolecular pair energy (no tail, no Wolf constants)."
+function total_pair_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    U = 0.0
+    for i in 1:sys.n_mol-1, j in i+1:sys.n_mol
+        U += pair_energy(sys, ff, i, j)
+    end
+    return U
+end
+
+"Total intermolecular pair energy and molecular virial."
+function total_pair_energy_virial(sys::RigidSystem, ff::SiteForceField)
+    U = 0.0; W = 0.0
+    for i in 1:sys.n_mol-1, j in i+1:sys.n_mol
+        u, w = pair_energy_virial(sys, ff, i, j)
+        U += u; W += w
+    end
+    return U, W
+end
+
+"Number of LJ sites of each type."
+function count_lj_sites(sys::RigidSystem, ff::SiteForceField)
+    N = zeros(Int, ff.n_types)
+    for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]
+        for ty in t.site_type
+            ty > 0 && (N[ty] += 1)
+        end
+    end
+    return N
+end
+
+"LJ tail correction to the energy for the current volume."
+function lrc_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    ff.use_lrc || return 0.0
+    N = count_lj_sites(sys, ff)
+    V = sys.L^3
+    E = 0.0
+    for a in 1:ff.n_types, b in 1:ff.n_types
+        σ = ff.σ_mix[a, b]; x3 = (σ / ff.rc)^3; x9 = x3^3
+        E += (8π / 3) * (N[a] * N[b] / V) * ff.ϵ_mix[a, b] * σ^3 * (x9 / 3 - x3)
+    end
+    return E
+end
+
+"LJ tail correction to the pressure for the current volume."
+function lrc_pressure(sys::RigidSystem, ff::SiteForceField)::Float64
+    ff.use_lrc || return 0.0
+    N = count_lj_sites(sys, ff)
+    V = sys.L^3
+    P = 0.0
+    for a in 1:ff.n_types, b in 1:ff.n_types
+        σ = ff.σ_mix[a, b]; x3 = (σ / ff.rc)^3; x9 = x3^3
+        P += (16π / 3) * (N[a] * N[b] / V^2) * ff.ϵ_mix[a, b] * σ^3 * (2 * x9 / 3 - x3)
+    end
+    return P
+end
+
+"""
+    wolf_constant_energy(sys, ff)
+
+Configuration-independent Wolf terms (self + intramolecular exclusion) of all molecules; add to the
+pair energy to compare absolute energies with Ewald.
+"""
+function wolf_constant_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    ff.coulomb === :wolf || return 0.0
+    E = 0.0
+    wp = ff.wolf
+    for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]
+        for n in 1:t.n_sites
+            E -= wp.ke * (erfc(wp.α * wp.rc) / (2 * wp.rc) + wp.α / SQRT_PI) * t.site_q[n]^2
+            for m in n+1:t.n_sites
+                (t.site_q[n] == 0.0 || t.site_q[m] == 0.0) && continue
+                r = norm(t.sites_body[:, n] - t.sites_body[:, m])
+                E -= wp.ke * t.site_q[n] * t.site_q[m] / r - wolf_pair_u(r, t.site_q[n], t.site_q[m], wp)
+            end
+        end
+    end
+    return E
+end
+
+"Total configurational energy U = pair sum + tail correction (+ Wolf constants if `with_constants`)."
+function total_energy(sys::RigidSystem, ff::SiteForceField; with_constants::Bool=false)::Float64
+    U = total_pair_energy(sys, ff) + lrc_energy(sys, ff)
+    with_constants && (U += wolf_constant_energy(sys, ff))
+    return U
+end
+
+"Pressure from the molecular virial: N kT/V + W/(3V) + tail."
+function pressure(sys::RigidSystem, ff::SiteForceField, W::Float64)::Float64
+    V = sys.L^3
+    return sys.n_mol / (sys.β * V) + W / (3.0 * V) + lrc_pressure(sys, ff)
+end
+
+function pressure(sys::RigidSystem, ff::SiteForceField)::Float64
+    _, W = total_pair_energy_virial(sys, ff)
+    return pressure(sys, ff, W)
+end
+
+# ============================================================================
+# Random configurations
+# ============================================================================
+
+"""
+    random_rigid_system!(sys, ff; max_tries=10_000)
+
+Place molecules one by one at uniform random positions/orientations, rejecting placements whose
+pair energy with the molecules already placed is capped (overlapping). Equilibrate afterwards.
+"""
+function random_rigid_system!(sys::RigidSystem, ff::SiteForceField; max_tries::Int=10_000)
+    L = sys.L
+    for i in 1:sys.n_mol
+        placed = false
+        for _ in 1:max_tries
+            com = MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L)
+            set_molecule!(sys, i, com, uniform_random_quaternion(sys.rng))
+            ok = true
+            for j in 1:i-1
+                u = pair_energy(sys, ff, i, j)
+                if u >= minimum(ff.ucap_mix) * 0.999
+                    ok = false; break
+                end
+            end
+            if ok
+                placed = true; break
+            end
+        end
+        placed || error("random_rigid_system!: could not place molecule $i without overlap")
+    end
+    return sys
+end
+
+# ============================================================================
+# Metropolis MC
+# ============================================================================
+
+"Hamilton product q1 ⊗ q2 (both (w, x, y, z))."
+@inline function quat_mul(q1::AbstractVector{Float64}, q2::AbstractVector{Float64})
+    w1, x1, y1, z1 = q1[1], q1[2], q1[3], q1[4]
+    w2, x2, y2, z2 = q2[1], q2[2], q2[3], q2[4]
+    return MVector{4,Float64}(w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                              w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                              w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                              w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+end
+
+"Random rotation quaternion: uniform random axis, angle uniform in (−δθ, δθ)."
+function small_rotation_quaternion(rng::AbstractRNG, δθ::Float64)
+    # uniform axis on the sphere
+    z = 2.0 * rand(rng) - 1.0
+    φ = 2π * rand(rng)
+    s = sqrt(1.0 - z * z)
+    ax, ay, az = s * cos(φ), s * sin(φ), z
+    θ = (2.0 * rand(rng) - 1.0) * δθ
+    h = 0.5 * θ
+    return MVector{4,Float64}(cos(h), sin(h) * ax, sin(h) * ay, sin(h) * az)
+end
+
+mutable struct RigidMCStats
+    trans_att::Int; trans_acc::Int
+    rot_att::Int; rot_acc::Int
+    reor_att::Int; reor_acc::Int
+    vol_att::Int; vol_acc::Int
+end
+RigidMCStats() = RigidMCStats(0, 0, 0, 0, 0, 0, 0, 0)
+
+"Metropolis translation of molecule i by a uniform random displacement in a cube of half-side δ."
+function mc_translate!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64, st::RigidMCStats)::Bool
+    st.trans_att += 1
+    u_old = removal_energy(sys, ff, i)
+    com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    com_new = MVector{3,Float64}(com_old[1] + (2rand(sys.rng) - 1) * δ,
+                                 com_old[2] + (2rand(sys.rng) - 1) * δ,
+                                 com_old[3] + (2rand(sys.rng) - 1) * δ)
+    set_molecule!(sys, i, com_new, q)
+    ΔU = removal_energy(sys, ff, i) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.trans_acc += 1
+        return true
+    end
+    set_molecule!(sys, i, com_old, q)
+    return false
+end
+
+"Metropolis rotation of molecule i about a random axis by an angle uniform in (−δθ, δθ)."
+function mc_rotate!(sys::RigidSystem, ff::SiteForceField, i::Int, δθ::Float64, st::RigidMCStats)::Bool
+    st.rot_att += 1
+    u_old = removal_energy(sys, ff, i)
+    com = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    q_new = quat_mul(small_rotation_quaternion(sys.rng, δθ), q_old)
+    set_molecule!(sys, i, com, q_new)
+    ΔU = removal_energy(sys, ff, i) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.rot_acc += 1
+        return true
+    end
+    set_molecule!(sys, i, com, q_old)
+    return false
+end
+
+"Metropolis uniform reorientation of molecule i (Shoemake quaternion)."
+function mc_reorient!(sys::RigidSystem, ff::SiteForceField, i::Int, st::RigidMCStats)::Bool
+    st.reor_att += 1
+    u_old = removal_energy(sys, ff, i)
+    com = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    set_molecule!(sys, i, com, uniform_random_quaternion(sys.rng))
+    ΔU = removal_energy(sys, ff, i) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.reor_acc += 1
+        return true
+    end
+    set_molecule!(sys, i, com, q_old)
+    return false
+end
+
+"""
+    mc_volume_trial!(sys, ff, Pext, max_dlnV, st; U_current) -> (accepted, U_new)
+
+Random walk in ln V with COM scaling (Frenkel & Smit, Understanding Molecular Simulation, §5.4.2,
+Eq. 5.4.11): acc = min{1, exp(−β[ΔU + P ΔV] + (N+1) ln(V'/V))}. Returns the new total energy
+(pair + tail) so callers need not recompute it.
+"""
+function mc_volume_trial!(sys::RigidSystem, ff::SiteForceField, Pext::Float64, max_dlnV::Float64,
+                          st::RigidMCStats; U_current::Float64)
+    st.vol_att += 1
+    L_old = sys.L; V_old = L_old^3
+    lnV_new = log(V_old) + (2rand(sys.rng) - 1) * max_dlnV
+    V_new = exp(lnV_new); L_new = cbrt(V_new)
+    s = L_new / L_old
+    com_old = copy(sys.com)
+    sys.L = L_new
+    sys.com .*= s
+    U_new = total_energy(sys, ff)
+    ΔU = U_new - U_current
+    arg = -sys.β * (ΔU + Pext * (V_new - V_old)) + (sys.n_mol + 1) * log(V_new / V_old)
+    if arg >= 0.0 || rand(sys.rng) < exp(arg)
+        st.vol_acc += 1
+        return true, U_new
+    end
+    sys.L = L_old
+    sys.com .= com_old
+    return false, U_current
+end
+
+"""
+    widom_rigid(sys, ff, template_idx; ninsert) -> mean of exp(−β ΔU)
+
+Widom insertion of a rigid molecule at a uniform random position and orientation (Frenkel & Smit
+§7.2.1); the excess chemical potential is −kT ln of the returned average (intermolecular part; the
+tail contribution of the inserted molecule, if any, is added by `widom_lrc_shift`).
+"""
+function widom_rigid(sys::RigidSystem, ff::SiteForceField, template_idx::Int; ninsert::Int=1000)
+    # temporarily append a ghost molecule
+    ghost = RigidSystem(sys.templates, vcat(sys.tmpl, template_idx), sys.L, sys.β, sys.rng)
+    ghost.com[:, 1:sys.n_mol] .= sys.com
+    ghost.quat[:, 1:sys.n_mol] .= sys.quat
+    ghost.site_off[:, 1:sys.n_sites_total] .= sys.site_off
+    g = ghost.n_mol
+    acc = 0.0
+    L = sys.L
+    for _ in 1:ninsert
+        com = MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L)
+        set_molecule!(ghost, g, com, uniform_random_quaternion(sys.rng))
+        ΔU = removal_energy(ghost, ff, g)
+        acc += exp(-sys.β * ΔU)
+    end
+    return acc / ninsert
+end
+
+"Change of the LJ tail energy on adding one molecule of `template_idx` at the current volume."
+function widom_lrc_shift(sys::RigidSystem, ff::SiteForceField, template_idx::Int)::Float64
+    ff.use_lrc || return 0.0
+    ghost = RigidSystem(sys.templates, vcat(sys.tmpl, template_idx), sys.L, sys.β, sys.rng)
+    return lrc_energy(ghost, ff) - lrc_energy(sys, ff)
+end
+
+"""
+    run_rigid_mc!(sys, ff; sweeps, δ, δθ, Pext=nothing, max_dlnV=0.1, vol_every=1,
+                  sample_every=1, block_size=10, widom_template=0, widom_per_sample=0)
+
+NVT (Pext === nothing) or NPT Metropolis MC. One sweep = n_mol translation + n_mol rotation
+attempts (+ one volume trial every `vol_every` sweeps in NPT). Returns block averages of U/N
+(pair + tail), P, ρ and, if requested, the Widom ⟨exp(−βΔU)⟩.
+"""
+function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
+                       Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
+                       vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
+                       widom_template::Int=0, widom_per_sample::Int=0)
+    st = RigidMCStats()
+    N = sys.n_mol
+    U = total_energy(sys, ff)
+    ba_U = BlockAverager(block_size); ba_P = BlockAverager(block_size)
+    ba_rho = BlockAverager(block_size); ba_w = BlockAverager(block_size)
+    for sweep in 1:sweeps
+        for _ in 1:N
+            i = rand(sys.rng, 1:N)
+            mc_translate!(sys, ff, i, δ, st)
+            i = rand(sys.rng, 1:N)
+            mc_rotate!(sys, ff, i, δθ, st)
+        end
+        if Pext !== nothing && sweep % vol_every == 0
+            U = total_energy(sys, ff)
+            _, U = mc_volume_trial!(sys, ff, Pext, max_dlnV, st; U_current=U)
+        end
+        if sweep % sample_every == 0
+            Up, W = total_pair_energy_virial(sys, ff)
+            push!(ba_U, (Up + lrc_energy(sys, ff)) / N)
+            push!(ba_P, pressure(sys, ff, W))
+            push!(ba_rho, N / sys.L^3)
+            if widom_template > 0 && widom_per_sample > 0
+                push!(ba_w, widom_rigid(sys, ff, widom_template; ninsert=widom_per_sample))
+            end
+        end
+    end
+    return (U=ba_U, P=ba_P, rho=ba_rho, widom=ba_w, stats=st)
+end
+
+# ============================================================================
+# Equilibrium kinetic Monte Carlo (Tan / Ustinov scheme) for rigid molecules
+# ============================================================================
+
+"""
+    RigidEKMCState
+
+Pair-energy matrix (n_mol × n_mol), molecular energies φ_i = Σ_j u_ij, mobilities m_i = exp(β φ_i)
+and the total rate R, kept consistent after every event (Tan 2017 Appendix 1).
+"""
+mutable struct RigidEKMCState
+    pair_u::Matrix{Float64}
+    phi::Vector{Float64}
+    m::Vector{Float64}
+    R::Float64
+    debug_check_every::Int
+    events::Int
+end
+
+function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every::Int=0)
+    N = sys.n_mol
+    ek = RigidEKMCState(zeros(N, N), zeros(N), zeros(N), 0.0, debug_check_every, 0)
+    rebuild_rigid_ekmc!(ek, sys, ff)
+    return ek
+end
+
+"Recompute all pair energies, φ, mobilities and R from scratch."
+function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
+    N = sys.n_mol
+    fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0)
+    for i in 1:N-1, j in i+1:N
+        u = pair_energy(sys, ff, i, j)
+        ek.pair_u[i, j] = u; ek.pair_u[j, i] = u
+        ek.phi[i] += u; ek.phi[j] += u
+    end
+    R = 0.0
+    for i in 1:N
+        ek.m[i] = exp(sys.β * ek.phi[i]); R += ek.m[i]
+    end
+    ek.R = R
+    (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R")
+    return nothing
+end
+
+"Appendix-1 update after molecule k has been moved: row/column k, all φ_j, all mobilities, R."
+function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, k::Int)
+    N = sys.n_mol
+    β = sys.β
+    phik = 0.0
+    @inbounds for j in 1:N
+        j == k && continue
+        u_old = ek.pair_u[k, j]
+        u_new = pair_energy(sys, ff, k, j)
+        ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
+        ek.phi[j] += u_new - u_old
+        phik += u_new
+    end
+    ek.phi[k] = phik
+    R = 0.0
+    @inbounds for j in 1:N
+        ek.m[j] = exp(β * ek.phi[j]); R += ek.m[j]
+    end
+    ek.R = R
+    (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R after moving molecule $k")
+    return nothing
+end
+
+"Rosenbluth (tower) selection with probability m_i / R."
+function select_by_mobility(ek::RigidEKMCState, rng::AbstractRNG)::Int
+    r = rand(rng) * ek.R
+    c = 0.0
+    @inbounds for i in eachindex(ek.m)
+        c += ek.m[i]
+        c > r && return i
+    end
+    return length(ek.m)
+end
+
+"""
+    rigid_ekmc_step!(ek, sys, ff, acc::ChemicalPotentialAccumulator) -> Δt
+
+One event: residence time Δt = ln(1/ξ)/R of the *current* configuration (accumulated into `acc`
+with R/N), selection of a molecule by mobility, and its relocation to a uniform random position with
+a uniform random orientation. Returns Δt (the weight of the configuration that was just left).
+"""
+function rigid_ekmc_step!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField,
+                          acc::ChemicalPotentialAccumulator)::Float64
+    R = ek.R
+    u = rand(sys.rng)
+    u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
+    dt = log(1 / u) / R
+    N = sys.n_mol
+    acc.t_total += dt
+    RN = R / N
+    acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
+    k = select_by_mobility(ek, sys.rng)
+    L = sys.L
+    com = MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L)
+    set_molecule!(sys, k, com, uniform_random_quaternion(sys.rng))
+    update_rigid_ekmc_after_move!(ek, sys, ff, k)
+    ek.events += 1
+    if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
+        phi_saved = copy(ek.phi); R_saved = ek.R
+        rebuild_rigid_ekmc!(ek, sys, ff)
+        err = maximum(abs.(phi_saved .- ek.phi))
+        relR = abs(R_saved - ek.R) / ek.R
+        (err > 1e-8 || relR > 1e-8) && @warn "rigid eKMC bookkeeping drift" err relR
+    end
+    return dt
+end
+
+"Time-weighted block averager: blocks of `block_events` events, block mean = Σ x Δt / Σ Δt."
+mutable struct TimeWeightedBlockAverager
+    block_events::Int
+    sum_x::Float64
+    sum_t::Float64
+    n::Int
+    block_means::Vector{Float64}
+end
+TimeWeightedBlockAverager(block_events::Int) = TimeWeightedBlockAverager(block_events, 0.0, 0.0, 0, Float64[])
+function Base.push!(b::TimeWeightedBlockAverager, x::Float64, dt::Float64)
+    b.sum_x += x * dt; b.sum_t += dt; b.n += 1
+    if b.n >= b.block_events
+        push!(b.block_means, b.sum_x / b.sum_t)
+        b.sum_x = 0.0; b.sum_t = 0.0; b.n = 0
+    end
+    return b
+end
+function mean(b::TimeWeightedBlockAverager)
+    isempty(b.block_means) && return b.sum_t > 0 ? b.sum_x / b.sum_t : NaN
+    return sum(b.block_means) / length(b.block_means)
+end
+function stderr(b::TimeWeightedBlockAverager)
+    n = length(b.block_means)
+    n < 2 && return NaN
+    m = mean(b)
+    return sqrt(sum((x - m)^2 for x in b.block_means) / (n - 1) / n)
+end
+
+"""
+    rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV) -> P_before
+
+Tan et al. (2017) Eq. 12 auxiliary-pressure volume move: p_aux = n (p + p*), expand by n ΔV_max if
+p > p_aux else contract; COMs are rescaled, orientations kept, everything rebuilt (Appendix 1).
+"""
+function rigid_ekmc_volume_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField,
+                                 Pext::Float64, max_dV::Float64)
+    _, W = total_pair_energy_virial(sys, ff)
+    p = pressure(sys, ff, W)
+    n = rand(sys.rng)
+    p_aux = n * (p + Pext)
+    V = sys.L^3
+    V_new = p > p_aux ? V + n * max_dV : V - n * max_dV
+    V_new > 0.0 || (V_new = 0.5 * V)
+    L_new = cbrt(V_new)
+    sys.com .*= L_new / sys.L
+    sys.L = L_new
+    rebuild_rigid_ekmc!(ek, sys, ff)
+    return p
+end
+
+"""
+    run_rigid_ekmc!(sys, ff; events, Pext=nothing, max_dV=0.0, vol_every_sweeps=10,
+                    sample_every=10, block_events=1000, pressure_every=50*sample_every,
+                    debug_check_every=0)
+
+NVT (Pext === nothing) or NPT eKMC. Observables are time-weighted (Tan 2017 Eq. 5) with the
+residence time of the sampled configuration. U is taken from the maintained molecular energies
+(U = ½ Σ φ_i, free) every `sample_every` events; the pressure needs the O(N²) virial and is sampled
+every `pressure_every` events (its blocks hold `block_events ÷ pressure_every` samples). Returns block averages of U/N (pair + tail), P, ρ,
+the NVT chemical-potential accumulator (μ_ex = `mu_ex(acc, T)`), blocked R/N (`RN`, for
+μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`).
+"""
+function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
+                         Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
+                         vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
+                         pressure_every::Int=50 * sample_every, debug_check_every::Int=0)
+    N = sys.n_mol
+    ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every)
+    acc = ChemicalPotentialAccumulator()
+    acc_npt = NPTChemicalPotentialAccumulator()
+    ba_U = TimeWeightedBlockAverager(block_events ÷ sample_every)
+    ba_P = TimeWeightedBlockAverager(max(1, block_events ÷ pressure_every))
+    ba_rho = TimeWeightedBlockAverager(block_events ÷ sample_every)
+    ba_RN = TimeWeightedBlockAverager(block_events ÷ sample_every)   # R/N for blocked μ errors
+    t_total = 0.0
+    for ev in 1:events
+        if ev % sample_every == 0
+            # weight of the current configuration: draw its Δt here and reuse it in the step
+            R = ek.R
+            u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
+            dt = log(1 / u) / R
+            V = sys.L^3
+            Up = 0.5 * sum(ek.phi)
+            push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
+            if ev % pressure_every == 0
+                _, W = total_pair_energy_virial(sys, ff)
+                push!(ba_P, pressure(sys, ff, W), dt)
+            end
+            push!(ba_rho, N / V, dt)
+            push!(ba_RN, R / N, dt)
+            push!(acc_npt, R / N, V, dt)
+            # perform the event with this dt (same statistics as rigid_ekmc_step!)
+            acc.t_total += dt; RN = R / N
+            acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
+            k = select_by_mobility(ek, sys.rng)
+            L = sys.L
+            set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
+                          uniform_random_quaternion(sys.rng))
+            update_rigid_ekmc_after_move!(ek, sys, ff, k)
+            ek.events += 1
+            t_total += dt
+        else
+            t_total += rigid_ekmc_step!(ek, sys, ff, acc)
+        end
+        if Pext !== nothing && ev % (vol_every_sweeps * N) == 0
+            rigid_ekmc_volume_move!(ek, sys, ff, Pext, max_dV)
+        end
+    end
+    return (U=ba_U, P=ba_P, rho=ba_rho, RN=ba_RN, mu=acc, mu_npt=acc_npt, t_total=t_total, ek=ek)
+end
