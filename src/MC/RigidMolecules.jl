@@ -506,15 +506,25 @@ function total_energy(sys::RigidSystem, ff::SiteForceField; with_constants::Bool
     return U
 end
 
-"Pressure from the molecular virial: N kT/V + W/(3V) + tail."
-function pressure(sys::RigidSystem, ff::SiteForceField, W::Float64)::Float64
+"""
+    pressure(sys, ff, W; tail=:virial)
+
+Pressure from the molecular virial, N kT/V + W/(3V) + P_tail. `tail=:virial` uses the virial-route
+tail (Allen & Tildesley Eq. 2.137, what LAMMPS/GROMACS add and what the NIST SPC/E EOS used);
+`tail=:thermodynamic` uses −∂U_tail/∂V = U_tail/V, the tail pressure that is consistent with
+U_tail(V) entering an NPT Metropolis acceptance (the two differ by ≈ (8π/3)ρ²εσ³(σ/r_c)³, ~100 atm
+for water at r_c = 10 Å). Use `:thermodynamic` when comparing with `run_rigid_mc!` NPT densities.
+"""
+function pressure(sys::RigidSystem, ff::SiteForceField, W::Float64; tail::Symbol=:virial)::Float64
     V = sys.L^3
-    return sys.n_mol / (sys.β * V) + W / (3.0 * V) + lrc_pressure(sys, ff)
+    tail in (:virial, :thermodynamic) || error("pressure: tail must be :virial or :thermodynamic")
+    P_tail = tail === :virial ? lrc_pressure(sys, ff) : lrc_energy(sys, ff) / V
+    return sys.n_mol / (sys.β * V) + W / (3.0 * V) + P_tail
 end
 
-function pressure(sys::RigidSystem, ff::SiteForceField)::Float64
+function pressure(sys::RigidSystem, ff::SiteForceField; tail::Symbol=:virial)::Float64
     _, W = total_pair_energy_virial(sys, ff)
-    return pressure(sys, ff, W)
+    return pressure(sys, ff, W; tail=tail)
 end
 
 # ============================================================================
@@ -709,7 +719,7 @@ attempts (+ one volume trial every `vol_every` sweeps in NPT). Returns block ave
 function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
                        vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
-                       widom_template::Int=0, widom_per_sample::Int=0)
+                       widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial)
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
@@ -730,7 +740,7 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
         if sweep % sample_every == 0
             Up, W = total_pair_energy_virial(sys, ff)
             push!(ba_U, (Up + lrc_energy(sys, ff)) / N)
-            push!(ba_P, pressure(sys, ff, W))
+            push!(ba_P, pressure(sys, ff, W; tail=tail_route))
             V = sys.L^3
             push!(ba_rho, N / V)
             push!(ba_V, V)
@@ -977,7 +987,9 @@ every event since the previous volume move (`vol_pressure = :partial_average`, T
 maintained incrementally with the pair energies, so the pressure costs nothing per event. With
 `vol_scheme = :newton` the first `vol_equil_moves` volume moves use the full Newton gain (capped at
 `max_dV`), after which the Robbins–Monro gain 1/(k − k0 + 1) lets the volume converge; observables
-are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N). `vol_scheme = :newton` (default) applies Kelly's secant
+are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N).
+`tail_route` (`:virial` or `:thermodynamic`, see `pressure`) selects the tail pressure used both in
+the volume controller and in the reported P. `vol_scheme = :newton` (default) applies Kelly's secant
 update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
 threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
 half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
@@ -996,7 +1008,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
                          vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
-                         vol_equil_moves::Int=200, burnin_events::Int=0)
+                         vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial)
     N = sys.n_mol
     vol_pressure in (:partial_average, :instantaneous) ||
         error("run_rigid_ekmc!: vol_pressure must be :partial_average or :instantaneous")
@@ -1030,12 +1042,12 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
         V = sys.L^3
         if Pext !== nothing
             # pressure is free from the maintained virial; time-weight it over every event of the block
-            p_part_sum += pressure(sys, ff, ekmc_virial(ek)) * dt; p_part_t += dt
+            p_part_sum += pressure(sys, ff, ekmc_virial(ek); tail=tail_route) * dt; p_part_t += dt
         end
         if ev % sample_every == 0 && ev > burnin_events
             Up = 0.5 * sum(ek.phi)
             push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
-            push!(ba_P, pressure(sys, ff, ekmc_virial(ek)), dt)
+            push!(ba_P, pressure(sys, ff, ekmc_virial(ek); tail=tail_route), dt)
             push!(ba_rho, N / V, dt)
             push!(ba_V, V, dt)
             push!(ba_RN, R / N, dt)
