@@ -24,7 +24,7 @@ N=${N:-500}
 MC_SWEEPS=${MC_SWEEPS:-8000}        # 2000 equilibration + 8000 production sweeps
 EKMC_EVENTS=${EKMC_EVENTS:-100000}  # hybrid events (≈ sweeps)
 SEED=${SLURM_ARRAY_TASK_ID:-1}
-export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-10}
+export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-100}
 mkdir -p "$OUT"
 
 echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED alpha=$SPCE_ALPHA cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA start=$(date)"

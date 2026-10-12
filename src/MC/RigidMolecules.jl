@@ -916,6 +916,8 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
     ba_V = BlockAverager(block_size); ba_wV = BlockAverager(block_size)   # NPT Widom: <V e^{-βΔU}>/<V>
     ba_iw = BlockAverager(block_size)                                      # inverse Widom of one molecule
     ba_R = BlockAverager(max(1, block_size ÷ max(R_every, 1)))             # relocation rate R = Σ exp(βu_i) of relaxed states
+    ba_Rs = [BlockAverager(max(1, block_size ÷ max(R_every, 1))) for _ in sys.templates]   # per template
+    Rs = zeros(length(sys.templates))
     n_samples = 0
     for sweep in 1:sweeps
         for _ in 1:N
@@ -945,15 +947,19 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             end
             n_samples += 1
             if R_every > 0 && n_samples % R_every == 0
-                R = 0.0
+                fill!(Rs, 0.0)
                 for i in 1:N
-                    R += _mobility(sys.β, removal_energy(sys, ff, i))
+                    Rs[sys.tmpl[i]] += _mobility(sys.β, removal_energy(sys, ff, i))
                 end
-                push!(ba_R, R)
+                push!(ba_R, sum(Rs))
+                for s in eachindex(Rs)
+                    push!(ba_Rs[s], Rs[s])
+                end
             end
         end
     end
-    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw, R=ba_R)
+    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw, R=ba_R,
+            R_species=ba_Rs)
 end
 
 # ============================================================================
@@ -980,12 +986,25 @@ mutable struct RigidEKMCState
     mc_trials::Int              # Metropolis trials made by the MC-kernel events
     mc_accepted::Int
     mc_events::Int              # number of MC-kernel events
+    c::Vector{Float64}          # per-molecule rate scale: m_i = c_i exp(βu_i) (species importance sampling)
 end
 
-function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every::Int=0)
+"""
+    init_rigid_ekmc(sys, ff; debug_check_every=0, rate_scale=nothing)
+
+`rate_scale[i]` multiplies molecule i's relocation rate: m_i = c_i exp(βu_i). A constant factor per
+molecule leaves detailed balance intact (π(x) c_i e^{βu_i(x)}/V = c_i e^{−βU_rest}/V is still symmetric in
+x ↔ x′) and the time-weighted averages canonical; only the *frequency* with which species are relocated
+changes. The μ observables use exp(βu_i) = m_i/c_i, so they are unchanged. Used to give a dilute solute
+the same relocation frequency as the whole solvent (JOURNAL 2026-10-12 entry 19).
+"""
+function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every::Int=0,
+                         rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing)
     N = sys.n_mol
+    c = rate_scale === nothing ? ones(N) : Vector{Float64}(rate_scale)
+    length(c) == N && all(c .> 0) || error("init_rigid_ekmc: rate_scale must have one positive entry per molecule")
     ek = RigidEKMCState(zeros(N, N), zeros(N, N), zeros(N), zeros(N), zeros(N), 0.0, debug_check_every, 0,
-                        zeros(N), zeros(N), 0, 0, 0)
+                        zeros(N), zeros(N), 0, 0, 0, c)
     rebuild_rigid_ekmc!(ek, sys, ff)
     return ek
 end
@@ -1027,13 +1046,13 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
             ek.pair_w[i, j] = ek.row_w[j]; ek.pair_w[j, i] = ek.row_w[j]
             if du != 0.0
                 ek.phi[j] += du
-                ek.m[j] = _mobility(β, ek.phi[j])
+                ek.m[j] = ek.c[j] * _mobility(β, ek.phi[j])
             end
             ek.wsum[j] += dw
             phii += ek.row_u[j]; wi += ek.row_w[j]
         end
         ek.phi[i] = phii; ek.wsum[i] = wi
-        ek.m[i] = _mobility(β, phii)
+        ek.m[i] = ek.c[i] * _mobility(β, phii)
         ek.R = sum(ek.m)                      # never incremental (see update_rigid_ekmc_after_move!)
         ek.mc_accepted += 1
         return true
@@ -1091,7 +1110,7 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     end
     R = 0.0
     for i in 1:N
-        ek.m[i] = _mobility(sys.β, ek.phi[i]); R += ek.m[i]
+        ek.m[i] = ek.c[i] * _mobility(sys.β, ek.phi[i]); R += ek.m[i]
     end
     ek.R = R
     (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R")
@@ -1111,7 +1130,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         if u_new != u_old
             ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
             ek.phi[j] += u_new - u_old
-            ek.m[j] = _mobility(β, ek.phi[j])
+            ek.m[j] = ek.c[j] * _mobility(β, ek.phi[j])
         end
         if w_new != w_old
             ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
@@ -1120,7 +1139,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         phik += u_new; wk += w_new
     end
     ek.phi[k] = phik; ek.wsum[k] = wk
-    ek.m[k] = _mobility(β, phik)
+    ek.m[k] = ek.c[k] * _mobility(β, phik)
     # R is always resummed: mobilities span ~50 orders of magnitude (a relocated molecule can have
     # exp(βu) ≈ 1e48), so an incremental R = R + Δm suffers catastrophic cancellation when such a term
     # is removed (found by the LJ-diatomic MC↔eKMC test, 2026-10-11). The O(N) sum is negligible; only
@@ -1376,7 +1395,10 @@ its error `ratio_jackknife_stderr` (use these for μ: `T·log(ratio_mean(RN))` �
 `species_mu=true` adds `RN_species[s]`, the blocked (1/N_s) Σ_{i∈s} exp(βu_i) of every template s
 (per-species μ_ex,s = T ln⟨·⟩; the mobilities are the clamped `_mobility` values, as in R), and
 `trace_molecule=i` records (u_i, Δt) at every sample in `trace_phi`, `trace_dt` (tail diagnostics for
-a single solute).
+a single solute). `species_rate_scale[s]` multiplies the relocation rate of every molecule of template s
+(`init_rigid_ekmc` `rate_scale`): balance and the per-species μ are unaffected, the share of relocation
+bursts per species changes; with scaling the global R/N accumulators (`RN`, `mu`, `RNV`, `mu_npt`) no longer
+give a physical μ — use `RN_species`.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -1385,7 +1407,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
                          vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
-                         vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0)
+                         vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
+                         species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing)
     N = sys.n_mol
     λ = mc_kernel_rate
     vol_period = vol_every_events > 0 ? vol_every_events : vol_every_sweeps * N
@@ -1397,7 +1420,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     # running least-squares regression of the block pressure P̄ on V for the Newton slope
     reg_n = 0; reg_V = 0.0; reg_P = 0.0; reg_VV = 0.0; reg_VP = 0.0
     p_part_sum = 0.0; p_part_t = 0.0
-    ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every)
+    rate_scale = species_rate_scale === nothing ? nothing : [species_rate_scale[sys.tmpl[i]] for i in 1:N]
+    ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every, rate_scale=rate_scale)
     acc = ChemicalPotentialAccumulator()
     acc_npt = NPTChemicalPotentialAccumulator()
     ba_U = TimeWeightedBlockAverager(block_events ÷ sample_every)
@@ -1449,7 +1473,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             if species_mu
                 fill!(sp_sum, 0.0)
                 @inbounds for i in 1:N
-                    sp_sum[sys.tmpl[i]] += ek.m[i]
+                    sp_sum[sys.tmpl[i]] += ek.m[i] / ek.c[i]      # exp(βu_i), scale removed
                 end
                 for s in 1:nspec
                     n_spec[s] > 0 && push!(ba_RNs[s], sp_sum[s] / n_spec[s], dt)

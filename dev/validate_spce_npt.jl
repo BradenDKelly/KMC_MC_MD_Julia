@@ -77,7 +77,7 @@ open(out, "w") do io
     V0 = sys.L^3
     burn = min(200 * 10 * N + ekmc_events ÷ 5, ekmc_events ÷ 2)   # vol_equil_moves + 20 %, at most half the run
     t0 = time()
-    λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))
+    λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))   # 0 = stock (pure) eKMC; the Slurm wrappers pass 100 for the hybrid
     # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
     # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")

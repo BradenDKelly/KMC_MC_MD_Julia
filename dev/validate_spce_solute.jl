@@ -19,7 +19,8 @@ Chem. B 130 (2026) 4636, Table 1); experiment: methane 8.37 kJ/mol (same table),
 −21.3 kJ/mol (Ben-Naim & Marcus, J. Chem. Phys. 81 (1984) 2016).
 
 Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_events seed outdir
-Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_LAMBDA (10; λ = fac·⟨R⟩, 0 = pure eKMC), SPCE_TAG.
+Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
+eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG.
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates
@@ -37,7 +38,7 @@ cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "molecule"))
 coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
 elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
-λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "10"))
+λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "100"))
 tag = get(ENV, "SPCE_TAG", "")
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -123,12 +124,20 @@ open(out, "w") do io
     # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
     R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
-    λ = λfac > 0 ? λfac * (isfinite(R_mc) ? R_mc : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
+    # species rate scaling: the solute gets the share SPCE_SOLUTE_SHARE of the relocation bursts (exact:
+    # a constant factor on one species' rate keeps detailed balance, DESIGN §5c / JOURNAL entry 19)
+    share = parse(Float64, get(ENV, "SPCE_SOLUTE_SHARE", "0.5"))
+    R_w = isfinite(R_mc) ? MCm.mean(mc.R_species[1]) : NaN
+    R_s = isfinite(R_mc) ? MCm.mean(mc.R_species[2]) : NaN
+    c_sol = (isfinite(R_w) && isfinite(R_s) && R_s > 0) ? share / (1 - share) * R_w / R_s : 1.0
+    R_eff = isfinite(R_mc) ? R_w + c_sol * R_s : NaN
+    λ = λfac > 0 ? λfac * (isfinite(R_eff) ? R_eff : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
+    println(io, "# species rate scale: <R_water>_MC=$(R_w)  <R_solute>_MC=$(R_s)  c_solute=$(c_sol)  (solute share $(share))"); flush(io)
     println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                              debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
-                             species_mu=true, trace_molecule=isol)
+                             species_mu=true, trace_molecule=isol, species_rate_scale=[1.0, c_sol])
     t_ek = time() - t0
     rw, rs = ek.RN_species[1], ek.RN_species[2]
     μ_w = T * log(MCm.ratio_mean(rw)); eμ_w = T * MCm.ratio_jackknife_stderr(rw; f=log)

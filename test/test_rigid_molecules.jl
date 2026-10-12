@@ -451,12 +451,23 @@ end
     iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
     μ_r, eμ_r = T * log(iw), T * eiw / iw
     events = 4_000_000
+    sys_scaled = deepcopy(sys)
     ek = MCm.run_rigid_ekmc!(sys, ff; events=events, sample_every=1, block_events=events ÷ 25,
                              debug_check_every=events ÷ 10, species_mu=true, trace_molecule=Nt)
+    # species rate scaling (solute relocated 30× more often): same μ for both species, exact by balance
+    ek2 = MCm.run_rigid_ekmc!(sys_scaled, ff; events=events ÷ 2, sample_every=1, block_events=events ÷ 50,
+                              debug_check_every=events ÷ 10, species_mu=true, species_rate_scale=[1.0, 30.0])
+    @test ek2.ek.c[Nt] == 30.0 && ek2.ek.c[1] == 1.0
+    μ_sc, eμ_sc = T * log(MCm.ratio_mean(ek2.RN_species[2])), T * MCm.ratio_jackknife_stderr(ek2.RN_species[2]; f=log)
+    μ_w2, eμ_w2 = T * log(MCm.ratio_mean(ek2.RN_species[1])), T * MCm.ratio_jackknife_stderr(ek2.RN_species[1]; f=log)
+    μ_w1, eμ_w1 = T * log(MCm.ratio_mean(ek.RN_species[1])), T * MCm.ratio_jackknife_stderr(ek.RN_species[1]; f=log)
     rs = ek.RN_species[2]
     μ_ek, eμ_ek = T * log(MCm.ratio_mean(rs)), T * MCm.ratio_jackknife_stderr(rs; f=log)
-    @info "LJ solute at infinite dilution, N=32+1 ρ*=0.3 T*=2" μ_w eμ_w μ_ek eμ_ek μ_r eμ_r MCm.mean(mc.U) MCm.mean(ek.U) MCm.mean(mc.P) MCm.mean(ek.P)
+    @info "LJ solute at infinite dilution, N=32+1 ρ*=0.3 T*=2" μ_w eμ_w μ_ek eμ_ek μ_sc eμ_sc μ_w1 μ_w2 μ_r eμ_r MCm.mean(mc.U) MCm.mean(ek.U) MCm.mean(ek2.U) MCm.mean(mc.P) MCm.mean(ek.P)
     @test within3σ(μ_w, eμ_w, μ_ek, eμ_ek)
+    @test within3σ(μ_w, eμ_w, μ_sc, eμ_sc)                    # rate-scaled solute: same infinite-dilution μ
+    @test within3σ(μ_w1, eμ_w1, μ_w2, eμ_w2)                  # solvent species μ unchanged by the scaling
+    @test within3σ(MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(ek2.U), MCm.stderr(ek2.U))
     @test within3σ(MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(ek.U), MCm.stderr(ek.U))
     @test within3σ(MCm.mean(mc.P), MCm.stderr(mc.P), MCm.mean(ek.P), MCm.stderr(ek.P))
     @test μ_r < μ_w - 1.0            # the Metropolis removal estimator misses the overlap region (see above)

@@ -82,7 +82,7 @@ open(out, "w") do io
     t0 = time()
     # MC-kernel hybrid (λ = SPCE_LAMBDA × ⟨R⟩ from a pilot; 0 = pure eKMC). With λ > 0 most events are
     # Metropolis sweeps (2N trials), so EKMC_EVENTS should be ~1e4–1e5, not 1e7.
-    λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))
+    λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))   # 0 = stock (pure) eKMC; the Slurm wrappers pass 100 for the hybrid
     # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
     # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
