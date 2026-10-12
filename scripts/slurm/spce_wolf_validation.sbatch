@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=4G
 #SBATCH --time=24:00:00
 #SBATCH --output=/shared/kmc_polyatomic/slurm_logs/spce_wolf_%A_%a.out
@@ -27,5 +27,5 @@ SEED=${SLURM_ARRAY_TASK_ID:-1}
 
 echo "host=$(hostname) N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED start=$(date)"
 cd "$PROJECT" || exit 1
-"$JULIA" --project="$PROJECT" dev/validate_spce_wolf.jl "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
+"$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_wolf.jl "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
 echo "end=$(date)"

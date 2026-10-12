@@ -51,6 +51,7 @@ struct RigidTemplate
     site_type::Vector{Int}
     site_q::Vector{Float64}
     site_mass::Vector{Float64}
+    extent::Float64             # largest site distance from the COM (interacting sites only)
     function RigidTemplate(name::String, sites_body::Matrix{Float64}, site_type::Vector{Int},
                            site_q::Vector{Float64}, site_mass::Vector{Float64})
         n = size(sites_body, 2)
@@ -60,7 +61,11 @@ struct RigidTemplate
         mtot > 0.0 || error("RigidTemplate: total mass must be positive")
         com = sites_body * site_mass ./ mtot
         sb = sites_body .- com
-        new(name, n, sb, copy(site_type), copy(site_q), copy(site_mass))
+        ext = 0.0
+        for k in 1:n
+            (site_type[k] > 0 || site_q[k] != 0.0) && (ext = max(ext, sqrt(sum(abs2, view(sb, :, k)))))
+        end
+        new(name, n, sb, copy(site_type), copy(site_q), copy(site_mass), ext)
     end
 end
 
@@ -324,6 +329,9 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
         Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
     end
     ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
+    # no site pair can be within rc if the COMs are farther apart than rc + both extents
+    rmax = ff.rc + ti.extent + tj.extent
+    Rx * Rx + Ry * Ry + Rz * Rz >= rmax * rmax && return 0.0
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
     u = 0.0
@@ -368,6 +376,8 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
         Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
     end
     ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
+    rmax = ff.rc + ti.extent + tj.extent
+    Rx * Rx + Ry * Ry + Rz * Rz >= rmax * rmax && return 0.0, 0.0
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
     u = 0.0; w = 0.0
@@ -408,20 +418,92 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
     return u, w
 end
 
-"Removal energy u_k = Σ_{j≠k} u_kj (the eKMC molecular energy, Tan 2017 Eq. 1a)."
-function removal_energy(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64
-    u = 0.0
-    for j in 1:sys.n_mol
-        j == k && continue
-        u += pair_energy(sys, ff, k, j)
+# ----------------------------------------------------------------------------
+# Threaded evaluation of pair rows and totals
+# ----------------------------------------------------------------------------
+# All the cost of MC trials and eKMC events is the row {u_kj, w_kj}_{j≠k}, whose terms are independent;
+# it is split over Julia threads (`julia -t N`) when N_mol ≥ PARALLEL_MIN_MOL. Results are identical
+# to the serial path up to floating-point summation order (the reductions below sum per-thread
+# partials in a fixed order, so a given thread count is deterministic). Random numbers are only drawn
+# on the calling thread.
+
+"Smallest number of molecules for which the pair-row loops are threaded."
+const PARALLEL_MIN_MOL = 96
+
+@inline _use_threads(N::Int) = Threads.nthreads() > 1 && N >= PARALLEL_MIN_MOL
+
+"Fill row_u[j], row_w[j] = pair energy/virial of molecule k with every j ≠ k."
+function eval_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, sys::RigidSystem,
+                   ff::SiteForceField, k::Int)
+    N = sys.n_mol
+    if _use_threads(N)
+        Threads.@threads :static for j in 1:N
+            if j != k
+                u, w = pair_energy_virial(sys, ff, k, j)
+                @inbounds row_u[j] = u; @inbounds row_w[j] = w
+            end
+        end
+    else
+        @inbounds for j in 1:N
+            j == k && continue
+            u, w = pair_energy_virial(sys, ff, k, j)
+            row_u[j] = u; row_w[j] = w
+        end
     end
-    return u
+    @inbounds row_u[k] = 0.0; @inbounds row_w[k] = 0.0
+    return nothing
 end
+
+"Σ_{j≠k} pair_energy(k, j) with a chunked threaded reduction (fixed summation order per chunk count)."
+function _row_energy_sum(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64
+    N = sys.n_mol
+    if _use_threads(N)
+        nt = Threads.nthreads()
+        partial = zeros(Float64, nt)
+        Threads.@threads :static for t in 1:nt
+            lo = (N * (t - 1)) ÷ nt + 1; hi = (N * t) ÷ nt
+            acc = 0.0
+            for j in lo:hi
+                j == k && continue
+                acc += pair_energy(sys, ff, k, j)
+            end
+            @inbounds partial[t] = acc
+        end
+        return sum(partial)
+    else
+        u = 0.0
+        for j in 1:N
+            j == k && continue
+            u += pair_energy(sys, ff, k, j)
+        end
+        return u
+    end
+end
+
+"Removal energy u_k = Σ_{j≠k} u_kj (the eKMC molecular energy, Tan 2017 Eq. 1a)."
+removal_energy(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64 = _row_energy_sum(sys, ff, k)
+
+# Per-task partial sums are indexed by the task number t (rows i ≡ t mod nt, which also balances the
+# triangular loop), never by Threads.threadid(): with Julia ≥ 1.12 the default pool's thread ids start
+# at 2 when an interactive thread exists, so threadid()-indexed arrays overflow.
 
 "Total intermolecular pair energy (no tail, no Wolf constants)."
 function total_pair_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    N = sys.n_mol
+    if _use_threads(N)
+        nt = Threads.nthreads()
+        partial = zeros(Float64, nt)
+        Threads.@threads :static for t in 1:nt
+            acc = 0.0
+            for i in t:nt:N-1, j in i+1:N
+                acc += pair_energy(sys, ff, i, j)
+            end
+            @inbounds partial[t] = acc
+        end
+        return sum(partial)
+    end
     U = 0.0
-    for i in 1:sys.n_mol-1, j in i+1:sys.n_mol
+    for i in 1:N-1, j in i+1:N
         U += pair_energy(sys, ff, i, j)
     end
     return U
@@ -429,8 +511,22 @@ end
 
 "Total intermolecular pair energy and molecular virial."
 function total_pair_energy_virial(sys::RigidSystem, ff::SiteForceField)
+    N = sys.n_mol
+    if _use_threads(N)
+        nt = Threads.nthreads()
+        pU = zeros(Float64, nt); pW = zeros(Float64, nt)
+        Threads.@threads :static for t in 1:nt
+            aU = 0.0; aW = 0.0
+            for i in t:nt:N-1, j in i+1:N
+                u, w = pair_energy_virial(sys, ff, i, j)
+                aU += u; aW += w
+            end
+            @inbounds pU[t] = aU; @inbounds pW[t] = aW
+        end
+        return sum(pU), sum(pW)
+    end
     U = 0.0; W = 0.0
-    for i in 1:sys.n_mol-1, j in i+1:sys.n_mol
+    for i in 1:N-1, j in i+1:N
         u, w = pair_energy_virial(sys, ff, i, j)
         U += u; W += w
     end
@@ -773,13 +869,88 @@ mutable struct RigidEKMCState
     R::Float64
     debug_check_every::Int
     events::Int
+    row_u::Vector{Float64}      # scratch: candidate row for Metropolis trials inside eKMC
+    row_w::Vector{Float64}
+    mc_trials::Int              # Metropolis trials made by the MC-kernel events
+    mc_accepted::Int
+    mc_events::Int              # number of MC-kernel events
 end
 
 function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every::Int=0)
     N = sys.n_mol
-    ek = RigidEKMCState(zeros(N, N), zeros(N, N), zeros(N), zeros(N), zeros(N), 0.0, debug_check_every, 0)
+    ek = RigidEKMCState(zeros(N, N), zeros(N, N), zeros(N), zeros(N), zeros(N), 0.0, debug_check_every, 0,
+                        zeros(N), zeros(N), 0, 0, 0)
     rebuild_rigid_ekmc!(ek, sys, ff)
     return ek
+end
+
+"""
+    ekmc_mc_trial!(ek, sys, ff, i, δ, δθ; rotate) -> accepted::Bool
+
+One Metropolis trial (translation by a uniform displacement in a cube of half-side δ, or rotation
+about a random axis by an angle uniform in ±δθ) on molecule i, evaluated and committed through the
+eKMC pair bookkeeping (row i of energies and virials, φ_j, Σ_j w_ij, mobilities, R). The proposal is
+symmetric, so the kernel preserves the canonical distribution (Metropolis et al. 1953).
+"""
+function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, i::Int,
+                        δ::Float64, δθ::Float64; rotate::Bool)::Bool
+    N = sys.n_mol
+    ek.mc_trials += 1
+    com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    if rotate
+        set_molecule!(sys, i, com_old, quat_mul(small_rotation_quaternion(sys.rng, δθ), q_old))
+    else
+        set_molecule!(sys, i, MVector{3,Float64}(com_old[1] + (2rand(sys.rng) - 1) * δ,
+                                                 com_old[2] + (2rand(sys.rng) - 1) * δ,
+                                                 com_old[3] + (2rand(sys.rng) - 1) * δ), q_old)
+    end
+    eval_row!(ek.row_u, ek.row_w, sys, ff, i)
+    ΔU = 0.0
+    @inbounds for j in 1:N
+        j == i && continue
+        ΔU += ek.row_u[j] - ek.pair_u[i, j]
+    end
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        β = sys.β
+        phii = 0.0; wi = 0.0
+        @inbounds for j in 1:N
+            j == i && continue
+            du = ek.row_u[j] - ek.pair_u[i, j]; dw = ek.row_w[j] - ek.pair_w[i, j]
+            ek.pair_u[i, j] = ek.row_u[j]; ek.pair_u[j, i] = ek.row_u[j]
+            ek.pair_w[i, j] = ek.row_w[j]; ek.pair_w[j, i] = ek.row_w[j]
+            if du != 0.0
+                ek.phi[j] += du
+                ek.m[j] = exp(β * ek.phi[j])
+            end
+            ek.wsum[j] += dw
+            phii += ek.row_u[j]; wi += ek.row_w[j]
+        end
+        ek.phi[i] = phii; ek.wsum[i] = wi
+        ek.m[i] = exp(β * phii)
+        ek.R = sum(ek.m)                      # never incremental (see update_rigid_ekmc_after_move!)
+        ek.mc_accepted += 1
+        return true
+    end
+    set_molecule!(sys, i, com_old, q_old)
+    return false
+end
+
+"""
+    ekmc_mc_sweep!(ek, sys, ff, δ, δθ)
+
+The MC-kernel event: N translation and N rotation trials on randomly chosen molecules, then R is
+recomputed from the mobilities to prevent round-off drift.
+"""
+function ekmc_mc_sweep!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, δ::Float64, δθ::Float64)
+    N = sys.n_mol
+    for _ in 1:N
+        ekmc_mc_trial!(ek, sys, ff, rand(sys.rng, 1:N), δ, δθ; rotate=false)
+        ekmc_mc_trial!(ek, sys, ff, rand(sys.rng, 1:N), δ, δθ; rotate=true)
+    end
+    ek.R = sum(ek.m)
+    ek.mc_events += 1
+    return nothing
 end
 
 "Total molecular virial from the maintained pair virials."
@@ -789,12 +960,28 @@ ekmc_virial(ek::RigidEKMCState) = 0.5 * sum(ek.wsum)
 function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
     N = sys.n_mol
     fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0); fill!(ek.pair_w, 0.0); fill!(ek.wsum, 0.0)
-    for i in 1:N-1, j in i+1:N
-        u, w = pair_energy_virial(sys, ff, i, j)
-        ek.pair_u[i, j] = u; ek.pair_u[j, i] = u
-        ek.pair_w[i, j] = w; ek.pair_w[j, i] = w
-        ek.phi[i] += u; ek.phi[j] += u
-        ek.wsum[i] += w; ek.wsum[j] += w
+    if _use_threads(N)
+        nt = Threads.nthreads()
+        Threads.@threads :static for t in 1:nt            # rows i ≡ t (mod nt); distinct cells: no races
+            for i in t:nt:N-1, j in i+1:N
+                u, w = pair_energy_virial(sys, ff, i, j)
+                @inbounds begin
+                    ek.pair_u[i, j] = u; ek.pair_u[j, i] = u
+                    ek.pair_w[i, j] = w; ek.pair_w[j, i] = w
+                end
+            end
+        end
+        @inbounds for i in 1:N
+            ek.phi[i] = sum(view(ek.pair_u, :, i)); ek.wsum[i] = sum(view(ek.pair_w, :, i))
+        end
+    else
+        for i in 1:N-1, j in i+1:N
+            u, w = pair_energy_virial(sys, ff, i, j)
+            ek.pair_u[i, j] = u; ek.pair_u[j, i] = u
+            ek.pair_w[i, j] = w; ek.pair_w[j, i] = w
+            ek.phi[i] += u; ek.phi[j] += u
+            ek.wsum[i] += w; ek.wsum[j] += w
+        end
     end
     R = 0.0
     for i in 1:N
@@ -809,22 +996,30 @@ end
 function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, k::Int)
     N = sys.n_mol
     β = sys.β
+    eval_row!(ek.row_u, ek.row_w, sys, ff, k)          # threaded when N ≥ PARALLEL_MIN_MOL
     phik = 0.0; wk = 0.0
     @inbounds for j in 1:N
         j == k && continue
         u_old = ek.pair_u[k, j]; w_old = ek.pair_w[k, j]
-        u_new, w_new = pair_energy_virial(sys, ff, k, j)
-        ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
-        ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
-        ek.phi[j] += u_new - u_old
-        ek.wsum[j] += w_new - w_old
+        u_new = ek.row_u[j]; w_new = ek.row_w[j]
+        if u_new != u_old
+            ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
+            ek.phi[j] += u_new - u_old
+            ek.m[j] = exp(β * ek.phi[j])
+        end
+        if w_new != w_old
+            ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
+            ek.wsum[j] += w_new - w_old
+        end
         phik += u_new; wk += w_new
     end
     ek.phi[k] = phik; ek.wsum[k] = wk
-    R = 0.0
-    @inbounds for j in 1:N
-        ek.m[j] = exp(β * ek.phi[j]); R += ek.m[j]
-    end
+    ek.m[k] = exp(β * phik)
+    # R is always resummed: mobilities span ~50 orders of magnitude (a relocated molecule can have
+    # exp(βu) ≈ 1e48), so an incremental R = R + Δm suffers catastrophic cancellation when such a term
+    # is removed (found by the LJ-diatomic MC↔eKMC test, 2026-10-11). The O(N) sum is negligible; only
+    # the exponentials of the molecules whose φ changed are recomputed above.
+    R = sum(ek.m)
     ek.R = R
     (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R after moving molecule $k")
     return nothing
@@ -914,6 +1109,22 @@ function rigid_ekmc_newton_volume_move!(ek::RigidEKMCState, sys::RigidSystem, ff
     return P̄
 end
 
+"""
+    estimate_relocation_rate(sys, ff; events=20_000) -> ⟨R⟩_time
+
+Pilot run of pure eKMC (modifies `sys`) returning the time-weighted mean of the relocation rate,
+⟨R⟩ = M / t_total = N exp(βμ_ex) (Tan 2018 Eq. 7), the natural scale for `mc_kernel_rate`.
+"""
+function estimate_relocation_rate(sys::RigidSystem, ff::SiteForceField; events::Int=20_000)
+    ek = init_rigid_ekmc(sys, ff)
+    acc = ChemicalPotentialAccumulator()
+    t = 0.0
+    for _ in 1:events
+        t += rigid_ekmc_step!(ek, sys, ff, acc)
+    end
+    return events / t
+end
+
 "Time-weighted block averager: blocks of `block_events` events, block mean = Σ x Δt / Σ Δt."
 mutable struct TimeWeightedBlockAverager
     block_events::Int
@@ -989,7 +1200,19 @@ maintained incrementally with the pair energies, so the pressure costs nothing p
 `max_dV`), after which the Robbins–Monro gain 1/(k − k0 + 1) lets the volume converge; observables
 are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N).
 `tail_route` (`:virial` or `:thermodynamic`, see `pressure`) selects the tail pressure used both in
-the volume controller and in the reported P. `vol_scheme = :newton` (default) applies Kelly's secant
+the volume controller and in the reported P.
+
+MC-kernel hybrid (`mc_kernel_rate` = λ > 0): an extra event of constant rate λ whose action is one
+Metropolis sweep (N translations of half-width `mc_δ` and N rotations of half-angle `mc_δθ`, done
+through the eKMC bookkeeping by `ekmc_mc_sweep!`). The generator is Q_eKMC + λ(K − I) with K the
+Metropolis kernel; both terms satisfy detailed balance with the canonical distribution, so the
+chain stays balanced and the time averages canonical. Residence times are ln(1/ξ)/(R + λ): with λ
+of the order of R in relaxed states the weights of relaxed configurations become nearly uniform,
+which removes the heavy tail that uniform relocation alone produces in hydrogen-bonded liquids
+(JOURNAL entry 5), while a mis-placed molecule (R ≫ λ) is still relocated at once. The μ observable
+is unchanged: ⟨R/N⟩_time with R = Σ exp(βu_i) (the relocation rate, not R + λ); the Tan shortcut
+⟨R⟩ = M/t_total no longer applies. λ must be a constant for the run (a state-dependent λ would break
+balance); `estimate_relocation_rate` gives the scale from a short pilot. `vol_scheme = :newton` (default) applies Kelly's secant
 update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
 threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
 half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
@@ -1008,8 +1231,11 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
                          vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
-                         vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial)
+                         vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
+                         mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3)
     N = sys.n_mol
+    λ = mc_kernel_rate
+    λ >= 0.0 || error("run_rigid_ekmc!: mc_kernel_rate must be ≥ 0")
     vol_pressure in (:partial_average, :instantaneous) ||
         error("run_rigid_ekmc!: vol_pressure must be :partial_average or :instantaneous")
     vol_scheme in (:newton, :auxiliary) ||
@@ -1036,9 +1262,10 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     dV_history = Float64[]
     for ev in 1:events
         # weight of the current configuration: draw its Δt here and reuse it in the step
-        R = ek.R
+        R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
+        Rtot = R + λ                   # total event rate incl. the MC-kernel event
         u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
-        dt = log(1 / u) / R
+        dt = log(1 / u) / Rtot
         V = sys.L^3
         if Pext !== nothing
             # pressure is free from the maintained virial; time-weight it over every event of the block
@@ -1053,19 +1280,15 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             push!(ba_RN, R / N, dt)
             push!(ba_RNV, R / N / V, dt)
             push!(acc_npt, R / N, V, dt)
-            # perform the event with this dt (same statistics as rigid_ekmc_step!)
+        end
+        if ev > burnin_events
             acc.t_total += dt; RN = R / N
             acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
-            k = select_by_mobility(ek, sys.rng)
-            L = sys.L
-            set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
-                          uniform_random_quaternion(sys.rng))
-            update_rigid_ekmc_after_move!(ek, sys, ff, k)
+        end
+        # the event: MC-kernel sweep with probability λ/(R+λ), otherwise a relocation
+        if λ > 0.0 && rand(sys.rng) * Rtot < λ
+            ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
         else
-            if ev > burnin_events
-                acc.t_total += dt; RN = R / N
-                acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
-            end
             k = select_by_mobility(ek, sys.rng)
             L = sys.L
             set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
@@ -1112,5 +1335,6 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
         end
     end
     return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, RN=ba_RN, RNV=ba_RNV, mu=acc, mu_npt=acc_npt,
-            t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history)
+            t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
+            mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN)
 end
