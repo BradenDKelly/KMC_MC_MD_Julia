@@ -77,7 +77,14 @@ LJ parameters per site type (Lorentz–Berthelot mixing, same tables as `LJParam
 `rc` shared by LJ and Coulomb, and the Coulomb model (`:none` or `:wolf` with damping `α`).
 `shift_lj=true` uses the cut-and-shifted LJ, u(r) − u(rc), which is continuous at rc so that the
 virial pressure needs no impulsive correction (the `:shifted` model of `LJParams`); the tail
-corrections are those of the truncated potential in both cases. `cutoff=:molecule` includes all site
+corrections are those of the truncated potential in both cases. `cap_factor` sets the molecule-pair overlap cap
+U_cap = cap_factor·ϵ_ab (default `OVERLAP_U_REDUCED` = 100, the LJ value of Kelly's thesis §3.5). **For
+charged molecules the cap must exceed any binding energy a molecule can gain by overlapping**: with
+100 ϵ the SPC/E liquid at 298 K keeps ~1 % of its molecules in O–O overlaps (a capped pair costs
++100 ϵ = 65 kJ/mol while a water molecule's bonds are worth −140 ϵ), which lowers the energy, raises
+the density and hides +8000 ϵ of real Coulomb repulsion per overlapped pair (2026-10-12 diagnostic);
+`spce_model` therefore uses cap_factor = 1000 (mobilities are clamped at exp(MOBILITY_LOG_MAX) so
+multiply-capped molecules cannot overflow R). `cutoff=:molecule` includes all site
 pairs of a molecule pair iff the COM separation is below rc (group-based cutoff, Allen & Tildesley
 §5.2.1): the Wolf shift terms −q_i q_j erfc(α rc)/rc then cancel exactly for neutral molecules, which
 removes the artificial ±|q_i q_j| erfc(α rc)/rc energies that a site-based cutoff gives to molecule
@@ -105,12 +112,12 @@ end
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
                         coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
                         use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
-                        cutoff::Symbol=:site)
+                        cutoff::Symbol=:site, cap_factor::Float64=Float64(OVERLAP_U_REDUCED))
     coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
     cutoff in (:site, :molecule) || error("SiteForceField: cutoff must be :site or :molecule")
     σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
     rcap2 = (OVERLAP_R_REDUCED .* σ_mix) .^ 2
-    ucap = OVERLAP_U_REDUCED .* ϵ_mix
+    ucap = cap_factor .* ϵ_mix
     wp = WolfParams(α, rc, ke; model=:wolf)
     u_rc = [4.0 * ϵ_mix[a, b] * ((σ_mix[a, b] / rc)^12 - (σ_mix[a, b] / rc)^6)
             for a in 1:length(σ_types), b in 1:length(σ_types)]
@@ -135,7 +142,7 @@ and the conversion constants (`σ_angstrom`, `ϵ_kelvin`, `q_scale`): T* = T/ϵ_
 """
 function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
                     use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
-                    cutoff::Symbol=:site)
+                    cutoff::Symbol=:site, cap_factor::Float64=1000.0)
     σ_A = 3.16555789
     ϵ_K = 78.19743111
     q_H = 0.42380
@@ -151,7 +158,7 @@ function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
                          [15.9994, 1.00794, 1.00794])
     ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=:wolf,
                         α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
-                        shift_lj=shift_lj, cutoff=cutoff)
+                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor)
     return (template=tmpl, ff=ff, σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=q_scale)
 end
 
@@ -447,6 +454,15 @@ end
 # to the serial path up to floating-point summation order (the reductions below sum per-thread
 # partials in a fixed order, so a given thread count is deterministic). Random numbers are only drawn
 # on the calling thread.
+
+"""
+Upper bound on β·φ_i in the mobility exp(β φ_i). A molecule with k capped pairs has β φ_i ≈ k·β·U_cap;
+with U_cap = 1000 ϵ at T* ≈ 4 that is ≈ 260 k, so k ≥ 3 would overflow Float64. Clamping changes only
+the rates of states whose time weight is below exp(−600) — negligible by any measure — and keeps the
+selection of the overlapping molecule as the next mover certain.
+"""
+const MOBILITY_LOG_MAX = 600.0
+@inline _mobility(β::Float64, φ::Float64) = exp(min(β * φ, MOBILITY_LOG_MAX))
 
 "Smallest number of molecules for which the pair-row loops are threaded."
 const PARALLEL_MIN_MOL = 96
@@ -942,13 +958,13 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
             ek.pair_w[i, j] = ek.row_w[j]; ek.pair_w[j, i] = ek.row_w[j]
             if du != 0.0
                 ek.phi[j] += du
-                ek.m[j] = exp(β * ek.phi[j])
+                ek.m[j] = _mobility(β, ek.phi[j])
             end
             ek.wsum[j] += dw
             phii += ek.row_u[j]; wi += ek.row_w[j]
         end
         ek.phi[i] = phii; ek.wsum[i] = wi
-        ek.m[i] = exp(β * phii)
+        ek.m[i] = _mobility(β, phii)
         ek.R = sum(ek.m)                      # never incremental (see update_rigid_ekmc_after_move!)
         ek.mc_accepted += 1
         return true
@@ -1006,7 +1022,7 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     end
     R = 0.0
     for i in 1:N
-        ek.m[i] = exp(sys.β * ek.phi[i]); R += ek.m[i]
+        ek.m[i] = _mobility(sys.β, ek.phi[i]); R += ek.m[i]
     end
     ek.R = R
     (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R")
@@ -1026,7 +1042,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         if u_new != u_old
             ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
             ek.phi[j] += u_new - u_old
-            ek.m[j] = exp(β * ek.phi[j])
+            ek.m[j] = _mobility(β, ek.phi[j])
         end
         if w_new != w_old
             ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
@@ -1035,7 +1051,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         phik += u_new; wk += w_new
     end
     ek.phi[k] = phik; ek.wsum[k] = wk
-    ek.m[k] = exp(β * phik)
+    ek.m[k] = _mobility(β, phik)
     # R is always resummed: mobilities span ~50 orders of magnitude (a relocated molecule can have
     # exp(βu) ≈ 1e48), so an incremental R = R + Δm suffers catastrophic cancellation when such a term
     # is removed (found by the LJ-diatomic MC↔eKMC test, 2026-10-11). The O(N) sum is negligible; only
