@@ -74,7 +74,8 @@ end
                    cap_overlaps=true)
 
 LJ parameters per site type (Lorentz–Berthelot mixing, same tables as `LJParams`), site-based cutoff
-`rc` shared by LJ and Coulomb, and the Coulomb model (`:none` or `:wolf` with damping `α`).
+`rc` shared by LJ and Coulomb, and the Coulomb model: `:none`, `:wolf` (damping `α`), or `:rf` (GROMACS
+reaction field with `epsilon_rf`, default ∞; `RFParams`), the model GROMACS can run too.
 `shift_lj=true` uses the cut-and-shifted LJ, u(r) − u(rc), which is continuous at rc so that the
 virial pressure needs no impulsive correction (the `:shifted` model of `LJParams`); the tail
 corrections are those of the truncated potential in both cases. `cap_factor` sets the molecule-pair overlap cap
@@ -108,14 +109,15 @@ struct SiteForceField
     shift_lj::Bool
     u_rc_mix::Matrix{Float64}   # LJ value at rc per type pair (subtracted when shift_lj)
     cutoff::Symbol              # :site (each site pair tested against rc) or :molecule (COM distance)
+    rf::RFParams                # reaction-field parameters (used when coulomb === :rf)
 end
 
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
                         coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
                         use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
                         cutoff::Symbol=:site, cap_factor::Float64=Float64(OVERLAP_U_REDUCED),
-                        mixing::Symbol=:lorentz_berthelot)
-    coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
+                        mixing::Symbol=:lorentz_berthelot, epsilon_rf::Float64=Inf, epsilon_r::Float64=1.0)
+    coulomb in (:none, :wolf, :rf) || error("SiteForceField: coulomb must be :none, :wolf or :rf")
     cutoff in (:site, :molecule) || error("SiteForceField: cutoff must be :site or :molecule")
     mixing in (:lorentz_berthelot, :geometric) ||
         error("SiteForceField: mixing must be :lorentz_berthelot or :geometric")
@@ -131,8 +133,9 @@ function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc
     wp = WolfParams(α, rc, ke; model=:wolf)
     u_rc = [4.0 * ϵ_mix[a, b] * ((σ_mix[a, b] / rc)^12 - (σ_mix[a, b] / rc)^6)
             for a in 1:length(σ_types), b in 1:length(σ_types)]
+    rfp = RFParams(rc, ke; ε_rf=epsilon_rf, ε_r=epsilon_r)
     return SiteForceField(length(σ_types), σ_mix, ϵ_mix, rcap2, ucap, rc, rc * rc, coulomb, wp,
-                          use_lrc, cap_overlaps, shift_lj, u_rc, cutoff)
+                          use_lrc, cap_overlaps, shift_lj, u_rc, cutoff, rfp)
 end
 
 # ============================================================================
@@ -143,7 +146,7 @@ end
 const KE_K_ANGSTROM_CODATA2010 = (1.602176565e-19)^2 / (4π * 8.854187817e-12 * 1.3806488e-23) * 1e10
 
 """
-    spce_model(; α_per_angstrom=0.16, rc_angstrom=10.0)
+    spce_model(; α_per_angstrom=0.16, rc_angstrom=10.0, coulomb=:wolf, epsilon_rf=Inf, cutoff=:site, ...)
 
 SPC/E water (Berendsen, Grigera, Straatsma, J. Phys. Chem. 91 (1987) 6269; NIST parameter values) in
 reduced units with σ_OO = ϵ_OO = k_B = 1. Returns a NamedTuple with the template, the force field,
@@ -152,7 +155,8 @@ and the conversion constants (`σ_angstrom`, `ϵ_kelvin`, `q_scale`): T* = T/ϵ_
 """
 function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
                     use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
-                    cutoff::Symbol=:site, cap_factor::Float64=1000.0)
+                    cutoff::Symbol=:site, cap_factor::Float64=1000.0, coulomb::Symbol=:wolf,
+                    epsilon_rf::Float64=Inf)
     σ_A = 3.16555789
     ϵ_K = 78.19743111
     q_H = 0.42380
@@ -166,9 +170,9 @@ function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
     tmpl = RigidTemplate("SPC/E", sites, [1, 0, 0],
                          [-2 * q_H * q_scale, q_H * q_scale, q_H * q_scale],
                          [15.9994, 1.00794, 1.00794])
-    ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=:wolf,
+    ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=coulomb,
                         α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
-                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor)
+                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor, epsilon_rf=epsilon_rf)
     return (template=tmpl, ff=ff, σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=q_scale)
 end
 
@@ -389,6 +393,8 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             qm = tj.site_q[m]
             if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
                 u += molcut ? wolf_pair_u_nocut(sqrt(r2), qn, qm, ff.wolf) : wolf_pair_u(sqrt(r2), qn, qm, ff.wolf)
+            elseif ff.coulomb === :rf && qn != 0.0 && qm != 0.0
+                u += rf_pair_u(sqrt(r2), qn, qm, ff.rf)
             end
         end
     end
@@ -448,6 +454,10 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
                 u += molcut ? wolf_pair_u_nocut(r, qn, qm, ff.wolf) : wolf_pair_u(r, qn, qm, ff.wolf)
                 # −r du/dr of ke q q [erfc(αr)/r − erfc(α rc)/rc]
                 fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
+            elseif ff.coulomb === :rf && qn != 0.0 && qm != 0.0
+                r = sqrt(r2)
+                u += rf_pair_u(r, qn, qm, ff.rf)
+                fr += rf_pair_fr(r, qn, qm, ff.rf)
             end
             # R_ij · r̂^{nm} (−du/dr) = (R·r)/r² · (−r du/dr)
             w += (Rx * dx + Ry * dy + Rz * dz) / r2 * fr
@@ -625,11 +635,28 @@ Configuration-independent Wolf terms (self + intramolecular exclusion) of all mo
 pair energy to compare absolute energies with Ewald.
 """
 function wolf_constant_energy(sys::RigidSystem, ff::SiteForceField)::Float64
-    ff.coulomb === :wolf || return 0.0
+    ff.coulomb === :none && return 0.0
     E = 0.0
-    wp = ff.wolf
     for i in 1:sys.n_mol
-        t = sys.templates[sys.tmpl[i]]
+        E += coulomb_molecule_constant(sys.templates[sys.tmpl[i]], ff)
+    end
+    return E
+end
+
+"""
+    coulomb_molecule_constant(template, ff) -> E
+
+Configuration-independent Coulomb terms of one rigid molecule in the force field's model: for `:wolf`
+the self term and the intramolecular exclusion correction (see `wolf_intra_energy`), for `:rf` the
+GROMACS excluded-pair corrections plus self terms (= −ke k_rf |μ|²/ε_r for a neutral molecule), 0 for
+`:none`. Per molecule these are constants of the sampled Hamiltonian; they enter absolute energies and —
+for `:rf`, where GROMACS carries them in a decoupling ΔG — the chemical potential of the species:
+μ_ex,GROMACS-RF = kT ln⟨exp(βu_s)⟩ + E_const(s) + ΔU_tail(s).
+"""
+function coulomb_molecule_constant(t::RigidTemplate, ff::SiteForceField)::Float64
+    E = 0.0
+    if ff.coulomb === :wolf
+        wp = ff.wolf
         for n in 1:t.n_sites
             E -= wp.ke * (erfc(wp.α * wp.rc) / (2 * wp.rc) + wp.α / SQRT_PI) * t.site_q[n]^2
             for m in n+1:t.n_sites
@@ -638,9 +665,17 @@ function wolf_constant_energy(sys::RigidSystem, ff::SiteForceField)::Float64
                 E -= wp.ke * t.site_q[n] * t.site_q[m] / r - wolf_pair_u(r, t.site_q[n], t.site_q[m], wp)
             end
         end
+    elseif ff.coulomb === :rf
+        p = ff.rf
+        E += rf_self_energy(t.site_q, p)
+        for n in 1:t.n_sites, m in n+1:t.n_sites
+            (t.site_q[n] == 0.0 || t.site_q[m] == 0.0) && continue
+            E += rf_excluded_u(norm(t.sites_body[:, n] - t.sites_body[:, m]), t.site_q[n], t.site_q[m], p)
+        end
     end
     return E
 end
+const coulomb_constant_energy = wolf_constant_energy
 
 "Total configurational energy U = pair sum + tail correction (+ Wolf constants if `with_constants`)."
 function total_energy(sys::RigidSystem, ff::SiteForceField; with_constants::Bool=false)::Float64

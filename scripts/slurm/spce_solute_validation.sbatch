@@ -28,6 +28,7 @@ export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_
 mkdir -p "$OUT"
 
 echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED alpha=$SPCE_ALPHA cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA start=$(date)"
+export SPCE_COULOMB=${SPCE_COULOMB:-wolf} SPCE_EPS_RF=${SPCE_EPS_RF:-0}
 cd "$PROJECT" || exit 1
 "$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_solute.jl "$SOLUTE" "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
 echo "end=$(date)"

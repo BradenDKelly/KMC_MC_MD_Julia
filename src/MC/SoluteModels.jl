@@ -86,18 +86,21 @@ geometric for OPLS-AA, applied to the water–solute cross terms too), and the c
 """
 function spce_solute_model(solute::Symbol; α_per_angstrom::Float64=0.20, rc_angstrom::Float64=10.0,
                            use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
-                           cutoff::Symbol=:molecule, cap_factor::Float64=1000.0)
+                           cutoff::Symbol=:molecule, cap_factor::Float64=1000.0, coulomb::Symbol=:wolf,
+                           epsilon_rf::Float64=Inf)
     m = spce_model(; α_per_angstrom=α_per_angstrom, rc_angstrom=rc_angstrom, use_lrc=use_lrc,
-                   cap_overlaps=cap_overlaps, shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor)
+                   cap_overlaps=cap_overlaps, shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor,
+                   coulomb=coulomb, epsilon_rf=epsilon_rf)
     σ_A, ϵ_K, qs = m.σ_angstrom, m.ϵ_kelvin, m.q_scale
     p = trappe_ua_solute(solute)
     types = [t > 0 ? t + 1 : 0 for t in p.types]          # shift past the water O type
     tmpl = RigidTemplate(p.name, p.sites ./ σ_A, types, p.q .* qs, p.mass)
     σ_types = vcat(1.0, [σ / σ_A for (σ, _) in p.lj])
     ϵ_types = vcat(1.0, [ϵ / ϵ_K for (_, ϵ) in p.lj])
-    ff = SiteForceField(σ_types, ϵ_types; rc=rc_angstrom / σ_A, coulomb=:wolf,
+    ff = SiteForceField(σ_types, ϵ_types; rc=rc_angstrom / σ_A, coulomb=coulomb,
                         α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
-                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor, mixing=p.mixing)
+                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor, mixing=p.mixing,
+                        epsilon_rf=epsilon_rf)
     return (templates=[m.template, tmpl], water=m.template, solute=tmpl, ff=ff,
             σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=qs, mixing=p.mixing)
 end

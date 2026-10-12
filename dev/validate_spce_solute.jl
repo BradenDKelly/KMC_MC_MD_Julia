@@ -34,12 +34,15 @@ outdir = length(ARGS) >= 6 ? ARGS[6] : joinpath(@__DIR__, "results", "spce_solut
 mkpath(outdir)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.20"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "molecule"))
+coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
+ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
+elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "10"))
 tag = get(ENV, "SPCE_TAG", "")
 
-m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
+m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
 ff = m.ff
-out = joinpath(outdir, "spce_$(solute)_N$(N)_seed$(seed)_$(cutoff)_a$(α_A)_cap$(Int(ff.ucap_mix[1,1]))$(tag).txt")
+out = joinpath(outdir, "spce_$(solute)_N$(N)_seed$(seed)_$(cutoff)_$(elec_tag)_cap$(Int(ff.ucap_mix[1,1]))$(tag).txt")
 T_K = 300.0
 T = T_K / m.ϵ_kelvin
 ρ_A3 = 1000.0 * 1e3 / 18.0153 * 6.02214129e23 / 1e30                       # water molecules per Å³
@@ -68,7 +71,7 @@ end
 
 open(out, "w") do io
     println(io, "# SPC/E + $(m.solute.name) at infinite dilution  $(Dates.now())  N_water=$N + 1 solute  L=$(round(L_A; digits=3)) Å  T=$T_K K  ρ_water=1000 kg/m³")
-    println(io, "# Wolf α=$(α_A) 1/Å rc=10 Å cutoff=$(cutoff) cap=$(Int(ff.ucap_mix[1,1])) ϵ; LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
+    println(io, "# Coulomb=$(coulomb) (Wolf α=$(α_A) 1/Å | RF ε_rf=$(ε_rf)) rc=10 Å cutoff=$(cutoff) cap=$(Int(ff.ucap_mix[1,1])) ϵ; LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
     flush(io)
     rc_check = ff.rc + m.water.extent + max(m.water.extent, m.solute.extent)
     rc_check < L / 2 || println(io, "# WARNING: rc + molecule extents = $(rc_check) ≥ L/2 = $(L/2)")
@@ -79,6 +82,11 @@ open(out, "w") do io
     water_only = MCm.RigidSystem(m.templates, fill(1, N), L, 1 / T, Xoshiro(0))
     ΔU_tail = MCm.lrc_energy(sys, ff) - MCm.lrc_energy(water_only, ff)        # tail energy of the one solute
     println(io, "# solute LJ tail ΔU_tail = $(round(ΔU_tail * kJmol_per_eps; digits=4)) kJ/mol (added to every solute μ_ex below)")
+    # per-molecule Coulomb constant of the model (RF: excluded-pair + self terms = −ke k_rf μ²; Wolf: self + intra).
+    # For the GROMACS reaction-field decoupling ΔG this constant is part of −ΔG and must be added (printed as
+    # mu_sol_rfconst); for Wolf vs PME it is a damping artefact and the pair-only value is the one to compare.
+    E_const = MCm.coulomb_molecule_constant(m.solute, ff)
+    println(io, "# solute Coulomb constant E_const = $(round(E_const * kJmol_per_eps; digits=4)) kJ/mol (model $(coulomb)); mu + E_const is the GROMACS-RF comparable value")
 
     # --- Metropolis MC: equilibrate + production (Widom insertion and removal estimators of the solute) ---
     st = MCm.RigidMCStats()
@@ -127,6 +135,7 @@ open(out, "w") do io
             MCm.mean(ek.P) * atm_per_pstar, MCm.stderr(ek.P) * atm_per_pstar,
             μ_w * kJmol_per_eps, eμ_w * kJmol_per_eps, μ_s * kJmol_per_eps, eμ_s * kJmol_per_eps,
             length(rs.block_sum_x), MCm.mu_ex(ek.mu, T) * kJmol_per_eps, ek.t_total / ekmc_events, ek.mc_acceptance)
+    @printf(io, "# eKMC mu_sol + E_const = %.2f ± %.2f kJ/mol (GROMACS-RF comparable; model %s)\n", (μ_s + E_const) * kJmol_per_eps, eμ_s * kJmol_per_eps, String(coulomb))
     println(io, "# eKMC solute block μ (kJ/mol): ", join(round.((T .* log.(rs.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC water block μ (kJ/mol):  ", join(round.(T .* log.(rw.block_means) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC block times: ", join(round.(rs.block_sum_t; sigdigits=3), " "))

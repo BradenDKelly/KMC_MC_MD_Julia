@@ -23,10 +23,13 @@ mkpath(outdir)
 # force-field variant from the environment (defaults = the site-cutoff α = 0.16 Å⁻¹ model of the first runs)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.16"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
+coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
+ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
+elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 
-m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
+m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
 tag = get(ENV, "SPCE_TAG", "")
-out = joinpath(outdir, "spce_npt_N$(N)_seed$(seed)_$(tail_route)_$(cutoff)_a$(α_A)_cap$(Int(m.ff.ucap_mix[1,1]))$(tag).txt")
+out = joinpath(outdir, "spce_npt_N$(N)_seed$(seed)_$(tail_route)_$(cutoff)_$(elec_tag)_cap$(Int(m.ff.ucap_mix[1,1]))$(tag).txt")
 ff = m.ff
 T_K = 298.15; P_bar = 1.0
 T = T_K / m.ϵ_kelvin

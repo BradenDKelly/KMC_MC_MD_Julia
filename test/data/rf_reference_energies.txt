@@ -1,0 +1,7 @@
+# GROMACS 2024.3 (mixed precision) gmx mdrun -rerun energies, kJ/mol, for rf_reference_spce_methanol.gro
+# (500 SPC/E + 1 OPLS-AA rigid methanol, L = 2.463884 nm; rvdw = rcoulomb = 1.0 nm, vdw-modifier None, DispCorr EnerPres;
+#  generated 2026-10-12 by dev/gromacs_rf_reference.jl + gromacs_fe/rf_ref; topology gromacs_fe/methanol_aa.top)
+# setting  eps_rf  LJ_SR  Disper_corr  Coulomb_SR
+rfinf inf 3370.079346 -92.536018 -24044.769531
+rf78 78 3370.079346 -92.536018 -24045.349609
+cut 1 3370.079346 -92.536018 -24073.947266

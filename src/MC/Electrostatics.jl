@@ -86,6 +86,77 @@ struct WolfParams
     end
 end
 
+"""
+    RFParams(rc, ke; ε_rf=Inf, ε_r=1.0)
+
+Reaction-field Coulomb exactly as GROMACS defines it for the Verlet scheme (Reference Manual 2024.3,
+"Coulomb interaction with reaction field", Eqs. 152–156): pair term ke q_i q_j/ε_r [1/r + k_rf r² − c_rf]
+for r < rc (zero at rc), k_rf = (ε_rf − ε_r)/((2ε_rf + ε_r) rc³), c_rf = 1/rc + k_rf rc²; every *excluded*
+(intramolecular) pair gets ke q_i q_j/ε_r (k_rf r² − c_rf) and every charge the self term
+−ke q_i² c_rf/(2ε_r). GROMACS `epsilon-rf = 0` means ε_rf = ∞ (k_rf = 1/(2rc³)); ε_rf = ε_r is the plain
+shifted cut-off (`coulombtype = Cut-off`). For a neutral rigid molecule the excluded + self constants sum
+to −ke k_rf |μ|²/ε_r (dipole self-energy in the reaction field), see `rf_molecule_constant`.
+"""
+struct RFParams
+    rc::Float64
+    ke::Float64
+    ε_r::Float64
+    ε_rf::Float64
+    k_rf::Float64
+    c_rf::Float64
+    function RFParams(rc::Float64, ke::Float64; ε_rf::Float64=Inf, ε_r::Float64=1.0)
+        rc > 0 || error("RFParams: rc must be positive")
+        k = isinf(ε_rf) ? 1.0 / (2.0 * rc^3) : (ε_rf - ε_r) / ((2.0 * ε_rf + ε_r) * rc^3)
+        new(rc, ke, ε_r, ε_rf, k, 1.0 / rc + k * rc^2)
+    end
+end
+
+"Reaction-field pair energy for r < rc (zero at rc)."
+@inline rf_pair_u(r::Float64, qi::Float64, qj::Float64, p::RFParams)::Float64 =
+    p.ke * qi * qj / p.ε_r * (1.0 / r + p.k_rf * r * r - p.c_rf)
+
+"−r du/dr of the reaction-field pair term (for the virial)."
+@inline rf_pair_fr(r::Float64, qi::Float64, qj::Float64, p::RFParams)::Float64 =
+    p.ke * qi * qj / p.ε_r * (1.0 / r - 2.0 * p.k_rf * r * r)
+
+"Reaction-field correction of an excluded pair at separation r."
+@inline rf_excluded_u(r::Float64, qi::Float64, qj::Float64, p::RFParams)::Float64 =
+    p.ke * qi * qj / p.ε_r * (p.k_rf * r * r - p.c_rf)
+
+"Reaction-field self term −ke Σ q_i² c_rf/(2ε_r)."
+rf_self_energy(q::AbstractVector{Float64}, p::RFParams)::Float64 = -p.ke * p.c_rf / (2.0 * p.ε_r) * sum(abs2, q)
+
+"""
+    rf_energy(pos, q, mol, L, p::RFParams) -> (pair, excluded, self)
+
+Flat-array reaction-field energy of rigid molecules in a cubic box: site-based cutoff pair sum over
+different molecules (minimum image), the excluded-pair correction over all same-molecule pairs, and the
+self term — the three pieces of GROMACS's "Coulomb (SR)" with `coulombtype = Reaction-Field`.
+"""
+function rf_energy(pos::AbstractMatrix{Float64}, q::AbstractVector{Float64},
+                   mol::AbstractVector{Int}, L::Float64, p::RFParams)
+    n = length(q)
+    rc2 = p.rc * p.rc
+    E = 0.0; Ex = 0.0
+    @inbounds for i in 1:n-1
+        qi = q[i]
+        xi, yi, zi = pos[1, i], pos[2, i], pos[3, i]
+        mi = mol[i]
+        for j in i+1:n
+            qj = q[j]
+            (qi == 0.0 || qj == 0.0) && continue
+            r2 = _min_image_r2(pos[1, j] - xi, pos[2, j] - yi, pos[3, j] - zi, L)
+            if mol[j] == mi
+                Ex += rf_excluded_u(sqrt(r2), qi, qj, p)
+            else
+                r2 < rc2 || continue
+                E += rf_pair_u(sqrt(r2), qi, qj, p)
+            end
+        end
+    end
+    return E, Ex, rf_self_energy(q, p)
+end
+
 # ----------------------------------------------------------------------------
 # Pair functions
 # ----------------------------------------------------------------------------

@@ -26,6 +26,7 @@ EKMC_EVENTS=${EKMC_EVENTS:-20000000}
 SEED=${SLURM_ARRAY_TASK_ID:-1}
 
 echo "host=$(hostname) N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED start=$(date)"
+export SPCE_COULOMB=${SPCE_COULOMB:-wolf} SPCE_EPS_RF=${SPCE_EPS_RF:-0}
 cd "$PROJECT" || exit 1
 "$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_wolf.jl "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
 echo "end=$(date)"
