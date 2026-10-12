@@ -20,9 +20,12 @@ ekmc_events = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 20_000_000
 seed = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 1
 outdir = length(ARGS) >= 5 ? ARGS[5] : joinpath(@__DIR__, "results")
 mkpath(outdir)
-out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed).txt")
+out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_a$(α_A).txt")
 
-m = MCm.spce_model(; α_per_angstrom=0.16, rc_angstrom=10.0)
+# force-field variant from the environment (defaults = the site-cutoff α = 0.16 Å⁻¹ model of the first runs)
+α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.16"))
+cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
+m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
 ff = m.ff
 T_K = 300.0
 T = T_K / m.ϵ_kelvin
@@ -36,7 +39,7 @@ atm_per_pstar = m.ϵ_kelvin * 1.3806488e-23 / (m.σ_angstrom * 1e-10)^3 / 101325
 
 open(out, "w") do io
     println(io, "# SPC/E Wolf validation  $(Dates.now())  N=$N  L=$(round(L_A; digits=3)) Å  T=$T_K K  ρ=1000 kg/m³")
-    println(io, "# Wolf α=0.16 1/Å rc=10 Å (reduced α*=$(ff.wolf.α), rc*=$(ff.rc)); LRC on; overlap cap on")
+    println(io, "# Wolf α=$(α_A) 1/Å rc=10 Å cutoff=$(cutoff) (reduced α*=$(ff.wolf.α), rc*=$(ff.rc)); LRC on; overlap cap on")
     println(io, "# NIST LAMMPS reference (Ewald, N=1500): U/N = -46.70 kJ/mol, p = 43.2 ± 5.1 atm")
     flush(io)
 
