@@ -332,3 +332,138 @@ if get(ENV, "MOLSIM_SLOW_TESTS", "0") == "1"
         @test within3σ(μ_mc, eμ_mc, μ_ek, eμ_ek)
     end
 end
+
+# ============================================================================
+# Global time-weighted ratio, jackknife error, per-species μ at infinite dilution (2026-10-12)
+# ============================================================================
+
+@testset "Time-weighted ratio estimator and delete-one-block jackknife" begin
+    # equal block times: the jackknife error of Σx/Σt is exactly the standard error of the block means
+    b = MCm.TimeWeightedBlockAverager(1)
+    xs = 10.0 .+ [0.1, -0.2, 0.3, -0.1, 0.2, -0.3, 0.15, -0.05]
+    for x in xs
+        push!(b, x, 1.0)
+    end
+    @test MCm.ratio_mean(b) ≈ sum(xs) / length(xs)
+    @test MCm.ratio_jackknife_stderr(b) ≈ MCm.stderr(b)
+    # f = log: agrees with the delta method to first order (relative errors here are ≈ 1 %)
+    @test MCm.ratio_jackknife_stderr(b; f=log) ≈ MCm.ratio_jackknife_stderr(b) / MCm.ratio_mean(b) rtol=1e-2
+    # constant x with very unequal block times: the ratio is exact and its error zero, whereas the
+    # mean of block ratios is also exact here but would not be for x varying with t
+    b2 = MCm.TimeWeightedBlockAverager(2)
+    for (x, t) in zip([3.0, 3.0, 3.0, 3.0, 3.0, 3.0], [0.1, 2.0, 0.5, 7.0, 0.01, 1.0])
+        push!(b2, x, t)
+    end
+    @test length(b2.block_sum_x) == 3 && MCm.ratio_mean(b2) ≈ 3.0
+    @test MCm.ratio_jackknife_stderr(b2) ≈ 0.0 atol=1e-12
+    # unequal block times: ratio of sums ≠ mean of block ratios (the biased blocked estimator)
+    b3 = MCm.TimeWeightedBlockAverager(1)
+    push!(b3, 1.0, 1.0); push!(b3, 3.0, 9.0)
+    @test MCm.ratio_mean(b3) ≈ 2.8 && MCm.mean(b3) ≈ 2.0
+    @test isnan(MCm.ratio_jackknife_stderr(MCm.TimeWeightedBlockAverager(1)))
+end
+
+@testset "TraPPE-UA solutes in SPC/E reduced units: geometry, charges, Lorentz–Berthelot" begin
+    m = MCm.spce_solute_model(:methanol_ua)
+    t = m.solute; σ = m.σ_angstrom
+    d(a, b) = sqrt(sum(abs2, t.sites_body[:, a] .- t.sites_body[:, b])) * σ
+    @test d(1, 2) ≈ 1.43 atol=1e-9                       # C–O
+    @test d(2, 3) ≈ 0.945 atol=1e-9                      # O–H
+    v1 = t.sites_body[:, 1] .- t.sites_body[:, 2]; v2 = t.sites_body[:, 3] .- t.sites_body[:, 2]
+    @test acosd(sum(v1 .* v2) / sqrt(sum(abs2, v1) * sum(abs2, v2))) ≈ 108.5 atol=1e-9
+    @test sum(t.site_q) ≈ 0.0 atol=1e-12
+    @test t.site_q ./ m.q_scale ≈ [0.265, -0.700, 0.435]
+    @test t.site_type == [2, 3, 0] && m.ff.n_types == 3
+    @test m.ff.σ_mix[1, 2] * σ ≈ (3.16555789 + 3.75) / 2 && m.ff.σ_mix[1, 3] * σ ≈ (3.16555789 + 3.02) / 2
+    @test m.ff.ϵ_mix[1, 2] * m.ϵ_kelvin ≈ sqrt(78.19743111 * 98.0) && m.ff.ϵ_mix[3, 3] * m.ϵ_kelvin ≈ 93.0
+    mm = MCm.spce_solute_model(:methane_ua)
+    @test mm.solute.n_sites == 1 && mm.solute.site_q == [0.0] && mm.ff.n_types == 2
+    @test mm.ff.σ_mix[2, 2] * σ ≈ 3.73 && mm.ff.ϵ_mix[2, 2] * mm.ϵ_kelvin ≈ 148.0
+    @test mm.ff.ucap_mix[1, 2] ≈ 1000.0 * mm.ff.ϵ_mix[1, 2]
+    # the water template and force-field constants are those of spce_model
+    m0 = MCm.spce_model(; α_per_angstrom=0.20, cutoff=:molecule)
+    @test m.water.sites_body == m0.template.sites_body && m.ff.wolf.α == m0.ff.wolf.α && m.ff.rc == m0.ff.rc
+    @test_throws ErrorException MCm.spce_solute_model(:ethanol)
+end
+
+@testset "OPLS-AA rigid all-atom methane and methanol in SPC/E units: geometry, charges, geometric mixing" begin
+    kB = 0.0083144626
+    m = MCm.spce_solute_model(:methane); t = m.solute; σ = m.σ_angstrom
+    d(t, a, b) = sqrt(sum(abs2, t.sites_body[:, a] .- t.sites_body[:, b])) * σ
+    @test t.n_sites == 5 && t.site_type == [2, 3, 3, 3, 3]
+    @test all(d(t, 1, k) ≈ 1.090 for k in 2:5)
+    @test all(d(t, a, b) ≈ 1.090 * sqrt(8 / 3) for a in 2:5, b in 2:5 if a < b)     # tetrahedral H–H
+    @test sum(t.site_q) ≈ 0.0 atol=1e-12
+    @test t.site_q[1] / m.q_scale ≈ -0.24
+    @test isapprox(m.ff.ϵ_mix[2, 2] * m.ϵ_kelvin * kB, 0.276144; rtol=1e-4) && isapprox(m.ff.ϵ_mix[3, 3] * m.ϵ_kelvin * kB, 0.12552; rtol=1e-4)
+    @test m.ff.σ_mix[1, 2] * σ ≈ sqrt(3.16555789 * 3.50) && m.ff.σ_mix[1, 3] * σ ≈ sqrt(3.16555789 * 2.50)   # geometric
+    @test m.mixing === :geometric
+    mo = MCm.spce_solute_model(:methanol); t = mo.solute; σ = mo.σ_angstrom
+    @test t.n_sites == 6 && t.site_type == [2, 3, 3, 3, 4, 0]
+    @test isapprox(d(t, 1, 5), 1.41189; atol=2e-4) && isapprox(d(t, 5, 6), 0.94569; atol=2e-4)   # C–O, O–H (OPLS minimum)
+    @test all(isapprox(d(t, 1, k), 1.0904; atol=2e-4) for k in 2:4)
+    @test sum(t.site_q) ≈ 0.0 atol=1e-12
+    @test t.site_q[5] / mo.q_scale ≈ -0.683 && t.site_q[6] / mo.q_scale ≈ 0.418
+    @test isapprox(mo.ff.ϵ_mix[4, 4] * mo.ϵ_kelvin * kB, 0.71128; rtol=1e-4) && mo.ff.σ_mix[4, 4] * σ ≈ 3.12
+    @test mo.ff.σ_mix[1, 4] * σ ≈ sqrt(3.16555789 * 3.12)
+    # the template is centred on the COM
+    @test maximum(abs.(t.sites_body * t.site_mass)) <= 1e-12 * sum(t.site_mass)
+    # Lorentz–Berthelot stays the default for the generic constructor
+    ff = MCm.SiteForceField([1.0, 2.0], [1.0, 1.0]; rc=2.5)
+    @test ff.σ_mix[1, 2] == 1.5
+    @test_throws ErrorException MCm.SiteForceField([1.0], [1.0]; rc=2.5, mixing=:arithmetic)
+end
+
+@testset "Infinite dilution: one LJ solute in the LJ-diatomic solvent — per-species eKMC vs Widom (pure solvent)" begin
+    # Supercritical state (ρ* = 0.3, T* = 2, 32 diatomics) as in the NVT test above. The eKMC per-species
+    # estimator exp(βμ_s) = ⟨exp(βu_s)⟩ for the one real solute (particle removal with kMC time weights)
+    # must equal Widom insertion of the solute into the PURE solvent (Frenkel & Smit §7.2.1): both are the
+    # infinite-dilution μ_ex. Widom into the system that already holds the real solute is NOT the same
+    # quantity at this size (the real solute excludes ≈ 5 % of the volume to the ghost: +0.2 in μ at
+    # N = 32, dev diagnostic 2026-10-12), so the reference is a separate pure-solvent run. The Metropolis
+    # particle-removal average of the same observable fails: 85 % of ⟨exp(βu_s)⟩ comes from overlap
+    # configurations with ≈ 3e-12 of the canonical weight, which canonical MC never visits but the eKMC
+    # relocation move samples with the correct time weights (Shing & Gubbins, Mol. Phys. 46 (1982) 1109).
+    # No tail correction on either side (same constant).
+    tmpl2, _ = lj_diatomic_model()
+    sol = MCm.RigidTemplate("LJ1", zeros(3, 1), [2], [0.0], [1.0])
+    ff = MCm.SiteForceField([1.0, 1.2], [1.0, 0.7]; rc=2.5, coulomb=:none)
+    N = 32; ρ = 0.3; T = 2.0; L = cbrt(N / ρ); Nt = N + 1
+    function equilibrated(tm, seed)
+        sys = MCm.RigidSystem([tmpl2, sol], tm, L, 1 / T, Xoshiro(seed))
+        MCm.random_rigid_system!(sys, ff)
+        st = MCm.RigidMCStats(); n = length(tm)
+        for _ in 1:500, _ in 1:n
+            MCm.mc_translate!(sys, ff, rand(sys.rng, 1:n), 0.15, st)
+            MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:n), 0.4, st)
+        end
+        return sys
+    end
+    # reference: Widom insertion of the solute into the pure solvent
+    mc0 = MCm.run_rigid_mc!(equilibrated(fill(1, N), 11), ff; sweeps=4000, δ=0.15, δθ=0.4, sample_every=1,
+                            block_size=100, widom_template=2, widom_per_sample=50)
+    w, ew = MCm.mean(mc0.widom), MCm.stderr(mc0.widom)
+    μ_w, eμ_w = -T * log(w), T * ew / w
+    # solvent + 1 real solute: MC (U, P, removal estimator) and eKMC (U, P, per-species μ)
+    sys = equilibrated(vcat(fill(1, N), 2), 11)
+    mc = MCm.run_rigid_mc!(deepcopy(sys), ff; sweeps=4000, δ=0.15, δθ=0.4, sample_every=1, block_size=100,
+                           inverse_widom_molecule=Nt)
+    iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
+    μ_r, eμ_r = T * log(iw), T * eiw / iw
+    events = 4_000_000
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=events, sample_every=1, block_events=events ÷ 25,
+                             debug_check_every=events ÷ 10, species_mu=true, trace_molecule=Nt)
+    rs = ek.RN_species[2]
+    μ_ek, eμ_ek = T * log(MCm.ratio_mean(rs)), T * MCm.ratio_jackknife_stderr(rs; f=log)
+    @info "LJ solute at infinite dilution, N=32+1 ρ*=0.3 T*=2" μ_w eμ_w μ_ek eμ_ek μ_r eμ_r MCm.mean(mc.U) MCm.mean(ek.U) MCm.mean(mc.P) MCm.mean(ek.P)
+    @test within3σ(μ_w, eμ_w, μ_ek, eμ_ek)
+    @test within3σ(MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(ek.U), MCm.stderr(ek.U))
+    @test within3σ(MCm.mean(mc.P), MCm.stderr(mc.P), MCm.mean(ek.P), MCm.stderr(ek.P))
+    @test μ_r < μ_w - 1.0            # the Metropolis removal estimator misses the overlap region (see above)
+    # bookkeeping identities: R·N_t = Σ_s N_s ⟨R_s/N_s⟩ sample by sample; the trace reproduces the estimator
+    @test MCm.ratio_mean(ek.RN) * Nt ≈ N * MCm.ratio_mean(ek.RN_species[1]) + MCm.ratio_mean(rs) rtol=1e-10
+    @test length(ek.trace_phi) == length(ek.trace_dt) == events
+    @test MCm.ratio_mean(rs) ≈ sum(MCm._mobility(1 / T, ek.trace_phi[k]) * ek.trace_dt[k] for k in eachindex(ek.trace_phi)) /
+                               sum(ek.trace_dt) rtol=1e-10
+    @test isempty(MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=100, sample_every=10, block_events=50).RN_species)
+end

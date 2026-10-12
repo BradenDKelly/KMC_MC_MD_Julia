@@ -25,7 +25,8 @@ mkpath(outdir)
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
 
 m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
-out = joinpath(outdir, "spce_npt_N$(N)_seed$(seed)_$(tail_route)_$(cutoff)_a$(α_A)_cap$(Int(m.ff.ucap_mix[1,1])).txt")
+tag = get(ENV, "SPCE_TAG", "")
+out = joinpath(outdir, "spce_npt_N$(N)_seed$(seed)_$(tail_route)_$(cutoff)_a$(α_A)_cap$(Int(m.ff.ucap_mix[1,1]))$(tag).txt")
 ff = m.ff
 T_K = 298.15; P_bar = 1.0
 T = T_K / m.ϵ_kelvin

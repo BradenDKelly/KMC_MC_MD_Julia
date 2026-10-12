@@ -25,7 +25,8 @@ mkpath(outdir)
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
 
 m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
-out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_a$(α_A)_cap$(Int(m.ff.ucap_mix[1,1])).txt")
+tag = get(ENV, "SPCE_TAG", "")          # appended to the file name (e.g. "_ev1e5") so reruns do not overwrite
+out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_a$(α_A)_cap$(Int(m.ff.ucap_mix[1,1]))$(tag).txt")
 ff = m.ff
 T_K = 300.0
 T = T_K / m.ϵ_kelvin
@@ -88,10 +89,15 @@ open(out, "w") do io
     rn, ern = MCm.mean(ek.RN), MCm.stderr(ek.RN)
     U_ek = (MCm.mean(ek.U) + const_E / N) * kJmol_per_eps
     eU_ek = MCm.stderr(ek.U) * kJmol_per_eps
-    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_RN=%.2f ± %.2f kJ/mol  mu_acc=%.2f kJ/mol  <dt>=%.3e\n",
+    # mu_RN: mean of block ratios (biased when block times differ); mu_acc: global time average (the
+    # estimator); mu_jk: the same global ratio with its delete-one-block jackknife error (Efron 1982)
+    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_RN=%.2f ± %.2f kJ/mol  mu_acc=%.2f kJ/mol  mu_jk=%.2f ± %.2f kJ/mol (%d blocks)  <dt>=%.3e\n",
             ekmc_events, t_ek, U_ek, eU_ek, MCm.mean(ek.P) * atm_per_pstar, MCm.stderr(ek.P) * atm_per_pstar,
             T * log(rn) * kJmol_per_eps, T * ern / rn * kJmol_per_eps, MCm.mu_ex(ek.mu, T) * kJmol_per_eps,
-            ek.t_total / ekmc_events)
+            T * log(MCm.ratio_mean(ek.RN)) * kJmol_per_eps, T * MCm.ratio_jackknife_stderr(ek.RN; f=log) * kJmol_per_eps,
+            length(ek.RN.block_sum_x), ek.t_total / ekmc_events)
+    println(io, "# eKMC block μ (global-ratio blocks, kJ/mol): ", join(round.(T .* log.(ek.RN.block_means) .* kJmol_per_eps; digits=2), " "))
+    println(io, "# eKMC block times: ", join(round.(ek.RN.block_sum_t; sigdigits=3), " "))
     println(io, "# block means U/N (eKMC, reduced): ", join(round.(ek.U.block_means; digits=3), " "))
     println(io, "# block means U/N (MC, reduced):   ", join(round.(mc.U.block_means; digits=3), " "))
 end

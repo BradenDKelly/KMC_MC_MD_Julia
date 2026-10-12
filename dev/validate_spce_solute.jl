@@ -1,0 +1,136 @@
+"""
+One rigid solute (OPLS-AA all-atom methane or methanol; TraPPE-UA `methane_ua`/`methanol_ua` for reference)
+at infinite dilution in SPC/E water: Metropolis MC (Widom insertion and particle-removal estimators of the
+solute μ_ex) vs hybrid eKMC (per-species ⟨exp(βu)⟩ with delete-one-block jackknife errors). JOURNAL
+2026-10-12 entry 14.
+
+State: T = 300 K; N water molecules in the box of pure water at 1000 kg/m³ plus one solute.
+Model: `spce_solute_model` — SPC/E with molecule-cutoff Wolf (α = SPCE_ALPHA Å⁻¹, r_c = 10 Å, cap 1000 ϵ,
+LJ tail) and the rigid solute (OPLS-AA: geometric mixing; TraPPE-UA: Lorentz–Berthelot). The LJ tail of
+the solute, ΔU_tail = U_tail(N water + solute) − U_tail(N water), is added to every solute μ_ex
+(Frenkel & Smit §3.2.2). Widom here inserts a second solute into the system holding the real one: at
+N = 500 the composition effect is O(1/N) (it is +0.2 kT for N = 32 LJ, test suite), negligible here.
+
+Reference: the GROMACS alchemical decoupling (BAR over 21 λ windows, PME, same box, same rigid solute,
+gromacs_fe/) of the identical model, −ΔG_decouple = μ_ex. Literature context for united-atom methane in
+SPC/E at 300 K: μ_ex = 9.71/9.56/9.45 ± 0.1 kJ/mol for N = 256/500/864 (Paschek, J. Chem. Phys. 120 (2004)
+6674, Table IV, OPLS-UA CH4, Widom) and ΔG_hyd = 9.39 kJ/mol for TraPPE-UA CH4 (Ramezani & Sharma, J. Phys.
+Chem. B 130 (2026) 4636, Table 1); experiment: methane 8.37 kJ/mol (same table), methanol −5.1 kcal/mol =
+−21.3 kJ/mol (Ben-Naim & Marcus, J. Chem. Phys. 81 (1984) 2016).
+
+Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_events seed outdir
+Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_LAMBDA (10; λ = fac·⟨R⟩, 0 = pure eKMC), SPCE_TAG.
+"""
+
+using MolSim, Random, StaticArrays, Printf, Dates
+const MCm = MolSim.MC
+
+solute = Symbol(length(ARGS) >= 1 ? ARGS[1] : "methane")
+N = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 500
+mc_sweeps = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 8000
+ekmc_events = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 100_000
+seed = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : 1
+outdir = length(ARGS) >= 6 ? ARGS[6] : joinpath(@__DIR__, "results", "spce_solute")
+mkpath(outdir)
+α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.20"))
+cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "molecule"))
+λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "10"))
+tag = get(ENV, "SPCE_TAG", "")
+
+m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
+ff = m.ff
+out = joinpath(outdir, "spce_$(solute)_N$(N)_seed$(seed)_$(cutoff)_a$(α_A)_cap$(Int(ff.ucap_mix[1,1]))$(tag).txt")
+T_K = 300.0
+T = T_K / m.ϵ_kelvin
+ρ_A3 = 1000.0 * 1e3 / 18.0153 * 6.02214129e23 / 1e30                       # water molecules per Å³
+ρstar = ρ_A3 * m.σ_angstrom^3
+L = cbrt(N / ρstar)
+L_A = L * m.σ_angstrom
+kJmol_per_eps = m.ϵ_kelvin * 1.3806488e-23 * 6.02214129e23 / 1000
+atm_per_pstar = m.ϵ_kelvin * 1.3806488e-23 / (m.σ_angstrom * 1e-10)^3 / 101325.0
+Nt = N + 1; isol = Nt                                                       # the solute is molecule N+1
+
+# time-weighted tail diagnostics of a single-molecule removal estimator ⟨exp(βu)⟩ = Σ w_k / Σ Δt_k
+function tail_report(io, phi, dt, β, name)
+    isempty(phi) && return
+    w = [MCm._mobility(β, phi[k]) * dt[k] for k in eachindex(phi)]
+    S = sum(w); tt = sum(dt)
+    ord = sortperm(w; rev=true)
+    n = length(w)
+    frac(p) = sum(w[ord[1:max(1, round(Int, p * n))]]) / S
+    neff = S^2 / sum(abs2, w)                                                  # Kish (Survey Sampling, 1965) effective sample size
+    # time-weighted quantiles of βu
+    o2 = sortperm(phi); c = cumsum(dt[o2]) ./ tt
+    q(p) = β * phi[o2[searchsortedfirst(c, p)]]
+    @printf(io, "# %s tail: samples=%d  Kish n_eff=%.1f  share of Σw from top 0.1%%/1%%/10%% of samples = %.3f/%.3f/%.3f  βu quantiles 5/50/95/99.9%% = %.2f/%.2f/%.2f/%.2f  max βu=%.2f\n",
+            name, n, neff, frac(0.001), frac(0.01), frac(0.1), q(0.05), q(0.5), q(0.95), q(0.999), β * maximum(phi))
+end
+
+open(out, "w") do io
+    println(io, "# SPC/E + $(m.solute.name) at infinite dilution  $(Dates.now())  N_water=$N + 1 solute  L=$(round(L_A; digits=3)) Å  T=$T_K K  ρ_water=1000 kg/m³")
+    println(io, "# Wolf α=$(α_A) 1/Å rc=10 Å cutoff=$(cutoff) cap=$(Int(ff.ucap_mix[1,1])) ϵ; LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
+    flush(io)
+    rc_check = ff.rc + m.water.extent + max(m.water.extent, m.solute.extent)
+    rc_check < L / 2 || println(io, "# WARNING: rc + molecule extents = $(rc_check) ≥ L/2 = $(L/2)")
+
+    sys = MCm.RigidSystem(m.templates, vcat(fill(1, N), 2), L, 1 / T, Xoshiro(seed))
+    MCm.random_rigid_system!(sys, ff)
+    const_E = MCm.wolf_constant_energy(sys, ff)
+    water_only = MCm.RigidSystem(m.templates, fill(1, N), L, 1 / T, Xoshiro(0))
+    ΔU_tail = MCm.lrc_energy(sys, ff) - MCm.lrc_energy(water_only, ff)        # tail energy of the one solute
+    println(io, "# solute LJ tail ΔU_tail = $(round(ΔU_tail * kJmol_per_eps; digits=4)) kJ/mol (added to every solute μ_ex below)")
+
+    # --- Metropolis MC: equilibrate + production (Widom insertion and removal estimators of the solute) ---
+    st = MCm.RigidMCStats()
+    δ = 0.1 / m.σ_angstrom * 3.0; δθ = 0.3
+    t0 = time()
+    for s in 1:(mc_sweeps ÷ 4), _ in 1:Nt
+        MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), δ, st)
+        MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), δθ, st)
+    end
+    println(io, "# MC equilibration $(mc_sweeps ÷ 4) sweeps: $(round(time() - t0; digits=1)) s, acc_t=$(st.trans_acc/st.trans_att), acc_r=$(st.rot_acc/st.rot_att)")
+    flush(io)
+    sys_mc = deepcopy(sys)
+    t0 = time()
+    mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
+                           block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
+                           inverse_widom_molecule=isol)
+    t_mc = time() - t0
+    w, ew = MCm.mean(mc.widom), MCm.stderr(mc.widom)
+    iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
+    U_mc = (MCm.mean(mc.U) * Nt + const_E) / Nt * kJmol_per_eps
+    @printf(io, "MC   sweeps=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_sol_widom=%.2f ± %.2f kJ/mol  mu_sol_removal=%.2f ± %.2f kJ/mol  acc_t=%.3f acc_r=%.3f\n",
+            mc_sweeps, t_mc, U_mc, MCm.stderr(mc.U) * kJmol_per_eps,
+            MCm.mean(mc.P) * atm_per_pstar, MCm.stderr(mc.P) * atm_per_pstar,
+            (-T * log(w) + ΔU_tail) * kJmol_per_eps, T * ew / w * kJmol_per_eps,
+            (T * log(iw) + ΔU_tail) * kJmol_per_eps, T * eiw / iw * kJmol_per_eps,
+            mc.stats.trans_acc / mc.stats.trans_att, mc.stats.rot_acc / mc.stats.rot_att)
+    println(io, "# MC removal-estimator block μ (kJ/mol): ", join(round.((T .* log.(mc.inv_widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
+    println(io, "# MC Widom block μ (kJ/mol):             ", join(round.((-T .* log.(mc.widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
+    flush(io)
+
+    # --- eKMC (MC-kernel hybrid) from the same equilibrated configuration ---
+    t0 = time()
+    λ = λfac > 0 ? λfac * MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000) : 0.0
+    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ)"); flush(io)
+    se = λfac > 0 ? 1 : 100
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
+                             debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
+                             species_mu=true, trace_molecule=isol)
+    t_ek = time() - t0
+    rw, rs = ek.RN_species[1], ek.RN_species[2]
+    μ_w = T * log(MCm.ratio_mean(rw)); eμ_w = T * MCm.ratio_jackknife_stderr(rw; f=log)
+    μ_s = T * log(MCm.ratio_mean(rs)) + ΔU_tail; eμ_s = T * MCm.ratio_jackknife_stderr(rs; f=log)
+    U_ek = (MCm.mean(ek.U) * Nt + const_E) / Nt * kJmol_per_eps
+    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_water=%.2f ± %.2f kJ/mol  mu_sol=%.2f ± %.2f kJ/mol (jackknife, %d blocks)  mu_mix_acc=%.2f  <dt>=%.3e  mc_acc=%.3f\n",
+            ekmc_events, t_ek, U_ek, MCm.stderr(ek.U) * kJmol_per_eps,
+            MCm.mean(ek.P) * atm_per_pstar, MCm.stderr(ek.P) * atm_per_pstar,
+            μ_w * kJmol_per_eps, eμ_w * kJmol_per_eps, μ_s * kJmol_per_eps, eμ_s * kJmol_per_eps,
+            length(rs.block_sum_x), MCm.mu_ex(ek.mu, T) * kJmol_per_eps, ek.t_total / ekmc_events, ek.mc_acceptance)
+    println(io, "# eKMC solute block μ (kJ/mol): ", join(round.((T .* log.(rs.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
+    println(io, "# eKMC water block μ (kJ/mol):  ", join(round.(T .* log.(rw.block_means) .* kJmol_per_eps; digits=2), " "))
+    println(io, "# eKMC block times: ", join(round.(rs.block_sum_t; sigdigits=3), " "))
+    tail_report(io, ek.trace_phi, ek.trace_dt, 1 / T, "eKMC solute")
+    println(io, "# block means U/N (eKMC, reduced): ", join(round.(ek.U.block_means; digits=3), " "))
+end
+println(read(out, String))

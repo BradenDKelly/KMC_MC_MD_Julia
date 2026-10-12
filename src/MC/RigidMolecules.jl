@@ -89,7 +89,8 @@ pairs of a molecule pair iff the COM separation is below rc (group-based cutoff,
 §5.2.1): the Wolf shift terms −q_i q_j erfc(α rc)/rc then cancel exactly for neutral molecules, which
 removes the artificial ±|q_i q_j| erfc(α rc)/rc energies that a site-based cutoff gives to molecule
 pairs straddling rc (−68 kJ/mol for an O–O pair inside rc = 4.5 Å with the H's outside; ±1.2 kJ/mol
-per site pair at 10 Å).
+per site pair at 10 Å). `mixing=:geometric` uses σ_ab = √(σ_a σ_b) (OPLS) instead of the arithmetic
+Lorentz rule; ϵ_ab = √(ϵ_a ϵ_b) in both cases.
 Energies are in units of ϵ when the charges are reduced (q* = q/√(4πε₀ σ ϵ), ke = 1).
 """
 struct SiteForceField
@@ -112,10 +113,19 @@ end
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
                         coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
                         use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
-                        cutoff::Symbol=:site, cap_factor::Float64=Float64(OVERLAP_U_REDUCED))
+                        cutoff::Symbol=:site, cap_factor::Float64=Float64(OVERLAP_U_REDUCED),
+                        mixing::Symbol=:lorentz_berthelot)
     coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
     cutoff in (:site, :molecule) || error("SiteForceField: cutoff must be :site or :molecule")
+    mixing in (:lorentz_berthelot, :geometric) ||
+        error("SiteForceField: mixing must be :lorentz_berthelot or :geometric")
     σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
+    if mixing === :geometric
+        # OPLS convention (Jorgensen, Maxwell, Tirado-Rives, JACS 118 (1996) 11225): σ_ab = √(σ_a σ_b) as well
+        for a in eachindex(σ_types), b in eachindex(σ_types)
+            σ_mix[a, b] = sqrt(σ_types[a] * σ_types[b])
+        end
+    end
     rcap2 = (OVERLAP_R_REDUCED .* σ_mix) .^ 2
     ucap = cap_factor .* ϵ_mix
     wp = WolfParams(α, rc, ke; model=:wolf)
@@ -848,17 +858,22 @@ NVT (Pext === nothing) or NPT Metropolis MC. One sweep = n_mol translation + n_m
 attempts (+ one volume trial every `vol_every` sweeps in NPT). Returns block averages of U/N
 (pair + tail), P, ρ, V and, if requested, the Widom ⟨exp(−βΔU)⟩ (`widom`) and ⟨V exp(−βΔU)⟩
 (`widomV`; in NPT βμ_ex = −ln(⟨V e^{−βΔU}⟩/⟨V⟩), Frenkel & Smit §7.2.1, Kelly thesis Eq. A.133).
+`inverse_widom_molecule=i` accumulates exp(βu_i) of molecule i at every sample (`inv_widom`): the
+particle-removal estimator exp(βμ_ex) = ⟨exp(βu_i)⟩ (Shing & Gubbins, Mol. Phys. 46 (1982) 1109),
+i.e. the Metropolis counterpart of the eKMC per-species ⟨R_s/N_s⟩, with the same `_mobility` clamp.
 """
 function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
                        vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
-                       widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial)
+                       widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial,
+                       inverse_widom_molecule::Int=0)
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
     ba_U = BlockAverager(block_size); ba_P = BlockAverager(block_size)
     ba_rho = BlockAverager(block_size); ba_w = BlockAverager(block_size)
     ba_V = BlockAverager(block_size); ba_wV = BlockAverager(block_size)   # NPT Widom: <V e^{-βΔU}>/<V>
+    ba_iw = BlockAverager(block_size)                                      # inverse Widom of one molecule
     for sweep in 1:sweeps
         for _ in 1:N
             i = rand(sys.rng, 1:N)
@@ -882,9 +897,12 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
                 push!(ba_w, w)
                 push!(ba_wV, V * w)
             end
+            if inverse_widom_molecule > 0
+                push!(ba_iw, _mobility(sys.β, removal_energy(sys, ff, inverse_widom_molecule)))
+            end
         end
     end
-    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st)
+    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw)
 end
 
 # ============================================================================
@@ -1162,22 +1180,58 @@ function estimate_relocation_rate(sys::RigidSystem, ff::SiteForceField; events::
     return events / t
 end
 
-"Time-weighted block averager: blocks of `block_events` events, block mean = Σ x Δt / Σ Δt."
+"""
+Time-weighted block averager: blocks of `block_events` events, block mean = Σ x Δt / Σ Δt. The block
+sums X_k = Σ x Δt and T_k = Σ Δt are kept as well (`block_sum_x`, `block_sum_t`) for the global ratio
+estimator `ratio_mean` and its jackknife error `ratio_jackknife_stderr`.
+"""
 mutable struct TimeWeightedBlockAverager
     block_events::Int
     sum_x::Float64
     sum_t::Float64
     n::Int
     block_means::Vector{Float64}
+    block_sum_x::Vector{Float64}
+    block_sum_t::Vector{Float64}
 end
-TimeWeightedBlockAverager(block_events::Int) = TimeWeightedBlockAverager(block_events, 0.0, 0.0, 0, Float64[])
+TimeWeightedBlockAverager(block_events::Int) =
+    TimeWeightedBlockAverager(block_events, 0.0, 0.0, 0, Float64[], Float64[], Float64[])
 function Base.push!(b::TimeWeightedBlockAverager, x::Float64, dt::Float64)
     b.sum_x += x * dt; b.sum_t += dt; b.n += 1
     if b.n >= b.block_events
         push!(b.block_means, b.sum_x / b.sum_t)
+        push!(b.block_sum_x, b.sum_x); push!(b.block_sum_t, b.sum_t)
         b.sum_x = 0.0; b.sum_t = 0.0; b.n = 0
     end
     return b
+end
+
+"""
+    ratio_mean(b) -> Σ_k X_k / Σ_k T_k
+
+Global kMC time average over the completed blocks (Tan et al. 2017: ⟨A⟩ = Σ A Δt / Σ Δt). This, not
+the mean of the block ratios (`mean`), is the estimator when the block times T_k differ (JOURNAL
+2026-10-12 entry 10: the blocked μ was biased by several kJ/mol for liquid water).
+"""
+ratio_mean(b::TimeWeightedBlockAverager) =
+    isempty(b.block_sum_x) ? (b.sum_t > 0 ? b.sum_x / b.sum_t : NaN) : sum(b.block_sum_x) / sum(b.block_sum_t)
+
+"""
+    ratio_jackknife_stderr(b; f=identity)
+
+Delete-one-block jackknife standard error (Efron, *The Jackknife, the Bootstrap and Other Resampling
+Plans*, SIAM 1982, Ch. 2) of f(Σ X_k / Σ T_k): with θ_(k) = f((ΣX − X_k)/(ΣT − T_k)) and n blocks,
+se² = (n − 1)/n · Σ_k (θ_(k) − θ̄_(·))². For equal block times and f = identity this is exactly the
+standard error of the block means. Blocks must be long enough to be independent (Flyvbjerg &
+Petersen, J. Chem. Phys. 91 (1989) 461). `f = log` gives the error of βμ_ex = ln⟨R/N⟩ directly.
+"""
+function ratio_jackknife_stderr(b::TimeWeightedBlockAverager; f=identity)
+    n = length(b.block_sum_x)
+    n < 2 && return NaN
+    SX = sum(b.block_sum_x); ST = sum(b.block_sum_t)
+    θ = [f((SX - b.block_sum_x[k]) / (ST - b.block_sum_t[k])) for k in 1:n]
+    θ̄ = sum(θ) / n
+    return sqrt((n - 1) / n * sum((θk - θ̄)^2 for θk in θ))
 end
 function mean(b::TimeWeightedBlockAverager)
     isempty(b.block_means) && return b.sum_t > 0 ? b.sum_x / b.sum_t : NaN
@@ -1266,6 +1320,12 @@ maintained pair matrices, so U, P and ρ are all sampled every `sample_every` ev
 the NVT chemical-potential accumulator (μ_ex = `mu_ex(acc, T)`), blocked R/N (`RN`, for
 μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`)
 plus blocked (R/N)/V (`RNV`) and V (`V`) so that μ_res = T ln(mean(RNV)·mean(V)) has a block error.
+Every blocked observable also carries its block sums, so the global time average is `ratio_mean` and
+its error `ratio_jackknife_stderr` (use these for μ: `T·log(ratio_mean(RN))` ± `T·ratio_jackknife_stderr(RN; f=log)`).
+`species_mu=true` adds `RN_species[s]`, the blocked (1/N_s) Σ_{i∈s} exp(βu_i) of every template s
+(per-species μ_ex,s = T ln⟨·⟩; the mobilities are the clamped `_mobility` values, as in R), and
+`trace_molecule=i` records (u_i, Δt) at every sample in `trace_phi`, `trace_dt` (tail diagnostics for
+a single solute).
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -1274,7 +1334,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
                          vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
-                         vol_every_events::Int=0)
+                         vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0)
     N = sys.n_mol
     λ = mc_kernel_rate
     vol_period = vol_every_events > 0 ? vol_every_events : vol_every_sweeps * N
@@ -1295,6 +1355,18 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     ba_V = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_RN = TimeWeightedBlockAverager(block_events ÷ sample_every)   # R/N for blocked μ errors
     ba_RNV = TimeWeightedBlockAverager(block_events ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
+    # per-species μ: exp(βμ_ex,s) = ⟨(1/N_s) Σ_{i∈s} exp(βu_i)⟩_time (Tan 2017 Eq. 8 applied to the
+    # molecules of species s; the particle-removal estimator of Shing & Gubbins, Mol. Phys. 46 (1982)
+    # 1109, with the kMC time weights). For a single solute (N_s = 1) it is ⟨exp(βu_solute)⟩.
+    nspec = length(sys.templates)
+    n_spec = zeros(Int, nspec)
+    for i in 1:N
+        n_spec[sys.tmpl[i]] += 1
+    end
+    ba_RNs = species_mu ? [TimeWeightedBlockAverager(block_events ÷ sample_every) for _ in 1:nspec] :
+                          TimeWeightedBlockAverager[]
+    sp_sum = zeros(Float64, nspec)
+    trace_phi = Float64[]; trace_dt = Float64[]     # (u_i, Δt) of `trace_molecule` at every sample
     t_total = 0.0
     # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`
     # moves set ΔV_max to half the standard deviation of the kMC-time-weighted volume histogram
@@ -1323,6 +1395,18 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             push!(ba_RN, R / N, dt)
             push!(ba_RNV, R / N / V, dt)
             push!(acc_npt, R / N, V, dt)
+            if species_mu
+                fill!(sp_sum, 0.0)
+                @inbounds for i in 1:N
+                    sp_sum[sys.tmpl[i]] += ek.m[i]
+                end
+                for s in 1:nspec
+                    n_spec[s] > 0 && push!(ba_RNs[s], sp_sum[s] / n_spec[s], dt)
+                end
+            end
+            if trace_molecule > 0
+                push!(trace_phi, ek.phi[trace_molecule]); push!(trace_dt, dt)
+            end
         end
         if ev > burnin_events
             acc.t_total += dt; RN = R / N
@@ -1379,5 +1463,6 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     end
     return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, RN=ba_RN, RNV=ba_RNV, mu=acc, mu_npt=acc_npt,
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
-            mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN)
+            mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
+            RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt)
 end
