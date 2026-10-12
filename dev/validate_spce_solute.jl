@@ -102,7 +102,7 @@ open(out, "w") do io
     t0 = time()
     mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
                            block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
-                           inverse_widom_molecule=isol)
+                           inverse_widom_molecule=isol, R_every=20)
     t_mc = time() - t0
     w, ew = MCm.mean(mc.widom), MCm.stderr(mc.widom)
     iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
@@ -119,8 +119,12 @@ open(out, "w") do io
 
     # --- eKMC (MC-kernel hybrid) from the same equilibrated configuration ---
     t0 = time()
-    λ = λfac > 0 ? λfac * MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000) : 0.0
-    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ)"); flush(io)
+    # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
+    # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
+    λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
+    R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
+    λ = λfac > 0 ? λfac * (isfinite(R_mc) ? R_mc : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
+    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                              debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,

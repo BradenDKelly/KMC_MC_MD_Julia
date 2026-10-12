@@ -896,12 +896,18 @@ attempts (+ one volume trial every `vol_every` sweeps in NPT). Returns block ave
 `inverse_widom_molecule=i` accumulates exp(βu_i) of molecule i at every sample (`inv_widom`): the
 particle-removal estimator exp(βμ_ex) = ⟨exp(βu_i)⟩ (Shing & Gubbins, Mol. Phys. 46 (1982) 1109),
 i.e. the Metropolis counterpart of the eKMC per-species ⟨R_s/N_s⟩, with the same `_mobility` clamp.
+`R_every=k` evaluates the eKMC relocation rate R = Σ_i exp(βu_i) of every k-th sample (N removal energies,
+one sweep's cost) into `R`: the Metropolis estimate of the *relaxed-state* R, the right scale for the
+hybrid's MC-kernel rate λ (λ = fac·⟨R⟩ gives a relocation fraction ≈ 1/(1 + fac) in relaxed states). A pure
+eKMC pilot of 2e4 events estimates ⟨R⟩ as M/t_total and can miss the relaxed states entirely in a dense
+liquid (2026-10-12: λ from the pilot ranged over 1e-2 … 4e3 between seeds of the same system, and at λ ≫ R the
+solute is never relocated, so its μ degenerates to the Metropolis removal estimator).
 """
 function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
                        vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
                        widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial,
-                       inverse_widom_molecule::Int=0)
+                       inverse_widom_molecule::Int=0, R_every::Int=0)
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
@@ -909,6 +915,8 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
     ba_rho = BlockAverager(block_size); ba_w = BlockAverager(block_size)
     ba_V = BlockAverager(block_size); ba_wV = BlockAverager(block_size)   # NPT Widom: <V e^{-βΔU}>/<V>
     ba_iw = BlockAverager(block_size)                                      # inverse Widom of one molecule
+    ba_R = BlockAverager(max(1, block_size ÷ max(R_every, 1)))             # relocation rate R = Σ exp(βu_i) of relaxed states
+    n_samples = 0
     for sweep in 1:sweeps
         for _ in 1:N
             i = rand(sys.rng, 1:N)
@@ -935,9 +943,17 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             if inverse_widom_molecule > 0
                 push!(ba_iw, _mobility(sys.β, removal_energy(sys, ff, inverse_widom_molecule)))
             end
+            n_samples += 1
+            if R_every > 0 && n_samples % R_every == 0
+                R = 0.0
+                for i in 1:N
+                    R += _mobility(sys.β, removal_energy(sys, ff, i))
+                end
+                push!(ba_R, R)
+            end
         end
     end
-    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw)
+    return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw, R=ba_R)
 end
 
 # ============================================================================

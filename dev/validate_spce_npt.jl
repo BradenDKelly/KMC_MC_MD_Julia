@@ -65,7 +65,7 @@ open(out, "w") do io
     t0 = time()
     mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, Pext=P_star, max_dlnV=0.02, vol_every=1,
                            sample_every=2, block_size=max(10, mc_sweeps ÷ 2 ÷ 40), widom_template=1,
-                           widom_per_sample=20, tail_route=tail_route)
+                           widom_per_sample=20, tail_route=tail_route, R_every=20)
     t_mc = time() - t0
     V̄ = MCm.mean(mc.V); wV, ewV = MCm.mean(mc.widomV), MCm.stderr(mc.widomV)
     @printf(io, "MC   NPT sweeps=%d time=%.0fs  rho=%.4f ± %.4f g/cm3  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_widomNPT=%.2f ± %.2f kJ/mol  acc_v=%.3f\n",
@@ -78,8 +78,12 @@ open(out, "w") do io
     burn = min(200 * 10 * N + ekmc_events ÷ 5, ekmc_events ÷ 2)   # vol_equil_moves + 20 %, at most half the run
     t0 = time()
     λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))
-    λ = λfac > 0 ? λfac * MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000) : 0.0
-    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ)"); flush(io)
+    # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
+    # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
+    λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
+    R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
+    λ = λfac > 0 ? λfac * (isfinite(R_mc) ? R_mc : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
+    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     # with the hybrid an event is ~one sweep, so volume moves go every 10 events (not 10·N)
     vee = λfac > 0 ? 10 : 0
