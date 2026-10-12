@@ -118,6 +118,22 @@ Damped shifted (Wolf) or damped shifted force (DSF) pair energy for r < rc; zero
 end
 
 """
+    wolf_pair_u_nocut(r, qi, qj, wp::WolfParams)
+
+The Wolf/DSF pair energy without the r ≥ rc test, for group-based (molecule) cutoffs where the
+inclusion decision is made on the COM distance; for neutral groups the shift terms then cancel.
+"""
+@inline function wolf_pair_u_nocut(r::Float64, qi::Float64, qj::Float64, wp::WolfParams)::Float64
+    rc = wp.rc; α = wp.α
+    erfc_rc = erfc(α * rc)
+    u = erfc(α * r) / r - erfc_rc / rc
+    if wp.model === :dsf
+        u += (erfc_rc / (rc * rc) + (2.0 * α / SQRT_PI) * exp(-α * α * rc * rc) / rc) * (r - rc)
+    end
+    return wp.ke * qi * qj * u
+end
+
+"""
     wolf_self_energy(q, wp::WolfParams)
 
 Configuration-independent Wolf self term `-ke [erfc(α rc)/(2 rc) + α/√π] Σ q²`.

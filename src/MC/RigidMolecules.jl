@@ -77,7 +77,12 @@ LJ parameters per site type (Lorentz–Berthelot mixing, same tables as `LJParam
 `rc` shared by LJ and Coulomb, and the Coulomb model (`:none` or `:wolf` with damping `α`).
 `shift_lj=true` uses the cut-and-shifted LJ, u(r) − u(rc), which is continuous at rc so that the
 virial pressure needs no impulsive correction (the `:shifted` model of `LJParams`); the tail
-corrections are those of the truncated potential in both cases.
+corrections are those of the truncated potential in both cases. `cutoff=:molecule` includes all site
+pairs of a molecule pair iff the COM separation is below rc (group-based cutoff, Allen & Tildesley
+§5.2.1): the Wolf shift terms −q_i q_j erfc(α rc)/rc then cancel exactly for neutral molecules, which
+removes the artificial ±|q_i q_j| erfc(α rc)/rc energies that a site-based cutoff gives to molecule
+pairs straddling rc (−68 kJ/mol for an O–O pair inside rc = 4.5 Å with the H's outside; ±1.2 kJ/mol
+per site pair at 10 Å).
 Energies are in units of ϵ when the charges are reduced (q* = q/√(4πε₀ σ ϵ), ke = 1).
 """
 struct SiteForceField
@@ -94,12 +99,15 @@ struct SiteForceField
     cap_overlaps::Bool
     shift_lj::Bool
     u_rc_mix::Matrix{Float64}   # LJ value at rc per type pair (subtracted when shift_lj)
+    cutoff::Symbol              # :site (each site pair tested against rc) or :molecule (COM distance)
 end
 
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
                         coulomb::Symbol=:none, α::Float64=0.0, ke::Float64=1.0,
-                        use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false)
+                        use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
+                        cutoff::Symbol=:site)
     coulomb in (:none, :wolf) || error("SiteForceField: coulomb must be :none or :wolf")
+    cutoff in (:site, :molecule) || error("SiteForceField: cutoff must be :site or :molecule")
     σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
     rcap2 = (OVERLAP_R_REDUCED .* σ_mix) .^ 2
     ucap = OVERLAP_U_REDUCED .* ϵ_mix
@@ -107,7 +115,7 @@ function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc
     u_rc = [4.0 * ϵ_mix[a, b] * ((σ_mix[a, b] / rc)^12 - (σ_mix[a, b] / rc)^6)
             for a in 1:length(σ_types), b in 1:length(σ_types)]
     return SiteForceField(length(σ_types), σ_mix, ϵ_mix, rcap2, ucap, rc, rc * rc, coulomb, wp,
-                          use_lrc, cap_overlaps, shift_lj, u_rc)
+                          use_lrc, cap_overlaps, shift_lj, u_rc, cutoff)
 end
 
 # ============================================================================
@@ -126,7 +134,8 @@ and the conversion constants (`σ_angstrom`, `ϵ_kelvin`, `q_scale`): T* = T/ϵ_
 ρ* = ρ[Å⁻³] σ_angstrom³, q* = q[e]·q_scale. Default Wolf parameters from dev/wolf_parameter_scan.jl.
 """
 function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
-                    use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false)
+                    use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
+                    cutoff::Symbol=:site)
     σ_A = 3.16555789
     ϵ_K = 78.19743111
     q_H = 0.42380
@@ -142,7 +151,7 @@ function spce_model(; α_per_angstrom::Float64=0.16, rc_angstrom::Float64=10.0,
                          [15.9994, 1.00794, 1.00794])
     ff = SiteForceField([1.0], [1.0]; rc=rc_angstrom / σ_A, coulomb=:wolf,
                         α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
-                        shift_lj=shift_lj)
+                        shift_lj=shift_lj, cutoff=cutoff)
     return (template=tmpl, ff=ff, σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=q_scale)
 end
 
@@ -329,9 +338,15 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
         Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
     end
     ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
-    # no site pair can be within rc if the COMs are farther apart than rc + both extents
-    rmax = ff.rc + ti.extent + tj.extent
-    Rx * Rx + Ry * Ry + Rz * Rz >= rmax * rmax && return 0.0
+    R2 = Rx * Rx + Ry * Ry + Rz * Rz
+    molcut = ff.cutoff === :molecule
+    if molcut
+        R2 >= ff.rc2 && return 0.0
+    else
+        # no site pair can be within rc if the COMs are farther apart than rc + both extents
+        rmax = ff.rc + ti.extent + tj.extent
+        R2 >= rmax * rmax && return 0.0
+    end
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
     u = 0.0
@@ -343,7 +358,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             dy = Ry + sys.site_off[2, sj + m] - oy
             dz = Rz + sys.site_off[3, sj + m] - oz
             r2 = dx * dx + dy * dy + dz * dz
-            r2 < rc2 || continue
+            (molcut || r2 < rc2) || continue
             tym = tj.site_type[m]
             if tyn > 0 && tym > 0
                 if ff.cap_overlaps && r2 < ff.rcap2_mix[tyn, tym]
@@ -356,7 +371,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             end
             qm = tj.site_q[m]
             if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
-                u += wolf_pair_u(sqrt(r2), qn, qm, ff.wolf)
+                u += molcut ? wolf_pair_u_nocut(sqrt(r2), qn, qm, ff.wolf) : wolf_pair_u(sqrt(r2), qn, qm, ff.wolf)
             end
         end
     end
@@ -376,8 +391,14 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
         Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
     end
     ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
-    rmax = ff.rc + ti.extent + tj.extent
-    Rx * Rx + Ry * Ry + Rz * Rz >= rmax * rmax && return 0.0, 0.0
+    R2 = Rx * Rx + Ry * Ry + Rz * Rz
+    molcut = ff.cutoff === :molecule
+    if molcut
+        R2 >= ff.rc2 && return 0.0, 0.0
+    else
+        rmax = ff.rc + ti.extent + tj.extent
+        R2 >= rmax * rmax && return 0.0, 0.0
+    end
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
     u = 0.0; w = 0.0
@@ -390,7 +411,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
             dy = Ry + sys.site_off[2, sj + m] - oy
             dz = Rz + sys.site_off[3, sj + m] - oz
             r2 = dx * dx + dy * dy + dz * dz
-            r2 < rc2 || continue
+            (molcut || r2 < rc2) || continue
             tym = tj.site_type[m]
             fr = 0.0                       # −du/dr · r  (site pair)
             if tyn > 0 && tym > 0
@@ -407,7 +428,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
             qm = tj.site_q[m]
             if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
                 r = sqrt(r2)
-                u += wolf_pair_u(r, qn, qm, ff.wolf)
+                u += molcut ? wolf_pair_u_nocut(r, qn, qm, ff.wolf) : wolf_pair_u(r, qn, qm, ff.wolf)
                 # −r du/dr of ke q q [erfc(αr)/r − erfc(α rc)/rc]
                 fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
             end
