@@ -20,11 +20,11 @@ ekmc_events = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 20_000_000
 seed = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 1
 outdir = length(ARGS) >= 5 ? ARGS[5] : joinpath(@__DIR__, "results")
 mkpath(outdir)
-out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_a$(α_A).txt")
-
 # force-field variant from the environment (defaults = the site-cutoff α = 0.16 Å⁻¹ model of the first runs)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.16"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
+out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_a$(α_A).txt")
+
 m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff)
 ff = m.ff
 T_K = 300.0
@@ -76,8 +76,14 @@ open(out, "w") do io
 
     # --- eKMC from the same equilibrated configuration ---
     t0 = time()
-    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=100, block_events=ekmc_events ÷ 25,
-                             debug_check_every=ekmc_events ÷ 10)
+    # MC-kernel hybrid (λ = SPCE_LAMBDA × ⟨R⟩ from a pilot; 0 = pure eKMC). With λ > 0 most events are
+    # Metropolis sweeps (2N trials), so EKMC_EVENTS should be ~1e4–1e5, not 1e7.
+    λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))
+    λ = λfac > 0 ? λfac * MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000) : 0.0
+    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ)"); flush(io)
+    se = λfac > 0 ? 1 : 100
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
+                             debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ)
     t_ek = time() - t0
     rn, ern = MCm.mean(ek.RN), MCm.stderr(ek.RN)
     U_ek = (MCm.mean(ek.U) + const_E / N) * kJmol_per_eps

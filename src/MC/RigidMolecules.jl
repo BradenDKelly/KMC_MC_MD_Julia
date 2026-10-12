@@ -1233,7 +1233,11 @@ which removes the heavy tail that uniform relocation alone produces in hydrogen-
 (JOURNAL entry 5), while a mis-placed molecule (R ≫ λ) is still relocated at once. The μ observable
 is unchanged: ⟨R/N⟩_time with R = Σ exp(βu_i) (the relocation rate, not R + λ); the Tan shortcut
 ⟨R⟩ = M/t_total no longer applies. λ must be a constant for the run (a state-dependent λ would break
-balance); `estimate_relocation_rate` gives the scale from a short pilot. `vol_scheme = :newton` (default) applies Kelly's secant
+balance); `estimate_relocation_rate` gives the scale from a short pilot. With λ > 0 most events are
+sweeps, so set `vol_every_events` (volume move every that many events) instead of `vol_every_sweeps`.
+Validated 2026-10-11 (JOURNAL entries 7–9): agrees with MC and pure eKMC at a supercritical state for
+λ = 1 and 10; at liquid density it reaches a lower-energy state that plain MC from a random start never
+finds in 160k sweeps, and MC continued from that state stays there. `vol_scheme = :newton` (default) applies Kelly's secant
 update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
 threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
 half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
@@ -1253,9 +1257,11 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
                          vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
                          vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
-                         mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3)
+                         mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
+                         vol_every_events::Int=0)
     N = sys.n_mol
     λ = mc_kernel_rate
+    vol_period = vol_every_events > 0 ? vol_every_events : vol_every_sweeps * N
     λ >= 0.0 || error("run_rigid_ekmc!: mc_kernel_rate must be ≥ 0")
     vol_pressure in (:partial_average, :instantaneous) ||
         error("run_rigid_ekmc!: vol_pressure must be :partial_average or :instantaneous")
@@ -1326,7 +1332,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
              abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))) &&
                 @warn "rigid eKMC bookkeeping drift" maximum(abs.(phi_saved .- ek.phi)) abs(R_saved - ek.R) / ek.R
         end
-        if Pext !== nothing && ev % (vol_every_sweeps * N) == 0
+        if Pext !== nothing && ev % vol_period == 0
             if vol_moves < adapt_dV_moves
                 push!(win_V, sys.L^3); push!(win_t, t_since_vol)
                 if length(win_V) >= adapt_dV_window
