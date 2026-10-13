@@ -44,8 +44,11 @@ elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 tag = get(ENV, "SPCE_TAG", "")
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
-ff = m.ff
-out = joinpath(outdir, "spce_$(solute)_N$(N)_seed$(seed)_$(cutoff)_$(elec_tag)_cap$(Int(ff.ucap_mix[1,1]))$(tag).txt")
+cap_mode = get(ENV, "SPCE_CAP", "kT100")   # kT100: 100 kT overlap cap (DESIGN §9, default from 2026-10-13); legacy: 1000 ε_ab at 0.75 σ_ab
+cap_mode in ("kT100", "legacy") || error("SPCE_CAP must be kT100 or legacy")
+ff = cap_mode == "legacy" ? m.ff : first(MCm.kT_overlap_cap(m.ff, m.templates, 300.0 / m.ϵ_kelvin; U_kT=100.0))
+cap_tag = cap_mode == "legacy" ? "cap$(Int(m.ff.ucap_mix[1,1]))" : "capkT100"
+out = joinpath(outdir, "spce_$(solute)_N$(N)_seed$(seed)_$(cutoff)_$(elec_tag)_$(cap_tag)$(tag).txt")
 T_K = 300.0
 T = T_K / m.ϵ_kelvin
 ρ_A3 = 1000.0 * 1e3 / 18.0153 * 6.02214129e23 / 1e30                       # water molecules per Å³
@@ -74,7 +77,7 @@ end
 
 open(out, "w") do io
     println(io, "# SPC/E + $(m.solute.name) at infinite dilution  $(Dates.now())  N_water=$N + 1 solute  L=$(round(L_A; digits=3)) Å  T=$T_K K  ρ_water=1000 kg/m³")
-    println(io, "# Coulomb=$(coulomb) (Wolf α=$(α_A) 1/Å | RF ε_rf=$(ε_rf)) rc=10 Å cutoff=$(cutoff) cap=$(Int(ff.ucap_mix[1,1])) ϵ; LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
+    println(io, "# Coulomb=$(coulomb) (Wolf α=$(α_A) 1/Å | RF ε_rf=$(ε_rf)) rc=10 Å cutoff=$(cutoff) cap=$(cap_tag); LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
     flush(io)
     rc_check = ff.rc + m.water.extent + max(m.water.extent, m.solute.extent)
     rc_check < L / 2 || println(io, "# WARNING: rc + molecule extents = $(rc_check) ≥ L/2 = $(L/2)")

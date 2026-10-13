@@ -264,6 +264,9 @@ include("test_flexible.jl")
 # Steepest-descent minimisation of random starts (overlap-trap regression)
 include("test_minimizer.jl")
 
+# kT overlap cap for polyatomics (DESIGN §9)
+include("test_overlap_cap.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

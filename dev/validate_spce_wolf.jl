@@ -30,8 +30,11 @@ elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 
 m = MCm.spce_model(; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
 tag = get(ENV, "SPCE_TAG", "")          # appended to the file name (e.g. "_ev1e5") so reruns do not overwrite
-out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_$(elec_tag)_cap$(Int(m.ff.ucap_mix[1,1]))$(tag).txt")
-ff = m.ff
+cap_mode = get(ENV, "SPCE_CAP", "kT100")   # kT100: 100 kT overlap cap (DESIGN §9, default from 2026-10-13); legacy: 1000 ε_ab at 0.75 σ_ab
+cap_mode in ("kT100", "legacy") || error("SPCE_CAP must be kT100 or legacy")
+ff = cap_mode == "legacy" ? m.ff : first(MCm.kT_overlap_cap(m.ff, [m.template], 300.0 / m.ϵ_kelvin; U_kT=100.0))
+cap_tag = cap_mode == "legacy" ? "cap$(Int(m.ff.ucap_mix[1,1]))" : "capkT100"
+out = joinpath(outdir, "spce_wolf_N$(N)_seed$(seed)_$(cutoff)_$(elec_tag)_$(cap_tag)$(tag).txt")
 T_K = 300.0
 T = T_K / m.ϵ_kelvin
 ρ_A3 = 1000.0 * 1e3 / 18.0153 * 6.02214129e23 / 1e30                       # molecules per Å³ at 1000 kg/m³

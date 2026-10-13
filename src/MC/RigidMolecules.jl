@@ -91,7 +91,7 @@ charged molecules the cap must exceed any binding energy a molecule can gain by 
 +100 ϵ = 65 kJ/mol while a water molecule's bonds are worth −140 ϵ), which lowers the energy, raises
 the density and hides +8000 ϵ of real Coulomb repulsion per overlapped pair (2026-10-12 diagnostic);
 `spce_model` therefore uses cap_factor = 1000 (mobilities are clamped at exp(MOBILITY_LOG_MAX) so
-multiply-capped molecules cannot overflow R). `cutoff=:molecule` includes all site
+multiply-capped molecules cannot overflow R). For polyatomic molecules use `kT_overlap_cap` (DESIGN §9): U_cap = 100 kT for every molecule pair, orientation-scanned trigger radii and min(u_bare, U_cap). `cutoff=:molecule` includes all site
 pairs of a molecule pair iff the COM separation is below rc (group-based cutoff, Allen & Tildesley
 §5.2.1): the Wolf shift terms −q_i q_j erfc(α rc)/rc then cancel exactly for neutral molecules, which
 removes the artificial ±|q_i q_j| erfc(α rc)/rc energies that a site-based cutoff gives to molecule
@@ -116,6 +116,7 @@ struct SiteForceField
     u_rc_mix::Matrix{Float64}   # LJ value at rc per type pair (subtracted when shift_lj)
     cutoff::Symbol              # :site (each site pair tested against rc) or :molecule (COM distance)
     rf::RFParams                # reaction-field parameters (used when coulomb === :rf)
+    cap_min_u::Float64          # kT overlap cap (DESIGN §9): a molecule pair is min(u_bare, cap_min_u); Inf = legacy rule only
 end
 
 function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc::Float64,
@@ -141,7 +142,7 @@ function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc
             for a in 1:length(σ_types), b in 1:length(σ_types)]
     rfp = RFParams(rc, ke; ε_rf=epsilon_rf, ε_r=epsilon_r)
     return SiteForceField(length(σ_types), σ_mix, ϵ_mix, rcap2, ucap, rc, rc * rc, coulomb, wp,
-                          use_lrc, cap_overlaps, shift_lj, u_rc, cutoff, rfp)
+                          use_lrc, cap_overlaps, shift_lj, u_rc, cutoff, rfp, Inf)
 end
 
 # ============================================================================
@@ -584,6 +585,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             end
         end
     end
+    ff.cap_overlaps && u > ff.cap_min_u && return ff.cap_min_u     # kT cap: min(u_bare, U_cap) (DESIGN §9)
     return u
 end
 
@@ -649,6 +651,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
             w += (Rx * dx + Ry * dy + Rz * dz) / r2 * fr
         end
     end
+    ff.cap_overlaps && u > ff.cap_min_u && return ff.cap_min_u, 0.0   # kT cap: capped pairs carry no virial
     return u, w
 end
 
@@ -931,7 +934,119 @@ end
 "Copy of `ff` with the overlap cap switched off (the bare site–site potential)."
 uncapped(ff::SiteForceField) = SiteForceField(ff.n_types, ff.σ_mix, ff.ϵ_mix, ff.rcap2_mix, ff.ucap_mix, ff.rc,
                                               ff.rc2, ff.coulomb, ff.wolf, ff.use_lrc, false, ff.shift_lj,
-                                              ff.u_rc_mix, ff.cutoff, ff.rf)
+                                              ff.u_rc_mix, ff.cutoff, ff.rf, Inf)
+
+"""
+    min_orientation_energy(sys, ffu, a, b, r, n_orient, rng) -> u_min
+
+Lowest bare molecule-pair energy found over `n_orient` uniformly random orientations of molecules 1 and 2 of
+`sys` (a two-molecule system in a large box) with site `a` of molecule 1 and site `b` of molecule 2 held at
+distance `r` along x. A sampled minimum (an upper bound on the true minimum).
+"""
+function min_orientation_energy(sys::RigidSystem, ffu::SiteForceField, a::Int, b::Int, r::Float64,
+                                n_orient::Int, rng::AbstractRNG)
+    c = 0.5 * sys.L
+    best = Inf
+    for _ in 1:n_orient
+        set_molecule!(sys, 1, MVector(c, c, c), uniform_random_quaternion(rng))
+        set_molecule!(sys, 2, MVector(c, c, c), uniform_random_quaternion(rng))
+        sa = sys.site_start[1] + a; sb = sys.site_start[2] + b
+        set_molecule!(sys, 1, MVector(c - sys.site_off[1, sa], c - sys.site_off[2, sa], c - sys.site_off[3, sa]),
+                      view(sys.quat, :, 1))
+        set_molecule!(sys, 2, MVector(c + r - sys.site_off[1, sb], c - sys.site_off[2, sb], c - sys.site_off[3, sb]),
+                      view(sys.quat, :, 2))
+        best = min(best, pair_energy(sys, ffu, 1, 2))
+    end
+    return best
+end
+
+"""
+    kT_overlap_cap(ff, templates, T; U_kT=100.0, n_orient=20_000, seed=20261013) -> (ff_capped, rstar)
+
+Overlap cap for polyatomic molecules (DESIGN §9, user decision 2026-10-13: U_cap = 100 kT). Generalises the
+rule of Kelly's thesis §3.5 — trigger radius r* where the bare potential equals the cap — to orientation-
+dependent molecule pairs:
+1. U_cap = `U_kT`·T (reduced energy) for every molecule pair.
+2. For every pair of templates (A, B) and LJ sites a ∈ A, b ∈ B, r*_ab is the largest site–site distance at
+   which every sampled orientation of the pair has bare (uncapped) energy ≥ U_cap: scan down from σ_ab in
+   steps of 0.02 σ_ab to the first distance where the sampled minimum is ≥ U_cap, then bisect (12 steps).
+   The trigger radius of LJ site types (t_a, t_b) is the minimum of r*_ab over all such pairs, so the
+   property holds for every molecule pair. Templates are scanned in their reference geometry.
+3. A molecule pair is U_cap if any LJ site pair is inside its trigger radius, otherwise min(u_bare, U_cap)
+   (`cap_min_u`). Hence no core is lower than its rim (no Metropolis trap) and the capped Hamiltonian differs
+   from the bare one only where u_bare ≥ U_cap (Boltzmann weight ≤ e^{−U_kT}); sampling error in r* is
+   harmless for the same reason.
+Charge-collapse check: an LJ-less charged site h (bonded at d_h to the nearest LJ site X of its molecule) can
+only reach an opposite charge at site Y of another molecule if |X − Y| ≤ d_h (+ d_h' if Y is LJ-less too, with
+its own host); every such distance must be inside the trigger radius, else an error is thrown.
+Returns the capped force field and the matrix of trigger radii (reduced units).
+"""
+function kT_overlap_cap(ff::SiteForceField, templates::Vector{RigidTemplate}, T::Float64; U_kT::Float64=100.0,
+                        n_orient::Int=20_000, seed::Int=20261013)
+    U = U_kT * T
+    ffu = uncapped(ff)
+    nt = ff.n_types
+    rstar = fill(Inf, nt, nt)
+    rng = Xoshiro(seed)
+    for A in eachindex(templates), B in A:length(templates)
+        tA = templates[A]; tB = templates[B]
+        ext = tA.extent + tB.extent
+        sys = RigidSystem([tA, tB], [1, 2], 4.0 * (ext + 3.0 * maximum(ff.σ_mix)) + 2.0 * ff.rc, 1.0 / T, Xoshiro(seed))
+        for a in 1:tA.n_sites, b in 1:tB.n_sites
+            ta = tA.site_type[a]; tb = tB.site_type[b]
+            (ta > 0 && tb > 0) || continue
+            σ = ff.σ_mix[ta, tb]
+            r_hi = σ
+            f(r) = min_orientation_energy(sys, ffu, a, b, r, n_orient, rng)
+            f(r_hi) < U || error("kT_overlap_cap: pair ($(tA.name) site $a, $(tB.name) site $b) is above U_cap at r = σ_ab")
+            r_lo = r_hi
+            while true
+                r_lo -= 0.02 * σ
+                r_lo > 0.1 * σ || error("kT_overlap_cap: no distance with energy ≥ U_cap for ($(tA.name) $a, $(tB.name) $b)")
+                f(r_lo) >= U && break
+                r_hi = r_lo
+            end
+            for _ in 1:12
+                rm = 0.5 * (r_lo + r_hi)
+                f(rm) >= U ? (r_lo = rm) : (r_hi = rm)
+            end
+            rstar[ta, tb] = min(rstar[ta, tb], r_lo); rstar[tb, ta] = rstar[ta, tb]
+        end
+    end
+    for t1 in 1:nt, t2 in 1:nt                       # type pairs that never meet: keep the legacy radius
+        isfinite(rstar[t1, t2]) || (rstar[t1, t2] = sqrt(ff.rcap2_mix[t1, t2]))
+    end
+    # charge-collapse coverage: (host X of h, d_h) for every charged site (LJ sites are their own host, d = 0)
+    function hosts(t::RigidTemplate)
+        out = Tuple{Int,Float64,Float64}[]          # (host LJ type, d_h, q)
+        for h in 1:t.n_sites
+            t.site_q[h] == 0.0 && continue
+            if t.site_type[h] > 0
+                push!(out, (t.site_type[h], 0.0, t.site_q[h])); continue
+            end
+            dbest = Inf; tbest = 0
+            for x in 1:t.n_sites
+                t.site_type[x] > 0 || continue
+                d = sqrt(sum(abs2, t.sites_body[:, h] .- t.sites_body[:, x]))
+                d < dbest && (dbest = d; tbest = t.site_type[x])
+            end
+            tbest > 0 || error("kT_overlap_cap: charged site $h of $(t.name) has no LJ site in its molecule")
+            push!(out, (tbest, dbest, t.site_q[h]))
+        end
+        return out
+    end
+    for A in eachindex(templates), B in A:length(templates)
+        for (x, dh, qh) in hosts(templates[A]), (y, dy, qy) in hosts(templates[B])
+            (qh * qy < 0.0 && (dh > 0.0 || dy > 0.0)) || continue
+            dh + dy < rstar[x, y] ||
+                error("kT_overlap_cap: opposite charges of $(templates[A].name)/$(templates[B].name) can collapse outside " *
+                      "the trigger radius (|X−Y| ≤ $(dh + dy) ≥ r* = $(rstar[x, y])); use a smaller U_kT")
+        end
+    end
+    ffc = SiteForceField(ff.n_types, ff.σ_mix, ff.ϵ_mix, rstar .^ 2, fill(U, nt, nt), ff.rc, ff.rc2, ff.coulomb,
+                         ff.wolf, ff.use_lrc, true, ff.shift_lj, ff.u_rc_mix, ff.cutoff, ff.rf, U)
+    return ffc, rstar
+end
 
 """
     rigid_forces_torques!(F, τ, sys, ff) -> U_pair
@@ -961,7 +1076,8 @@ function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::Rig
         end
         ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
         si = sys.site_start[i]; sj = sys.site_start[j]
-        # first pass: capped pair? (then cap energy, no force — as pair_energy)
+        # capped pair (geometric trigger, or bare energy above the kT cap)? then its cap energy and no
+        # force — exactly as pair_energy
         capped = false
         if ff.cap_overlaps
             for n in 1:ti.n_sites, m in 1:tj.n_sites
@@ -975,6 +1091,9 @@ function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::Rig
                 if r2 < ff.rcap2_mix[tyn, tym]
                     capped = true; U += ff.ucap_mix[tyn, tym]; break
                 end
+            end
+            if !capped && isfinite(ff.cap_min_u) && pair_energy(sys, ff, i, j) >= ff.cap_min_u
+                capped = true; U += ff.cap_min_u
             end
         end
         capped && continue
