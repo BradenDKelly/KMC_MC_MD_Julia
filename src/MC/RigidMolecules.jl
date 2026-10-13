@@ -1946,66 +1946,79 @@ function rigid_ekmc_volume_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteF
 end
 
 """
-    run_rigid_ekmc!(sys, ff; events, Pext=nothing, max_dV=0.0, vol_every_sweeps=10,
-                    sample_every=10, block_events=1000, debug_check_every=0,
-                    adapt_dV_moves=0, adapt_dV_window=100,
-                    vol_pressure=:partial_average, vol_scheme=:newton,
-                    vol_equil_moves=200, burnin_events=0)
+    RigidEKMCRun
 
-NVT (Pext === nothing) or NPT eKMC. In NPT a volume move is made every `vol_every_sweeps`·N events
-with maximum change `max_dV`, using the kMC-time-weighted block average of the virial pressure over
-every event since the previous volume move (`vol_pressure = :partial_average`, Tan 2016;
-`:instantaneous` reproduces the biased variant, see `rigid_ekmc_volume_move!`). The virial is
-maintained incrementally with the pair energies, so the pressure costs nothing per event. With
-`vol_scheme = :newton` the first `vol_equil_moves` volume moves use the full Newton gain (capped at
-`max_dV`), after which the Robbins–Monro gain 1/(k − k0 + 1) lets the volume converge; observables
-are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N).
-`tail_route` (`:virial` or `:thermodynamic`, see `pressure`) selects the tail pressure used both in
-the volume controller and in the reported P.
-
-MC-kernel hybrid (`mc_kernel_rate` = λ > 0): an extra event of constant rate λ whose action is one
-Metropolis sweep (N translations of half-width `mc_δ` and N rotations of half-angle `mc_δθ`, done
-through the eKMC bookkeeping by `ekmc_mc_sweep!`). The generator is Q_eKMC + λ(K − I) with K the
-Metropolis kernel; both terms satisfy detailed balance with the canonical distribution, so the
-chain stays balanced and the time averages canonical. Residence times are ln(1/ξ)/(R + λ): with λ
-of the order of R in relaxed states the weights of relaxed configurations become nearly uniform,
-which removes the heavy tail that uniform relocation alone produces in hydrogen-bonded liquids
-(JOURNAL entry 5), while a mis-placed molecule (R ≫ λ) is still relocated at once. The μ observable
-is unchanged: ⟨R/N⟩_time with R = Σ exp(βu_i) (the relocation rate, not R + λ); the Tan shortcut
-⟨R⟩ = M/t_total no longer applies. λ must be a constant for the run (a state-dependent λ would break
-balance); `estimate_relocation_rate` gives the scale from a short pilot. With λ > 0 most events are
-sweeps, so set `vol_every_events` (volume move every that many events) instead of `vol_every_sweeps`.
-Validated 2026-10-11 (JOURNAL entries 7–9): agrees with MC and pure eKMC at a supercritical state for
-λ = 1 and 10; at liquid density it reaches a lower-energy state that plain MC from a random start never
-finds in 160k sweeps, and MC continued from that state stays there. `vol_scheme = :newton` (default) applies Kelly's secant
-update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
-threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
-half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
-volume moves during the first `adapt_dV_moves` moves (Tan 2017 Appendix 4). Use it only as a short
-burn-in and read the final value from `max_dV` in the result: because the volume walk's spread is
-itself set by ΔV_max, the feedback shrinks ΔV_max towards zero if left on (dev experiment
-2026-10-11: 10.4 → 0.01 in 15 windows). Observables are time-weighted (Tan 2017 Eq. 5)
-with the residence time of the sampled configuration. U = ½ Σ φ_i and W = ½ Σ_i Σ_j w_ij come from the
-maintained pair matrices, so U, P and ρ are all sampled every `sample_every` events for free. Returns block averages of U/N (pair + tail), P, ρ,
-the NVT chemical-potential accumulator (μ_ex = `mu_ex(acc, T)`), blocked R/N (`RN`, for
-μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`)
-plus blocked (R/N)/V (`RNV`) and V (`V`) so that μ_res = T ln(mean(RNV)·mean(V)) has a block error.
-Every blocked observable also carries its block sums, so the global time average is `ratio_mean` and
-its error `ratio_jackknife_stderr` (use these for μ: `T·log(ratio_mean(RN))` ± `T·ratio_jackknife_stderr(RN; f=log)`).
-`species_mu=true` adds `RN_species[s]`, the blocked (1/N_s) Σ_{i∈s} exp(βu_i) of every template s
-(per-species μ_ex,s = T ln⟨·⟩; the mobilities are the clamped `_mobility` values, as in R), and
-`trace_molecule=i` records (u_i, Δt) at every sample in `trace_phi`, `trace_dt` (tail diagnostics for
-a single solute). `species_rate_scale[s]` multiplies the relocation rate of every molecule of template s
-(`init_rigid_ekmc` `rate_scale`): balance and the per-species μ are unaffected, the share of relocation
-bursts per species changes; with scaling the global R/N accumulators (`RN`, `mu`, `RNV`, `mu_npt`) no longer
-give a physical μ — use `RN_species`. `overlap_fast_path` (default false) counts capped landings analytically
-and redraws the mover without a row evaluation; it neglects the capped partner's mobility, a relative error
-of order exp(β(φ_partner − u_rest)) — negligible for liquid water, not for a weakly bound solute (see the
-comment in the loop); `fast_events`, `bursts` and `relocations` in the result count the events. The
-diagnostic trace records fast events only when the traced molecule is the mover. R/N and the species sums are accumulated at every event
-(block size `block_events`); U, P, ρ, V every `sample_every` events.
+Complete state of a rigid-molecule eKMC run between two events: the options, the eKMC bookkeeping, every
+accumulator and counter. `init_rigid_ekmc_run` builds it, `advance_rigid_ekmc!` continues it and
+`rigid_ekmc_results` returns the named tuple of `run_rigid_ekmc!`. With the `RigidSystem` (which owns the RNG)
+it is the whole run, so serializing (sys, run) and continuing after deserialization reproduces the
+uninterrupted run event for event (checkpoint/restart of long runs; test/test_ekmc_checkpoint.jl).
 """
-function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
+mutable struct RigidEKMCRun
+    events::Int
+    Pext::Union{Nothing,Float64}
+    sample_every::Int
+    burnin_events::Int
+    tail_route::Symbol
+    λ::Float64
+    mc_δ::Float64
+    mc_δθ::Float64
+    species_mu::Bool
+    trace_molecule::Int
+    overlap_fast_path::Bool
+    reservoirs::Union{Nothing,Vector}
+    flex_mols::Vector{Int}
+    vol_period::Int
+    adapt_dV_moves::Int
+    adapt_dV_window::Int
+    vol_pressure::Symbol
+    vol_scheme::Symbol
+    vol_equil_moves::Int
+    ek::RigidEKMCState
+    Uin::Vector{Float64}
+    acc::ChemicalPotentialAccumulator
+    acc_npt::NPTChemicalPotentialAccumulator
+    ba_U::TimeWeightedBlockAverager
+    ba_P::TimeWeightedBlockAverager
+    ba_rho::TimeWeightedBlockAverager
+    ba_V::TimeWeightedBlockAverager
+    ba_RN::TimeWeightedBlockAverager
+    ba_Ui::TimeWeightedBlockAverager
+    ba_RNV::TimeWeightedBlockAverager
+    ba_RNs::Vector{TimeWeightedBlockAverager}
+    nspec::Int
+    n_spec::Vector{Int}
+    sp_sum::Vector{Float64}
+    trace_phi::Vector{Float64}
+    trace_dt::Vector{Float64}
+    win_V::Vector{Float64}
+    win_t::Vector{Float64}
+    dV_history::Vector{Float64}
+    reg_n::Int
+    vol_moves::Int
+    next_vol::Int
+    n_fast::Int
+    n_reloc::Int
+    n_bursts::Int
+    ev::Int
+    n_full::Int
+    reg_V::Float64
+    reg_P::Float64
+    reg_VV::Float64
+    reg_VP::Float64
+    p_part_sum::Float64
+    p_part_t::Float64
+    t_total::Float64
+    t_since_vol::Float64
+    max_dV_current::Float64
+end
+
+"""
+    init_rigid_ekmc_run(sys, ff; events, kwargs...) -> RigidEKMCRun
+
+Validate the options of `run_rigid_ekmc!` (same keywords) and build the run state at event 0.
+"""
+function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
@@ -2080,7 +2093,80 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     next_vol = vol_period
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
-    while ev < events
+    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current)
+end
+
+"""
+    advance_rigid_ekmc!(r, sys, ff; until=r.events, wall_seconds=Inf) -> r
+
+Continue the run until event `min(until, r.events)` or until `wall_seconds` of wall time have passed (checked
+every 4096 events); a stopped run continues exactly where it left off at the next call. `r.ev` is the number
+of events done. (An overlap fast-path burst, if that switch is on, may run past `until`, as it would past
+any event of an uninterrupted run; it never runs past `r.events`.)
+"""
+function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceField; until::Int=r.events,
+                             wall_seconds::Float64=Inf)
+    N = sys.n_mol
+    deadline = time() + wall_seconds
+    events = r.events
+    Pext = r.Pext
+    sample_every = r.sample_every
+    burnin_events = r.burnin_events
+    tail_route = r.tail_route
+    λ = r.λ
+    mc_δ = r.mc_δ
+    mc_δθ = r.mc_δθ
+    species_mu = r.species_mu
+    trace_molecule = r.trace_molecule
+    overlap_fast_path = r.overlap_fast_path
+    reservoirs = r.reservoirs
+    flex_mols = r.flex_mols
+    vol_period = r.vol_period
+    adapt_dV_moves = r.adapt_dV_moves
+    adapt_dV_window = r.adapt_dV_window
+    vol_pressure = r.vol_pressure
+    vol_scheme = r.vol_scheme
+    vol_equil_moves = r.vol_equil_moves
+    ek = r.ek
+    Uin = r.Uin
+    acc = r.acc
+    acc_npt = r.acc_npt
+    ba_U = r.ba_U
+    ba_P = r.ba_P
+    ba_rho = r.ba_rho
+    ba_V = r.ba_V
+    ba_RN = r.ba_RN
+    ba_Ui = r.ba_Ui
+    ba_RNV = r.ba_RNV
+    ba_RNs = r.ba_RNs
+    nspec = r.nspec
+    n_spec = r.n_spec
+    sp_sum = r.sp_sum
+    trace_phi = r.trace_phi
+    trace_dt = r.trace_dt
+    win_V = r.win_V
+    win_t = r.win_t
+    dV_history = r.dV_history
+    reg_n = r.reg_n
+    vol_moves = r.vol_moves
+    next_vol = r.next_vol
+    n_fast = r.n_fast
+    n_reloc = r.n_reloc
+    n_bursts = r.n_bursts
+    ev = r.ev
+    n_full = r.n_full
+    reg_V = r.reg_V
+    reg_P = r.reg_P
+    reg_VV = r.reg_VV
+    reg_VP = r.reg_VP
+    p_part_sum = r.p_part_sum
+    p_part_t = r.p_part_t
+    t_total = r.t_total
+    t_since_vol = r.t_since_vol
+    max_dV_current = r.max_dV_current
+    stop = min(until, events)
+    while ev < stop
+        (ev & 4095 == 0) && time() > deadline && break
         ev += 1; n_full += 1          # n_full counts the states that get a full update (sampling stride for U, P)
         # weight of the current configuration: draw its Δt here and reuse it in the step
         R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
@@ -2204,9 +2290,136 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             vol_moves += 1
         end
     end
+    r.reg_n = reg_n
+    r.vol_moves = vol_moves
+    r.next_vol = next_vol
+    r.n_fast = n_fast
+    r.n_reloc = n_reloc
+    r.n_bursts = n_bursts
+    r.ev = ev
+    r.n_full = n_full
+    r.reg_V = reg_V
+    r.reg_P = reg_P
+    r.reg_VV = reg_VV
+    r.reg_VP = reg_VP
+    r.p_part_sum = p_part_sum
+    r.p_part_t = p_part_t
+    r.t_total = t_total
+    r.t_since_vol = t_since_vol
+    r.max_dV_current = max_dV_current
+    return r
+end
+
+"""
+    rigid_ekmc_results(r) -> NamedTuple
+
+The result of `run_rigid_ekmc!` from a run state (complete or partial).
+"""
+function rigid_ekmc_results(r::RigidEKMCRun)
+    ba_U = r.ba_U
+    ba_P = r.ba_P
+    ba_rho = r.ba_rho
+    ba_V = r.ba_V
+    ba_RN = r.ba_RN
+    ba_RNV = r.ba_RNV
+    acc = r.acc
+    acc_npt = r.acc_npt
+    t_total = r.t_total
+    ek = r.ek
+    vol_moves = r.vol_moves
+    max_dV_current = r.max_dV_current
+    dV_history = r.dV_history
+    ba_RNs = r.ba_RNs
+    trace_phi = r.trace_phi
+    trace_dt = r.trace_dt
+    n_fast = r.n_fast
+    n_bursts = r.n_bursts
+    n_reloc = r.n_reloc
+    ba_Ui = r.ba_Ui
     return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, RN=ba_RN, RNV=ba_RNV, mu=acc, mu_npt=acc_npt,
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
             mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
             RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt,
             fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui)
+end
+
+"""
+    run_rigid_ekmc!(sys, ff; events, Pext=nothing, max_dV=0.0, vol_every_sweeps=10,
+                    sample_every=10, block_events=1000, debug_check_every=0,
+                    adapt_dV_moves=0, adapt_dV_window=100,
+                    vol_pressure=:partial_average, vol_scheme=:newton,
+                    vol_equil_moves=200, burnin_events=0)
+
+NVT (Pext === nothing) or NPT eKMC. In NPT a volume move is made every `vol_every_sweeps`·N events
+with maximum change `max_dV`, using the kMC-time-weighted block average of the virial pressure over
+every event since the previous volume move (`vol_pressure = :partial_average`, Tan 2016;
+`:instantaneous` reproduces the biased variant, see `rigid_ekmc_volume_move!`). The virial is
+maintained incrementally with the pair energies, so the pressure costs nothing per event. With
+`vol_scheme = :newton` the first `vol_equil_moves` volume moves use the full Newton gain (capped at
+`max_dV`), after which the Robbins–Monro gain 1/(k − k0 + 1) lets the volume converge; observables
+are accumulated only after `burnin_events` events (choose ≥ `vol_equil_moves`·`vol_every_sweeps`·N).
+`tail_route` (`:virial` or `:thermodynamic`, see `pressure`) selects the tail pressure used both in
+the volume controller and in the reported P.
+
+MC-kernel hybrid (`mc_kernel_rate` = λ > 0): an extra event of constant rate λ whose action is one
+Metropolis sweep (N translations of half-width `mc_δ` and N rotations of half-angle `mc_δθ`, done
+through the eKMC bookkeeping by `ekmc_mc_sweep!`). The generator is Q_eKMC + λ(K − I) with K the
+Metropolis kernel; both terms satisfy detailed balance with the canonical distribution, so the
+chain stays balanced and the time averages canonical. Residence times are ln(1/ξ)/(R + λ): with λ
+of the order of R in relaxed states the weights of relaxed configurations become nearly uniform,
+which removes the heavy tail that uniform relocation alone produces in hydrogen-bonded liquids
+(JOURNAL entry 5), while a mis-placed molecule (R ≫ λ) is still relocated at once. The μ observable
+is unchanged: ⟨R/N⟩_time with R = Σ exp(βu_i) (the relocation rate, not R + λ); the Tan shortcut
+⟨R⟩ = M/t_total no longer applies. λ must be a constant for the run (a state-dependent λ would break
+balance); `estimate_relocation_rate` gives the scale from a short pilot. With λ > 0 most events are
+sweeps, so set `vol_every_events` (volume move every that many events) instead of `vol_every_sweeps`.
+Validated 2026-10-11 (JOURNAL entries 7–9): agrees with MC and pure eKMC at a supercritical state for
+λ = 1 and 10; at liquid density it reaches a lower-energy state that plain MC from a random start never
+finds in 160k sweeps, and MC continued from that state stays there. `vol_scheme = :newton` (default) applies Kelly's secant
+update `rigid_ekmc_newton_volume_move!` (first move: Tan rule); `:auxiliary` applies Tan's Eq. 12
+threshold rule every time. If `adapt_dV_moves > 0`, ΔV_max is reset to
+half the standard deviation of the kMC-time-weighted volume distribution every `adapt_dV_window`
+volume moves during the first `adapt_dV_moves` moves (Tan 2017 Appendix 4). Use it only as a short
+burn-in and read the final value from `max_dV` in the result: because the volume walk's spread is
+itself set by ΔV_max, the feedback shrinks ΔV_max towards zero if left on (dev experiment
+2026-10-11: 10.4 → 0.01 in 15 windows). Observables are time-weighted (Tan 2017 Eq. 5)
+with the residence time of the sampled configuration. U = ½ Σ φ_i and W = ½ Σ_i Σ_j w_ij come from the
+maintained pair matrices, so U, P and ρ are all sampled every `sample_every` events for free. Returns block averages of U/N (pair + tail), P, ρ,
+the NVT chemical-potential accumulator (μ_ex = `mu_ex(acc, T)`), blocked R/N (`RN`, for
+μ_ex = T ln mean(RN) with error T·stderr/mean) and, in NPT, the Eq. A.132 accumulator (`mu_ex_npt`)
+plus blocked (R/N)/V (`RNV`) and V (`V`) so that μ_res = T ln(mean(RNV)·mean(V)) has a block error.
+Every blocked observable also carries its block sums, so the global time average is `ratio_mean` and
+its error `ratio_jackknife_stderr` (use these for μ: `T·log(ratio_mean(RN))` ± `T·ratio_jackknife_stderr(RN; f=log)`).
+`species_mu=true` adds `RN_species[s]`, the blocked (1/N_s) Σ_{i∈s} exp(βu_i) of every template s
+(per-species μ_ex,s = T ln⟨·⟩; the mobilities are the clamped `_mobility` values, as in R), and
+`trace_molecule=i` records (u_i, Δt) at every sample in `trace_phi`, `trace_dt` (tail diagnostics for
+a single solute). `species_rate_scale[s]` multiplies the relocation rate of every molecule of template s
+(`init_rigid_ekmc` `rate_scale`): balance and the per-species μ are unaffected, the share of relocation
+bursts per species changes; with scaling the global R/N accumulators (`RN`, `mu`, `RNV`, `mu_npt`) no longer
+give a physical μ — use `RN_species`. `overlap_fast_path` (default false) counts capped landings analytically
+and redraws the mover without a row evaluation; it neglects the capped partner's mobility, a relative error
+of order exp(β(φ_partner − u_rest)) — negligible for liquid water, not for a weakly bound solute (see the
+comment in the loop); `fast_events`, `bursts` and `relocations` in the result count the events. The
+diagnostic trace records fast events only when the traced molecule is the mover. R/N and the species sums are accumulated at every event
+(block size `block_events`); U, P, ρ, V every `sample_every` events.
+"""
+function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
+                         Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
+                         vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
+                         debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
+                         vol_pressure::Symbol=:partial_average, vol_scheme::Symbol=:newton,
+                         vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
+                         mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
+                         vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
+                         species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing,
+                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing)
+    r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
+                            sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
+                            adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
+                            vol_scheme=vol_scheme, vol_equil_moves=vol_equil_moves, burnin_events=burnin_events,
+                            tail_route=tail_route, mc_kernel_rate=mc_kernel_rate, mc_δ=mc_δ, mc_δθ=mc_δθ,
+                            vol_every_events=vol_every_events, species_mu=species_mu, trace_molecule=trace_molecule,
+                            species_rate_scale=species_rate_scale, overlap_fast_path=overlap_fast_path, reservoirs=reservoirs)
+    advance_rigid_ekmc!(r, sys, ff)
+    return rigid_ekmc_results(r)
 end

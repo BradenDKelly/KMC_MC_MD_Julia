@@ -21,10 +21,12 @@ Chem. B 130 (2026) 4636, Table 1); experiment: methane 8.37 kJ/mol (same table),
 
 Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_events seed outdir
 Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
-eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG.
+eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
+SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
+of one invocation), SPCE_TRACE (1; 0 drops the per-event solute trace).
 """
 
-using MolSim, Random, StaticArrays, Printf, Dates
+using MolSim, Random, StaticArrays, Printf, Dates, Serialization
 const MCm = MolSim.MC
 
 solute = Symbol(length(ARGS) >= 1 ? ARGS[1] : "methane")
@@ -42,6 +44,9 @@ fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast pat
 elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))      # 0 = stock eKMC (default, user 2026-10-12); >0 = λ-hybrid, λ = fac·⟨R⟩_MC
 tag = get(ENV, "SPCE_TAG", "")
+ckpt = get(ENV, "SPCE_CHECKPOINT", "")    # checkpoint file: eKMC continues from it if present (chained jobs); "" = off
+wall = parse(Float64, get(ENV, "SPCE_WALL_SECONDS", "Inf"))   # eKMC wall-time budget of this invocation; checkpoint and exit when spent
+trace = get(ENV, "SPCE_TRACE", "1") == "1"   # per-event solute (u, Δt) trace for the tail report (16 bytes/event: off for ≳ 1e8 events)
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
 cap_mode = get(ENV, "SPCE_CAP", "kT100")   # kT100: 100 kT overlap cap (DESIGN §9, default from 2026-10-13); legacy: 1000 ε_ab at 0.75 σ_ab
@@ -75,7 +80,7 @@ function tail_report(io, phi, dt, β, name)
             name, n, neff, frac(0.001), frac(0.01), frac(0.1), q(0.05), q(0.5), q(0.95), q(0.999), β * maximum(phi))
 end
 
-open(out, "w") do io
+function setup_and_mc(io)
     println(io, "# SPC/E + $(m.solute.name) at infinite dilution  $(Dates.now())  N_water=$N + 1 solute  L=$(round(L_A; digits=3)) Å  T=$T_K K  ρ_water=1000 kg/m³")
     println(io, "# Coulomb=$(coulomb) (Wolf α=$(α_A) 1/Å | RF ε_rf=$(ε_rf)) rc=10 Å cutoff=$(cutoff) cap=$(cap_tag); LJ types σ*=$(round.([ff.σ_mix[a,a] for a in 1:ff.n_types]; digits=4)) ϵ*=$(round.([ff.ϵ_mix[a,a] for a in 1:ff.n_types]; digits=4))")
     flush(io)
@@ -170,10 +175,17 @@ open(out, "w") do io
     println(io, "# species rate scale: <R_water>_MC=$(R_w)  <R_solute>_MC=$(R_s)  c_solute=$(c_sol)  (solute share $(share))"); flush(io)
     println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
-    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
-                             debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
-                             species_mu=true, trace_molecule=isol, species_rate_scale=[1.0, c_sol], reservoirs=reservoirs)
-    t_ek = time() - t0
+    r = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
+                                debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
+                                species_mu=true, trace_molecule=trace ? isol : 0, species_rate_scale=[1.0, c_sol], reservoirs=reservoirs)
+    trace || println(io, "# solute trace off (SPCE_TRACE=0): no tail diagnostics; the trace costs 16 bytes per event")
+    ctx = (; out, T, kJmol_per_eps, atm_per_pstar, ΔU_tail, E_const, const_E, Nt, flex, Ures=flex ? Ures : NaN, coulomb, ekmc_events, t_ek=0.0)
+    return (sys, r, ff, ctx)
+end
+
+# --- eKMC: run (or continue from the checkpoint) and report ---
+function ekmc_report(io, ek, ctx)
+    (; T, kJmol_per_eps, atm_per_pstar, ΔU_tail, E_const, const_E, Nt, flex, Ures, coulomb, ekmc_events, t_ek) = ctx
     rw, rs = ek.RN_species[1], ek.RN_species[2]
     μ_w = T * log(MCm.ratio_mean(rw)); eμ_w = T * MCm.ratio_jackknife_stderr(rw; f=log)
     μ_s = T * log(MCm.ratio_mean(rs)) + ΔU_tail; eμ_s = T * MCm.ratio_jackknife_stderr(rs; f=log)
@@ -193,4 +205,36 @@ open(out, "w") do io
     tail_report(io, ek.trace_phi, ek.trace_dt, 1 / T, "eKMC solute")
     println(io, "# block means U/N (eKMC, reduced): ", join(round.(ek.U.block_means; digits=3), " "))
 end
-println(read(out, String))
+
+# atomic checkpoint write: a job killed while writing leaves the previous checkpoint intact
+function save_checkpoint(path, state)
+    tmp = path * ".tmp"
+    open(io -> serialize(io, state), tmp, "w")
+    mv(tmp, path; force=true)
+end
+
+if !isempty(ckpt) && isfile(ckpt * ".final")
+    println("run already complete (", ckpt, ".final exists); nothing to do"); exit(0)
+end
+if !isempty(ckpt) && isfile(ckpt)
+    sys, r, ff, ctx = deserialize(ckpt)
+    io = open(ctx.out, "a")
+    println(io, "# resumed from checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  host=$(gethostname())"); flush(io)
+else
+    sys, r, ff, ctx = open(setup_and_mc, out, "w")
+    isempty(ckpt) || save_checkpoint(ckpt, (sys, r, ff, ctx))
+    io = open(ctx.out, "a")
+end
+t0 = time()
+MCm.advance_rigid_ekmc!(r, sys, ff; wall_seconds=wall)
+ctx = merge(ctx, (; t_ek=ctx.t_ek + time() - t0))
+if r.ev < r.events
+    isempty(ckpt) && error("eKMC stopped at event $(r.ev) of $(r.events) without a checkpoint path (set SPCE_CHECKPOINT)")
+    save_checkpoint(ckpt, (sys, r, ff, ctx))
+    println(io, "# checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  eKMC wall time so far $(round(ctx.t_ek; digits=0)) s"); close(io)
+    println("checkpoint written at event $(r.ev) of $(r.events)"); exit(0)
+end
+ekmc_report(io, MCm.rigid_ekmc_results(r), ctx)
+close(io)
+isempty(ckpt) || (save_checkpoint(ckpt, (sys, r, ff, ctx)); mv(ckpt, ckpt * ".final"; force=true))
+println(read(ctx.out, String))

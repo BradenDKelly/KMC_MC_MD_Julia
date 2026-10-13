@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "055af32aacd54a650438ffa73b5f8941b8a36b83"
+project_hash = "ddb16ce3771312e3579831c609ff32250396f02e"
 
 [[deps.AliasTables]]
 deps = ["PtrArrays", "Random"]
@@ -524,7 +524,7 @@ uuid = "a63ad114-7e13-5084-954f-fe012c677804"
 version = "1.11.0"
 
 [[deps.MolSim]]
-deps = ["BenchmarkTools", "LinearAlgebra", "Plots", "Random", "Revise", "StaticArrays", "Test"]
+deps = ["BenchmarkTools", "LinearAlgebra", "Plots", "Random", "Revise", "SpecialFunctions", "StaticArrays", "Test"]
 path = "."
 uuid = "b7e0c6d8-6b6a-4e3a-9b5e-2c1f6a1c9c01"
 version = "0.0.0"
