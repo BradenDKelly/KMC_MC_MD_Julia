@@ -477,4 +477,28 @@ end
     @test MCm.ratio_mean(rs) ≈ sum(MCm._mobility(1 / T, ek.trace_phi[k]) * ek.trace_dt[k] for k in eachindex(ek.trace_phi)) /
                                sum(ek.trace_dt) rtol=1e-10
     @test isempty(MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=100, sample_every=10, block_events=50).RN_species)
+    # overlap fast path (switch, default off): same averages within errors, overlap detector exact, counters set
+    ek3 = MCm.run_rigid_ekmc!(deepcopy(sys_scaled), ff; events=events ÷ 2, sample_every=1, block_events=events ÷ 50,
+                              species_mu=true, overlap_fast_path=true, trace_molecule=Nt)
+    @test ek3.fast_events > 0 && ek3.bursts > 0 && ek3.relocations + ek3.fast_events == events ÷ 2
+    @test ek.fast_events == 0 && ek.relocations == events
+    μ_f, eμ_f = T * log(MCm.ratio_mean(ek3.RN_species[2])), T * MCm.ratio_jackknife_stderr(ek3.RN_species[2]; f=log)
+    @test within3σ(μ_w, eμ_w, μ_f, eμ_f)
+    @test within3σ(MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(ek3.U), MCm.stderr(ek3.U))
+    @test within3σ(MCm.mean(mc.P), MCm.stderr(mc.P), MCm.mean(ek3.P), MCm.stderr(ek3.P))
+    @test MCm.ratio_mean(ek3.RN) * Nt ≈ N * MCm.ratio_mean(ek3.RN_species[1]) + MCm.ratio_mean(ek3.RN_species[2]) rtol=1e-10
+    caps = Set(vec(ff.ucap_mix)); bad = 0
+    for _ in 1:2000
+        k = rand(sys.rng, 1:Nt)
+        MCm.set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L), MCm.uniform_random_quaternion(sys.rng))
+        n, us = MCm.capped_overlaps(sys, ff, k)
+        n2 = 0; us2 = 0.0
+        for j in 1:Nt
+            j == k && continue
+            u = MCm.pair_energy(sys, ff, k, j)
+            u in caps && (n2 += 1; us2 += u)
+        end
+        (n != n2 || abs(us - us2) > 1e-12) && (bad += 1)
+    end
+    @test bad == 0
 end

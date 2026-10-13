@@ -22,9 +22,9 @@ OUT=/shared/kmc_polyatomic/KMC_MC_MD_Julia/dev/results/spce_solute
 SOLUTE=${SOLUTE:-methane}
 N=${N:-500}
 MC_SWEEPS=${MC_SWEEPS:-8000}        # 2000 equilibration + 8000 production sweeps
-EKMC_EVENTS=${EKMC_EVENTS:-100000}  # hybrid events (≈ sweeps)
+EKMC_EVENTS=${EKMC_EVENTS:-100000000}  # stock eKMC events (SPCE_LAMBDA=0 default); a hybrid run needs ~1e5–1e7
 SEED=${SLURM_ARRAY_TASK_ID:-1}
-export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-100}
+export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-0}
 mkdir -p "$OUT"
 
 echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED alpha=$SPCE_ALPHA cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA start=$(date)"

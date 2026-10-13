@@ -22,7 +22,7 @@ OUT=/shared/kmc_polyatomic/KMC_MC_MD_Julia/dev/results/spce_wolf
 
 N=${N:-500}
 MC_SWEEPS=${MC_SWEEPS:-16000}   # v2: 4000 equilibration + 16000 production sweeps (8 threads)
-EKMC_EVENTS=${EKMC_EVENTS:-20000000}
+EKMC_EVENTS=${EKMC_EVENTS:-100000000}
 SEED=${SLURM_ARRAY_TASK_ID:-1}
 
 echo "host=$(hostname) N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED start=$(date)"

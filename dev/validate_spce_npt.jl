@@ -23,7 +23,8 @@ mkpath(outdir)
 # force-field variant from the environment (defaults = the site-cutoff α = 0.16 Å⁻¹ model of the first runs)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.16"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
-coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
+coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))
+fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast path switch (approximate for weakly bound species; default off)          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
 elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 
@@ -83,7 +84,7 @@ open(out, "w") do io
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
     R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
     λ = λfac > 0 ? λfac * (isfinite(R_mc) ? R_mc : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
-    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
+    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     # with the hybrid an event is ~one sweep, so volume moves go every 10 events (not 10·N)
     vee = λfac > 0 ? 10 : 0
@@ -92,7 +93,7 @@ open(out, "w") do io
     veq = parse(Int, get(ENV, "SPCE_VOL_EQUIL", "200"))
     λfac > 0 && (burn = min(veq * vee + ekmc_events ÷ 5, ekmc_events ÷ 2))
     println(io, "# NPT eKMC: vol_every_events=$(vee) vol_equil_moves=$(veq) burnin_events=$(burn)"); flush(io)
-    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, Pext=P_star, max_dV=0.02 * V0, vol_every_sweeps=10,
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, Pext=P_star, max_dV=0.02 * V0, vol_every_sweeps=10,
                              vol_every_events=vee, sample_every=se, block_events=max(25, (ekmc_events - burn) ÷ 25),
                              vol_equil_moves=veq, burnin_events=burn, debug_check_every=ekmc_events ÷ 10,
                              tail_route=tail_route, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ)

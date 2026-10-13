@@ -1150,6 +1150,55 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
     return nothing
 end
 
+"""
+    capped_overlaps(sys, ff, k) -> (n, ucap_sum)
+
+Number of molecule pairs (k, j) that `pair_energy(sys, ff, k, j)` would return as capped (a LJ site pair
+closer than the overlap radius) and the sum of their cap energies, found without evaluating any energy:
+COM pre-filter against extent_k + extent_j + r_cap, then site distances with early exit (same site order
+as `pair_energy`, so the same cap value). O(N) distance checks, ≈ 20× cheaper than a row. Used by the
+overlap fast path of `run_rigid_ekmc!` (DESIGN §5c item 1).
+"""
+function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
+    ff.cap_overlaps || return 0, 0.0
+    L = sys.L; N = sys.n_mol
+    tk = sys.templates[sys.tmpl[k]]; sk = sys.site_start[k]
+    rcap = sqrt(maximum(ff.rcap2_mix))
+    n = 0; usum = 0.0
+    @inbounds for j in 1:N
+        j == k && continue
+        tj = sys.templates[sys.tmpl[j]]
+        Rx = _min_image(sys.com[1, j] - sys.com[1, k], L)
+        Ry = _min_image(sys.com[2, j] - sys.com[2, k], L)
+        Rz = _min_image(sys.com[3, j] - sys.com[3, k], L)
+        dmax = tk.extent + tj.extent + rcap
+        Rx * Rx + Ry * Ry + Rz * Rz > dmax * dmax && continue
+        sj = sys.site_start[j]
+        found = false; ucap = 0.0
+        for a in 1:tk.n_sites
+            ta = tk.site_type[a]
+            ta > 0 || continue
+            ox, oy, oz = sys.site_off[1, sk + a], sys.site_off[2, sk + a], sys.site_off[3, sk + a]
+            for b in 1:tj.n_sites
+                tb = tj.site_type[b]
+                tb > 0 || continue
+                dx = Rx + sys.site_off[1, sj + b] - ox
+                dy = Ry + sys.site_off[2, sj + b] - oy
+                dz = Rz + sys.site_off[3, sj + b] - oz
+                if dx * dx + dy * dy + dz * dz < ff.rcap2_mix[ta, tb]
+                    found = true; ucap = ff.ucap_mix[ta, tb]
+                    break
+                end
+            end
+            found && break
+        end
+        if found
+            n += 1; usum += ucap
+        end
+    end
+    return n, usum
+end
+
 "Rosenbluth (tower) selection with probability m_i / R."
 function select_by_mobility(ek::RigidEKMCState, rng::AbstractRNG)::Int
     r = rand(rng) * ek.R
@@ -1398,7 +1447,12 @@ its error `ratio_jackknife_stderr` (use these for μ: `T·log(ratio_mean(RN))` �
 a single solute). `species_rate_scale[s]` multiplies the relocation rate of every molecule of template s
 (`init_rigid_ekmc` `rate_scale`): balance and the per-species μ are unaffected, the share of relocation
 bursts per species changes; with scaling the global R/N accumulators (`RN`, `mu`, `RNV`, `mu_npt`) no longer
-give a physical μ — use `RN_species`.
+give a physical μ — use `RN_species`. `overlap_fast_path` (default false) counts capped landings analytically
+and redraws the mover without a row evaluation; it neglects the capped partner's mobility, a relative error
+of order exp(β(φ_partner − u_rest)) — negligible for liquid water, not for a weakly bound solute (see the
+comment in the loop); `fast_events`, `bursts` and `relocations` in the result count the events. The
+diagnostic trace records fast events only when the traced molecule is the mover. R/N and the species sums are accumulated at every event
+(block size `block_events`); U, P, ρ, V every `sample_every` events.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -1408,7 +1462,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          vol_equil_moves::Int=200, burnin_events::Int=0, tail_route::Symbol=:virial,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
                          vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
-                         species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing)
+                         species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing,
+                         overlap_fast_path::Bool=false)
     N = sys.n_mol
     λ = mc_kernel_rate
     vol_period = vol_every_events > 0 ? vol_every_events : vol_every_sweeps * N
@@ -1428,7 +1483,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     ba_P = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_rho = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_V = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_RN = TimeWeightedBlockAverager(block_events ÷ sample_every)   # R/N for blocked μ errors
+    ba_RN = TimeWeightedBlockAverager(block_events)                  # R/N, every event (the μ observable)
     ba_RNV = TimeWeightedBlockAverager(block_events ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
     # per-species μ: exp(βμ_ex,s) = ⟨(1/N_s) Σ_{i∈s} exp(βu_i)⟩_time (Tan 2017 Eq. 8 applied to the
     # molecules of species s; the particle-removal estimator of Shing & Gubbins, Mol. Phys. 46 (1982)
@@ -1438,7 +1493,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     for i in 1:N
         n_spec[sys.tmpl[i]] += 1
     end
-    ba_RNs = species_mu ? [TimeWeightedBlockAverager(block_events ÷ sample_every) for _ in 1:nspec] :
+    ba_RNs = species_mu ? [TimeWeightedBlockAverager(block_events) for _ in 1:nspec] :      # every event
                           TimeWeightedBlockAverager[]
     sp_sum = zeros(Float64, nspec)
     trace_phi = Float64[]; trace_dt = Float64[]     # (u_i, Δt) of `trace_molecule` at every sample
@@ -1450,7 +1505,22 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     win_V = Float64[]; win_t = Float64[]
     max_dV_current = max_dV
     dV_history = Float64[]
-    for ev in 1:events
+    # Overlap fast path (DESIGN §5c item 1; a switch, OFF by default). A relocated molecule k that lands with
+    # n ≥ 1 capped pairs is in a state X′ with m_k′ = c_k exp(β(Σcaps + u_rest)). Its residence time
+    # ln(1/ξ)/R′ is below resolution and X′ contributes ln(1/ξ)·m_k′/R′ to Σ R Δt and ln(1/ξ)/c_k · m_k′/R′ to
+    # the species sum of k. The fast path takes m_k′/R′ = 1 and redraws k as the next mover without a row
+    # evaluation (dt_f = ln(1/ξ)/m_k′ with m_k′ from the caps alone keeps the products exact), evaluating the
+    # row once at the first landing without caps. APPROXIMATION: a capped partner j has m_j′ = c_j exp(β(φ_j +
+    # U_cap)), so m_j′/m_k′ = (c_j/c_k) exp(β(φ_j − u_rest)); the fast path neglects (a) j moving next and
+    # (b) j's species receiving ln(1/ξ)·m_j′/R′. Both are O(exp(β(φ_j − u_rest))): ≈ e^{−19} for liquid water
+    # (every partner strongly bound), but ≈ e^{−1} when the partner is a weakly bound solute — then the
+    # solute's μ is biased at the percent level. Use only when every species is strongly bound; the exact route
+    # to most of the saving is a cell list for the row. At liquid density 92 % of landings are capped.
+    next_vol = vol_period
+    n_fast = 0; n_reloc = 0; n_bursts = 0
+    ev = 0; n_full = 0
+    while ev < events
+        ev += 1; n_full += 1          # n_full counts the states that get a full update (sampling stride for U, P)
         # weight of the current configuration: draw its Δt here and reuse it in the step
         R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
         Rtot = R + λ                   # total event rate incl. the MC-kernel event
@@ -1461,15 +1531,19 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             # pressure is free from the maintained virial; time-weight it over every event of the block
             p_part_sum += pressure(sys, ff, ekmc_virial(ek); tail=tail_route) * dt; p_part_t += dt
         end
-        if ev % sample_every == 0 && ev > burnin_events
-            Up = 0.5 * sum(ek.phi)
-            push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
-            push!(ba_P, pressure(sys, ff, ekmc_virial(ek); tail=tail_route), dt)
-            push!(ba_rho, N / V, dt)
-            push!(ba_V, V, dt)
-            push!(ba_RN, R / N, dt)
-            push!(ba_RNV, R / N / V, dt)
-            push!(acc_npt, R / N, V, dt)
+        if ev > burnin_events
+            if n_full % sample_every == 0
+                Up = 0.5 * sum(ek.phi)
+                push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
+                push!(ba_P, pressure(sys, ff, ekmc_virial(ek); tail=tail_route), dt)
+                push!(ba_rho, N / V, dt)
+                push!(ba_V, V, dt)
+                push!(ba_RNV, R / N / V, dt)
+                push!(acc_npt, R / N, V, dt)
+            end
+            RN = R / N
+            push!(ba_RN, RN, dt)
+            acc.t_total += dt; acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
             if species_mu
                 fill!(sp_sum, 0.0)
                 @inbounds for i in 1:N
@@ -1483,10 +1557,6 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                 push!(trace_phi, ek.phi[trace_molecule]); push!(trace_dt, dt)
             end
         end
-        if ev > burnin_events
-            acc.t_total += dt; RN = R / N
-            acc.S += RN * dt; acc.S_sq += RN * RN * dt; acc.t_total_sq += dt * dt; acc.count += 1
-        end
         # the event: MC-kernel sweep with probability λ/(R+λ), otherwise a relocation
         if λ > 0.0 && rand(sys.rng) * Rtot < λ
             ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
@@ -1495,7 +1565,38 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             L = sys.L
             set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
                           uniform_random_quaternion(sys.rng))
+            if overlap_fast_path && ff.cap_overlaps
+                ncap, ucap = capped_overlaps(sys, ff, k)
+                ncap > 0 && (n_bursts += 1)
+                ck = ek.c[k]; sk = sys.tmpl[k]
+                while ncap > 0 && ev < events
+                    ev += 1
+                    ξ = rand(sys.rng); ξ = max(eps(Float64), min(ξ, 1.0 - eps(Float64)))
+                    lnξ = log(1 / ξ)
+                    mk = ck * _mobility(sys.β, ucap)          # m_k′ from the caps alone; only m_k′·dt_f = ln(1/ξ) matters
+                    dtf = lnξ / mk
+                    if ev > burnin_events
+                        push!(ba_RN, mk / N, dtf)
+                        acc.t_total += dtf; acc.S += (mk / N) * dtf; acc.S_sq += (mk / N)^2 * dtf
+                        acc.t_total_sq += dtf * dtf; acc.count += 1
+                        if species_mu
+                            for s in 1:nspec
+                                n_spec[s] > 0 && push!(ba_RNs[s], s == sk ? (mk / ck) / n_spec[sk] : 0.0, dtf)
+                            end
+                        end
+                        if trace_molecule == k          # other molecules: their stale φ is not their energy here
+                            push!(trace_phi, ucap); push!(trace_dt, dtf)
+                        end
+                    end
+                    ek.events += 1; n_fast += 1
+                    t_total += dtf; t_since_vol += dtf
+                    set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
+                                  uniform_random_quaternion(sys.rng))
+                    ncap, ucap = capped_overlaps(sys, ff, k)
+                end
+            end
             update_rigid_ekmc_after_move!(ek, sys, ff, k)
+            n_reloc += 1
         end
         ek.events += 1
         t_total += dt
@@ -1507,7 +1608,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
              abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))) &&
                 @warn "rigid eKMC bookkeeping drift" maximum(abs.(phi_saved .- ek.phi)) abs(R_saved - ek.R) / ek.R
         end
-        if Pext !== nothing && ev % vol_period == 0
+        if Pext !== nothing && ev >= next_vol
+            next_vol += vol_period
             if vol_moves < adapt_dV_moves
                 push!(win_V, sys.L^3); push!(win_t, t_since_vol)
                 if length(win_V) >= adapt_dV_window
@@ -1539,5 +1641,6 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, RN=ba_RN, RNV=ba_RNV, mu=acc, mu_npt=acc_npt,
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
             mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
-            RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt)
+            RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt,
+            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc)
 end

@@ -23,7 +23,8 @@ mkpath(outdir)
 # force-field variant from the environment (defaults = the site-cutoff α = 0.16 Å⁻¹ model of the first runs)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.16"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "site"))
-coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
+coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))
+fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast path switch (approximate for weakly bound species; default off)          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
 elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 
@@ -88,9 +89,9 @@ open(out, "w") do io
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
     R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
     λ = λfac > 0 ? λfac * (isfinite(R_mc) ? R_mc : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
-    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
+    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
-    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                              debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ)
     t_ek = time() - t0
     rn, ern = MCm.mean(ek.RN), MCm.stderr(ek.RN)
@@ -98,11 +99,11 @@ open(out, "w") do io
     eU_ek = MCm.stderr(ek.U) * kJmol_per_eps
     # mu_RN: mean of block ratios (biased when block times differ); mu_acc: global time average (the
     # estimator); mu_jk: the same global ratio with its delete-one-block jackknife error (Efron 1982)
-    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_RN=%.2f ± %.2f kJ/mol  mu_acc=%.2f kJ/mol  mu_jk=%.2f ± %.2f kJ/mol (%d blocks)  <dt>=%.3e\n",
+    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_RN=%.2f ± %.2f kJ/mol  mu_acc=%.2f kJ/mol  mu_jk=%.2f ± %.2f kJ/mol (%d blocks)  <dt>=%.3e  relocations=%d bursts=%d fast_events=%d\n",
             ekmc_events, t_ek, U_ek, eU_ek, MCm.mean(ek.P) * atm_per_pstar, MCm.stderr(ek.P) * atm_per_pstar,
             T * log(rn) * kJmol_per_eps, T * ern / rn * kJmol_per_eps, MCm.mu_ex(ek.mu, T) * kJmol_per_eps,
             T * log(MCm.ratio_mean(ek.RN)) * kJmol_per_eps, T * MCm.ratio_jackknife_stderr(ek.RN; f=log) * kJmol_per_eps,
-            length(ek.RN.block_sum_x), ek.t_total / ekmc_events)
+            length(ek.RN.block_sum_x), ek.t_total / ekmc_events, ek.relocations, ek.bursts, ek.fast_events)
     println(io, "# eKMC block μ (global-ratio blocks, kJ/mol): ", join(round.(T .* log.(ek.RN.block_means) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC block times: ", join(round.(ek.RN.block_sum_t; sigdigits=3), " "))
     println(io, "# block means U/N (eKMC, reduced): ", join(round.(ek.U.block_means; digits=3), " "))

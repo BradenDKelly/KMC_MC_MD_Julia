@@ -35,10 +35,11 @@ outdir = length(ARGS) >= 6 ? ARGS[6] : joinpath(@__DIR__, "results", "spce_solut
 mkpath(outdir)
 α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.20"))
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "molecule"))
-coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
+coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))
+fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast path switch (approximate for weakly bound species; default off)          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
 elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
-λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "100"))
+λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))      # 0 = stock eKMC (default, user 2026-10-12); >0 = λ-hybrid, λ = fac·⟨R⟩_MC
 tag = get(ENV, "SPCE_TAG", "")
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -126,16 +127,16 @@ open(out, "w") do io
     R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
     # species rate scaling: the solute gets the share SPCE_SOLUTE_SHARE of the relocation bursts (exact:
     # a constant factor on one species' rate keeps detailed balance, DESIGN §5c / JOURNAL entry 19)
-    share = parse(Float64, get(ENV, "SPCE_SOLUTE_SHARE", "0.5"))
+    share = parse(Float64, get(ENV, "SPCE_SOLUTE_SHARE", "0"))     # 0 = no rate scaling (default; equal-rate scaling fails for strongly bound solutes, JOURNAL entry 20)
     R_w = isfinite(R_mc) ? MCm.mean(mc.R_species[1]) : NaN
     R_s = isfinite(R_mc) ? MCm.mean(mc.R_species[2]) : NaN
-    c_sol = (isfinite(R_w) && isfinite(R_s) && R_s > 0) ? share / (1 - share) * R_w / R_s : 1.0
+    c_sol = (share > 0 && isfinite(R_w) && isfinite(R_s) && R_s > 0) ? share / (1 - share) * R_w / R_s : 1.0
     R_eff = isfinite(R_mc) ? R_w + c_sol * R_s : NaN
     λ = λfac > 0 ? λfac * (isfinite(R_eff) ? R_eff : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
     println(io, "# species rate scale: <R_water>_MC=$(R_w)  <R_solute>_MC=$(R_s)  c_solute=$(c_sol)  (solute share $(share))"); flush(io)
-    println(io, "# eKMC MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
+    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
-    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
+    ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                              debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
                              species_mu=true, trace_molecule=isol, species_rate_scale=[1.0, c_sol])
     t_ek = time() - t0
@@ -143,11 +144,12 @@ open(out, "w") do io
     μ_w = T * log(MCm.ratio_mean(rw)); eμ_w = T * MCm.ratio_jackknife_stderr(rw; f=log)
     μ_s = T * log(MCm.ratio_mean(rs)) + ΔU_tail; eμ_s = T * MCm.ratio_jackknife_stderr(rs; f=log)
     U_ek = (MCm.mean(ek.U) * Nt + const_E) / Nt * kJmol_per_eps
-    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_water=%.2f ± %.2f kJ/mol  mu_sol=%.2f ± %.2f kJ/mol (jackknife, %d blocks)  mu_mix_acc=%.2f  <dt>=%.3e  mc_acc=%.3f\n",
+    @printf(io, "eKMC events=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_water=%.2f ± %.2f kJ/mol  mu_sol=%.2f ± %.2f kJ/mol (jackknife, %d blocks)  mu_mix_acc=%.2f  <dt>=%.3e  mc_acc=%.3f  relocations=%d bursts=%d fast_events=%d\n",
             ekmc_events, t_ek, U_ek, MCm.stderr(ek.U) * kJmol_per_eps,
             MCm.mean(ek.P) * atm_per_pstar, MCm.stderr(ek.P) * atm_per_pstar,
             μ_w * kJmol_per_eps, eμ_w * kJmol_per_eps, μ_s * kJmol_per_eps, eμ_s * kJmol_per_eps,
-            length(rs.block_sum_x), MCm.mu_ex(ek.mu, T) * kJmol_per_eps, ek.t_total / ekmc_events, ek.mc_acceptance)
+            length(rs.block_sum_x), MCm.mu_ex(ek.mu, T) * kJmol_per_eps, ek.t_total / ekmc_events, ek.mc_acceptance,
+            ek.relocations, ek.bursts, ek.fast_events)
     @printf(io, "# eKMC mu_sol + E_const = %.2f ± %.2f kJ/mol (GROMACS-RF comparable; model %s)\n", (μ_s + E_const) * kJmol_per_eps, eμ_s * kJmol_per_eps, String(coulomb))
     println(io, "# eKMC solute block μ (kJ/mol): ", join(round.((T .* log.(rs.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC water block μ (kJ/mol):  ", join(round.(T .* log.(rw.block_means) .* kJmol_per_eps; digits=2), " "))
