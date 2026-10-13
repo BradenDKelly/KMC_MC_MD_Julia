@@ -32,6 +32,8 @@ out = joinpath(outdir, @sprintf("ljbias_r%.2f_T%.2f_N%d_es%g_seed%d.txt", ρ, T,
 
 sys = MCm.RigidSystem(templates, tm, L, 1 / T, Xoshiro(seed))
 MCm.random_rigid_system!(sys, ff)
+minimize = get(ENV, "LJBIAS_MINIMIZE", "1") == "1"   # steepest descent before MC (default on; 0 reproduces the 205827 runs)
+mres = minimize ? MCm.minimize_rigid!(sys, ff; nsteps=500) : nothing
 st = MCm.RigidMCStats(); δ = 0.12
 t0 = time()
 for _ in 1:2000, _ in 1:N                      # equilibration (translation only: single sites)
@@ -49,6 +51,7 @@ t_ek = time() - t0
 dt = ek.trace_dt
 neff = sum(dt)^2 / sum(abs2, dt)
 open(out, "w") do io
+    println(io, "# minimize=$(minimize) ", mres === nothing ? "" : "steps=$(mres.steps) U $(mres.U_start) → $(mres.U_end) capped=$(mres.n_capped)")
     println(io, "# ljbias $(Dates.now()) rho=$ρ T=$T N=$N L=$L events=$events seed=$seed eps_solute=$eps_s rc=2.5 LRC on")
     @printf(io, "MC sweeps=%d time=%.0fs (eq %.0fs) U/N=%.5f ± %.5f P=%.4f ± %.4f acc=%.3f\n", mc_sweeps, t_mc, t_eq,
             MCm.mean(mc.U), MCm.stderr(mc.U), MCm.mean(mc.P), MCm.stderr(mc.P), mc.stats.trans_acc / mc.stats.trans_att)

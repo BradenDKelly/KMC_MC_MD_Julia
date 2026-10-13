@@ -261,6 +261,9 @@ include("test_rf_gromacs.jl")
 # Flexible molecules: intramolecular energies in model units, reservoir, MC vs eKMC (DESIGN §7)
 include("test_flexible.jl")
 
+# Steepest-descent minimisation of random starts (overlap-trap regression)
+include("test_minimizer.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

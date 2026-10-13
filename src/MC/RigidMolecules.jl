@@ -925,6 +925,170 @@ function random_rigid_system!(sys::RigidSystem, ff::SiteForceField; max_tries::I
 end
 
 # ============================================================================
+# Energy minimisation of a starting configuration (steepest descent)
+# ============================================================================
+
+"Copy of `ff` with the overlap cap switched off (the bare site–site potential)."
+uncapped(ff::SiteForceField) = SiteForceField(ff.n_types, ff.σ_mix, ff.ϵ_mix, ff.rcap2_mix, ff.ucap_mix, ff.rc,
+                                              ff.rc2, ff.coulomb, ff.wolf, ff.use_lrc, false, ff.shift_lj,
+                                              ff.u_rc_mix, ff.cutoff, ff.rf)
+
+"""
+    rigid_forces_torques!(F, τ, sys, ff) -> U_pair
+
+Pair energy and, per molecule, the total force on the COM (`F`, 3 × n_mol) and the torque about the COM
+(`τ`, lab frame, 3 × n_mol) from the site–site LJ and Coulomb (Wolf/RF) terms, using the same cutoff rules
+and pair derivative (−r du/dr) as `pair_energy_virial`. Honours `ff.cap_overlaps` (a capped pair contributes
+its cap energy and no force), so call it with `uncapped(ff)` for the bare potential. Intramolecular terms
+of flexible molecules are not included (conformations are held fixed).
+"""
+function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::RigidSystem, ff::SiteForceField)
+    fill!(F, 0.0); fill!(τ, 0.0)
+    N = sys.n_mol; L = sys.L
+    molcut = ff.cutoff === :molecule
+    α = ff.wolf.α; ke = ff.wolf.ke
+    U = 0.0
+    @inbounds for i in 1:N-1, j in i+1:N
+        Rx = _min_image(sys.com[1, j] - sys.com[1, i], L)
+        Ry = _min_image(sys.com[2, j] - sys.com[2, i], L)
+        Rz = _min_image(sys.com[3, j] - sys.com[3, i], L)
+        R2 = Rx * Rx + Ry * Ry + Rz * Rz
+        if molcut
+            R2 >= ff.rc2 && continue
+        else
+            rmax = ff.rc + sys.ext[i] + sys.ext[j]
+            R2 >= rmax * rmax && continue
+        end
+        ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
+        si = sys.site_start[i]; sj = sys.site_start[j]
+        # first pass: capped pair? (then cap energy, no force — as pair_energy)
+        capped = false
+        if ff.cap_overlaps
+            for n in 1:ti.n_sites, m in 1:tj.n_sites
+                tyn = ti.site_type[n]; tym = tj.site_type[m]
+                (tyn > 0 && tym > 0) || continue
+                dx = Rx + sys.site_off[1, sj + m] - sys.site_off[1, si + n]
+                dy = Ry + sys.site_off[2, sj + m] - sys.site_off[2, si + n]
+                dz = Rz + sys.site_off[3, sj + m] - sys.site_off[3, si + n]
+                r2 = dx * dx + dy * dy + dz * dz
+                (molcut || r2 < ff.rc2) || continue
+                if r2 < ff.rcap2_mix[tyn, tym]
+                    capped = true; U += ff.ucap_mix[tyn, tym]; break
+                end
+            end
+        end
+        capped && continue
+        for n in 1:ti.n_sites
+            ox, oy, oz = sys.site_off[1, si + n], sys.site_off[2, si + n], sys.site_off[3, si + n]
+            tyn = ti.site_type[n]; qn = ti.site_q[n]
+            for m in 1:tj.n_sites
+                px, py, pz = sys.site_off[1, sj + m], sys.site_off[2, sj + m], sys.site_off[3, sj + m]
+                dx = Rx + px - ox; dy = Ry + py - oy; dz = Rz + pz - oz
+                r2 = dx * dx + dy * dy + dz * dz
+                (molcut || r2 < ff.rc2) || continue
+                tym = tj.site_type[m]; qm = tj.site_q[m]
+                fr = 0.0
+                if tyn > 0 && tym > 0
+                    σ2 = ff.σ_mix[tyn, tym]^2; s6 = (σ2 / r2)^3; ϵ = ff.ϵ_mix[tyn, tym]
+                    U += 4.0 * ϵ * (s6 * s6 - s6)
+                    ff.shift_lj && (U -= ff.u_rc_mix[tyn, tym])
+                    fr += 24.0 * ϵ * (2.0 * s6 * s6 - s6)
+                end
+                if ff.coulomb === :wolf && qn != 0.0 && qm != 0.0
+                    r = sqrt(r2)
+                    U += molcut ? wolf_pair_u_nocut(r, qn, qm, ff.wolf) : wolf_pair_u(r, qn, qm, ff.wolf)
+                    fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
+                elseif ff.coulomb === :rf && qn != 0.0 && qm != 0.0
+                    r = sqrt(r2)
+                    U += rf_pair_u(r, qn, qm, ff.rf)
+                    fr += rf_pair_fr(r, qn, qm, ff.rf)
+                end
+                # force on site m of j: (fr/r²) d (d points from i's site to j's site); opposite on i
+                fx = fr / r2 * dx; fy = fr / r2 * dy; fz = fr / r2 * dz
+                F[1, j] += fx; F[2, j] += fy; F[3, j] += fz
+                F[1, i] -= fx; F[2, i] -= fy; F[3, i] -= fz
+                τ[1, j] += py * fz - pz * fy; τ[2, j] += pz * fx - px * fz; τ[3, j] += px * fy - py * fx
+                τ[1, i] -= oy * fz - oz * fy; τ[2, i] -= oz * fx - ox * fz; τ[3, i] -= ox * fy - oy * fx
+            end
+        end
+    end
+    return U
+end
+
+"Rotation quaternion by angle θ about the unit lab-frame axis (ax, ay, az)."
+@inline function _axis_angle_quaternion(ax::Float64, ay::Float64, az::Float64, θ::Float64)
+    h = 0.5 * θ; s = sin(h)
+    return MVector{4,Float64}(cos(h), s * ax, s * ay, s * az)
+end
+
+"""
+    minimize_rigid!(sys, ff; nsteps=1000, h0=0.01, ftol=0.0) -> (U_start, U_end, steps, gmax, n_capped)
+
+Steepest-descent energy minimisation of the rigid-body coordinates (COM translations and rotations; flexible
+conformations held fixed), with the adaptive step rule of the GROMACS steepest-descent minimiser (GROMACS
+reference manual, "Energy minimization — steepest descent"): every molecule moves along its generalised force
+scaled so that the largest site displacement is h; a step that lowers the energy is accepted and h ← 1.2 h,
+otherwise it is undone and h ← 0.2 h. Rotations: the torque τ is converted to a force-equivalent |τ|/ext at the
+molecular extent ext and the rotation angle is h·|τ|/(ext²·g_max) about τ̂, so no site moves more than h.
+
+The minimisation runs on the UNCAPPED potential (`uncapped(ff)`): inside the overlap cap the capped energy is
+flat (zero force) and, for LJ with cap 100 ε at r = 0.75 σ, lower than the bare LJ just outside it
+(U_LJ(0.75 σ) = 104 ε), so the capped surface would let a pair fall into the core and stay there — the defect
+that trapped Metropolis runs from `random_rigid_system!` (JOURNAL entry 24). Use after `random_rigid_system!`
+and before Metropolis equilibration. Stops after `nsteps`, when g_max ≤ `ftol`, or when h < 1e-12.
+Returns the uncapped pair energies before/after, the steps taken, the final largest generalised force and
+the number of capped molecule pairs left (by `pair_energy` with the real `ff`).
+"""
+function minimize_rigid!(sys::RigidSystem, ff::SiteForceField; nsteps::Int=1000, h0::Float64=0.01, ftol::Float64=0.0)
+    N = sys.n_mol
+    ffu = uncapped(ff)
+    F = zeros(3, N); τ = zeros(3, N); F2 = zeros(3, N); τ2 = zeros(3, N)
+    com0 = copy(sys.com); q0 = copy(sys.quat)
+    U = rigid_forces_torques!(F, τ, sys, ffu)
+    U_start = U
+    h = h0; steps = 0; gmax = Inf
+    while steps < nsteps
+        gmax = 0.0
+        @inbounds for i in 1:N
+            gmax = max(gmax, sqrt(F[1, i]^2 + F[2, i]^2 + F[3, i]^2))
+            e = sys.ext[i]
+            e > 0.0 && (gmax = max(gmax, sqrt(τ[1, i]^2 + τ[2, i]^2 + τ[3, i]^2) / e))
+        end
+        (gmax <= ftol || h < 1e-12 || !isfinite(gmax)) && break
+        steps += 1
+        copyto!(com0, sys.com); copyto!(q0, sys.quat)
+        @inbounds for i in 1:N
+            com = MVector{3,Float64}(sys.com[1, i] + h * F[1, i] / gmax, sys.com[2, i] + h * F[2, i] / gmax,
+                                     sys.com[3, i] + h * F[3, i] / gmax)
+            q = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+            e = sys.ext[i]; tn = sqrt(τ[1, i]^2 + τ[2, i]^2 + τ[3, i]^2)
+            if e > 0.0 && tn > 0.0
+                θ = h * tn / (e * e * gmax)
+                q = quat_mul(_axis_angle_quaternion(τ[1, i] / tn, τ[2, i] / tn, τ[3, i] / tn, θ), q)
+                q ./= sqrt(sum(abs2, q))
+            end
+            set_molecule!(sys, i, com, q)
+        end
+        Un = rigid_forces_torques!(F2, τ2, sys, ffu)
+        if Un < U
+            U = Un; F, F2 = F2, F; τ, τ2 = τ2, τ
+            h *= 1.2
+        else
+            @inbounds for i in 1:N
+                set_molecule!(sys, i, view(com0, :, i), view(q0, :, i))
+            end
+            h *= 0.2
+        end
+    end
+    ncap = 0
+    caps = minimum(ff.ucap_mix) * 0.999
+    for i in 1:N-1, j in i+1:N
+        pair_energy(sys, ff, i, j) >= caps && (ncap += 1)
+    end
+    return (U_start=U_start, U_end=U, steps=steps, gmax=gmax, n_capped=ncap)
+end
+
+# ============================================================================
 # Metropolis MC
 # ============================================================================
 

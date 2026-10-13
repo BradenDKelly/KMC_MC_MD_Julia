@@ -98,6 +98,8 @@ open(out, "w") do io
         MCm._set_body!(sys, isol, MCm.draw_conformer(res, sys.rng))
         MCm.set_molecule!(sys, isol, sys.com[:, isol], MCm.uniform_random_quaternion(sys.rng))
     end
+    mres = MCm.minimize_rigid!(sys, ff; nsteps=500)   # steepest descent before MC (JOURNAL entry 25)
+    println(io, "# minimize_rigid!: $(mres.steps) steps, U_pair $(round(mres.U_start; sigdigits=6)) → $(round(mres.U_end; sigdigits=6)) (reduced), capped pairs left $(mres.n_capped)"); flush(io)
     const_E = MCm.wolf_constant_energy(sys, ff)
     water_only = MCm.RigidSystem(m.templates, fill(1, N), L, 1 / T, Xoshiro(0))
     ΔU_tail = MCm.lrc_energy(sys, ff) - MCm.lrc_energy(water_only, ff)        # tail energy of the one solute

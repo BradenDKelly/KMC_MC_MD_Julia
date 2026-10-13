@@ -53,6 +53,8 @@ open(out, "w") do io
 
     sys = MCm.RigidSystem([m.template], fill(1, N), L, 1 / T, Xoshiro(seed))
     MCm.random_rigid_system!(sys, ff)
+    mres = MCm.minimize_rigid!(sys, ff; nsteps=500)   # steepest descent before MC (JOURNAL entry 25)
+    println(io, "# minimize_rigid!: $(mres.steps) steps, U_pair $(round(mres.U_start; sigdigits=6)) → $(round(mres.U_end; sigdigits=6)) (reduced), capped pairs left $(mres.n_capped)"); flush(io)
     const_E = MCm.wolf_constant_energy(sys, ff)
 
     # --- Metropolis MC: equilibrate + production ---
