@@ -52,11 +52,14 @@ struct RigidTemplate
     site_q::Vector{Float64}
     site_mass::Vector{Float64}
     extent::Float64             # largest site distance from the COM (interacting sites only)
+    bonded::Union{Nothing,BondedTerms}   # intramolecular terms (reduced units) ⇒ a FLEXIBLE molecule; nothing = rigid
     function RigidTemplate(name::String, sites_body::Matrix{Float64}, site_type::Vector{Int},
-                           site_q::Vector{Float64}, site_mass::Vector{Float64})
+                           site_q::Vector{Float64}, site_mass::Vector{Float64};
+                           bonded::Union{Nothing,BondedTerms}=nothing)
         n = size(sites_body, 2)
         length(site_type) == n && length(site_q) == n && length(site_mass) == n ||
             error("RigidTemplate: inconsistent site counts")
+        bonded === nothing || bonded.n_sites == n || error("RigidTemplate: bonded terms for a different site count")
         mtot = sum(site_mass)
         mtot > 0.0 || error("RigidTemplate: total mass must be positive")
         com = sites_body * site_mass ./ mtot
@@ -65,9 +68,12 @@ struct RigidTemplate
         for k in 1:n
             (site_type[k] > 0 || site_q[k] != 0.0) && (ext = max(ext, sqrt(sum(abs2, view(sb, :, k)))))
         end
-        new(name, n, sb, copy(site_type), copy(site_q), copy(site_mass), ext)
+        new(name, n, sb, copy(site_type), copy(site_q), copy(site_mass), ext, bonded)
     end
 end
+
+"A template with bonded terms is a flexible molecule (DESIGN §7); `sites_body` is then only its reference geometry."
+isflexible(t::RigidTemplate) = t.bonded !== nothing
 
 """
     SiteForceField(σ_types, ϵ_types; rc, coulomb=:none, α=0.0, ke=1.0, use_lrc=true,
@@ -199,6 +205,8 @@ mutable struct RigidSystem
     site_start::Vector{Int}
     n_sites_total::Int
     rng::Xoshiro
+    body::Vector{Matrix{Float64}}   # flexible molecules: current COM-centred conformation in the body frame (3 × n); rigid: 3 × 0
+    ext::Vector{Float64}            # per-molecule extent (template extent for rigid molecules, current conformation for flexible)
 end
 
 function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Float64, β::Float64,
@@ -210,8 +218,10 @@ function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Flo
         site_start[i] = n
         n += templates[tmpl[i]].n_sites
     end
+    body = [isflexible(templates[tmpl[i]]) ? copy(templates[tmpl[i]].sites_body) : zeros(3, 0) for i in 1:n_mol]
+    ext = [templates[tmpl[i]].extent for i in 1:n_mol]
     sys = RigidSystem(n_mol, L, β, templates, copy(tmpl), zeros(3, n_mol), zeros(4, n_mol),
-                      zeros(3, n), site_start, n, rng)
+                      zeros(3, n), site_start, n, rng, body, ext)
     for i in 1:n_mol
         sys.quat[1, i] = 1.0
         update_site_offsets!(sys, i)
@@ -219,13 +229,17 @@ function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Flo
     return sys
 end
 
+"Body-frame site coordinates of molecule i: the template's for a rigid molecule, its own conformation if flexible."
+@inline body_sites(sys::RigidSystem, i::Int) = isflexible(sys.templates[sys.tmpl[i]]) ? sys.body[i] : sys.templates[sys.tmpl[i]].sites_body
+
 "Rotate the body-frame sites of molecule i into the lab frame (offsets from the COM)."
 function update_site_offsets!(sys::RigidSystem, i::Int)
     t = sys.templates[sys.tmpl[i]]
     R = quaternion_to_rotation_matrix(view(sys.quat, :, i))
     s0 = sys.site_start[i]
+    B = body_sites(sys, i)
     @inbounds for n in 1:t.n_sites
-        bx, by, bz = t.sites_body[1, n], t.sites_body[2, n], t.sites_body[3, n]
+        bx, by, bz = B[1, n], B[2, n], B[3, n]
         sys.site_off[1, s0 + n] = R[1, 1] * bx + R[1, 2] * by + R[1, 3] * bz
         sys.site_off[2, s0 + n] = R[2, 1] * bx + R[2, 2] * by + R[2, 3] * bz
         sys.site_off[3, s0 + n] = R[3, 1] * bx + R[3, 2] * by + R[3, 3] * bz
@@ -250,6 +264,178 @@ function set_molecule!(sys::RigidSystem, i::Int, com::AbstractVector{Float64}, q
         sys.quat[3, i] = q[3] / nq; sys.quat[4, i] = q[4] / nq
     end
     update_site_offsets!(sys, i)
+    return nothing
+end
+
+"""
+    set_conformation!(sys, i, body::AbstractMatrix)
+
+Replace the conformation of flexible molecule i by `body` (3 × n lab-oriented site coordinates relative
+to any origin): the COM is removed, the orientation quaternion reset to identity (the conformation
+carries the orientation), `site_off` and `ext` updated. The COM position `com[:, i]` is unchanged.
+"""
+function set_conformation!(sys::RigidSystem, i::Int, body::AbstractMatrix{Float64})
+    t = sys.templates[sys.tmpl[i]]
+    isflexible(t) || error("set_conformation!: molecule $i is rigid")
+    m = t.site_mass
+    c = body * m ./ sum(m)
+    B = sys.body[i]
+    size(B) == size(body) || (B = zeros(3, t.n_sites); sys.body[i] = B)
+    ext = 0.0
+    @inbounds for n in 1:t.n_sites, d in 1:3
+        B[d, n] = body[d, n] - c[d]
+    end
+    @inbounds for n in 1:t.n_sites
+        (t.site_type[n] > 0 || t.site_q[n] != 0.0) && (ext = max(ext, sqrt(B[1, n]^2 + B[2, n]^2 + B[3, n]^2)))
+    end
+    sys.ext[i] = ext
+    sys.quat[1, i] = 1.0; sys.quat[2, i] = 0.0; sys.quat[3, i] = 0.0; sys.quat[4, i] = 0.0
+    update_site_offsets!(sys, i)
+    return nothing
+end
+
+"Lab-frame site coordinates of molecule i (COM + offsets, not wrapped), 3 × n_sites."
+function molecule_sites(sys::RigidSystem, i::Int)
+    t = sys.templates[sys.tmpl[i]]
+    s0 = sys.site_start[i]
+    X = zeros(3, t.n_sites)
+    @inbounds for n in 1:t.n_sites, d in 1:3
+        X[d, n] = sys.com[d, i] + sys.site_off[d, s0 + n]
+    end
+    return X
+end
+
+"""
+    flex_intra_energy(t::RigidTemplate, ff, X) -> U_intra (reduced units)
+
+Intramolecular energy of a flexible molecule with site coordinates X (3 × n, any frame): bonded terms +
+1-4 and further intramolecular LJ/Coulomb (plain Coulomb with ke = 1 for the 1-4 pairs, as GROMACS's
+[pairs]), plus, for `coulomb = :rf`, GROMACS's reaction-field correction of every excluded pair
+(`rf_excluded_u`, conformation-dependent; −ke k_rf |μ|² for a neutral molecule) and the reaction-field pair
+term for the non-excluded intramolecular pairs — so the Hamiltonian stays identical to a GROMACS
+reaction-field run of the flexible topology. `:wolf` is not defined for flexible molecules.
+"""
+function flex_intra_energy(t::RigidTemplate, ff::SiteForceField, X::AbstractMatrix{Float64})::Float64
+    bt = t.bonded
+    bt === nothing && return 0.0
+    ff.coulomb === :wolf && error("flex_intra_energy: Wolf electrostatics are not defined for flexible molecules (use :rf or :none)")
+    eb, ea, ed = bonded_energy(bt, X)
+    E = eb + ea + ed
+    @inbounds for (a, b) in bt.pairs14
+        r = _dist(X, a, b)
+        if t.site_type[a] > 0 && t.site_type[b] > 0
+            s6 = (ff.σ_mix[t.site_type[a], t.site_type[b]] / r)^6
+            E += bt.fudge_lj * 4.0 * ff.ϵ_mix[t.site_type[a], t.site_type[b]] * (s6 * s6 - s6)
+        end
+        E += bt.fudge_qq * t.site_q[a] * t.site_q[b] / r
+    end
+    @inbounds for (a, b) in bt.nonbonded
+        r = _dist(X, a, b)
+        if t.site_type[a] > 0 && t.site_type[b] > 0
+            s6 = (ff.σ_mix[t.site_type[a], t.site_type[b]] / r)^6
+            E += 4.0 * ff.ϵ_mix[t.site_type[a], t.site_type[b]] * (s6 * s6 - s6)
+        end
+        if ff.coulomb === :rf
+            r < ff.rc && (E += rf_pair_u(r, t.site_q[a], t.site_q[b], ff.rf))
+        else
+            E += t.site_q[a] * t.site_q[b] / r
+        end
+    end
+    if ff.coulomb === :rf
+        nb = Set(bt.nonbonded)
+        for a in 1:t.n_sites-1, b in a+1:t.n_sites
+            (a, b) in nb && continue
+            (t.site_q[a] == 0.0 || t.site_q[b] == 0.0) && continue
+            E += rf_excluded_u(_dist(X, a, b), t.site_q[a], t.site_q[b], ff.rf)
+        end
+        E += rf_self_energy(t.site_q, ff.rf)
+    end
+    return E
+end
+
+"Intramolecular energy of molecule i in its current conformation (0 for rigid molecules)."
+intra_energy_molecule(sys::RigidSystem, ff::SiteForceField, i::Int)::Float64 =
+    isflexible(sys.templates[sys.tmpl[i]]) ? flex_intra_energy(sys.templates[sys.tmpl[i]], ff, sys.body[i]) : 0.0
+
+"Total intramolecular energy of all flexible molecules."
+function total_intra_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    E = 0.0
+    for i in 1:sys.n_mol
+        E += intra_energy_molecule(sys, ff, i)
+    end
+    return E
+end
+
+"""
+    ConformerReservoir
+
+Sample of isolated-molecule (ideal-gas) conformations of one flexible template, p_id(c) ∝ exp(−βU_intra(c)),
+stored COM-centred (3 × n each). Built by `build_reservoir` with vacuum Metropolis MC (single-site Cartesian
+displacements: exact for the Cartesian measure of harmonic bonds, Frenkel & Smit §13.2); drawn uniformly by
+`draw_conformer`. The relocation of a flexible molecule takes its new conformation from here (DESIGN §7.2):
+π(x) k(x→x′) = e^{−βU_rest} e^{−βU_intra(c)} e^{−βU_intra(c′)}/(Z_id V 8π²) is symmetric, so detailed balance
+holds with the rate exp(βu_inter) unchanged. Reusing a finite sample introduces correlation but no bias
+(the sample is unbiased); rebuild with `build_reservoir` when in doubt.
+"""
+struct ConformerReservoir
+    template::Int                      # template index the conformers belong to
+    confs::Vector{Matrix{Float64}}
+    U_intra::Vector{Float64}           # intramolecular energy of each conformer (reduced units)
+    acceptance::Float64
+end
+
+"""
+    build_reservoir(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03)
+
+Vacuum Metropolis MC on one molecule of `template_idx`: a sweep = one displacement attempt per site
+(uniform in a cube of half-side δ, reduced units). `M` conformations are stored every `stride_sweeps`
+sweeps after `burnin_sweeps`.
+"""
+function build_reservoir(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
+                         rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
+                         δ::Float64=0.03)
+    t = templates[template_idx]
+    isflexible(t) || error("build_reservoir: template $(t.name) is rigid")
+    X = copy(t.sites_body)
+    U = flex_intra_energy(t, ff, X)
+    confs = Matrix{Float64}[]; Us = Float64[]
+    att = 0; acc = 0
+    m = t.site_mass; mtot = sum(m)
+    total = burnin_sweeps + M * stride_sweeps
+    for sweep in 1:total
+        for _ in 1:t.n_sites
+            k = rand(rng, 1:t.n_sites)
+            o1, o2, o3 = X[1, k], X[2, k], X[3, k]
+            X[1, k] += (2rand(rng) - 1) * δ; X[2, k] += (2rand(rng) - 1) * δ; X[3, k] += (2rand(rng) - 1) * δ
+            Un = flex_intra_energy(t, ff, X)
+            att += 1
+            if Un <= U || rand(rng) < exp(-β * (Un - U))
+                U = Un; acc += 1
+            else
+                X[1, k] = o1; X[2, k] = o2; X[3, k] = o3
+            end
+        end
+        if sweep > burnin_sweeps && (sweep - burnin_sweeps) % stride_sweeps == 0
+            c = X * m ./ mtot
+            push!(confs, X .- c); push!(Us, U)
+        end
+    end
+    return ConformerReservoir(template_idx, confs, Us, acc / att)
+end
+
+"Uniformly drawn conformation (a reference into the reservoir — do not modify)."
+@inline draw_conformer(res::ConformerReservoir, rng::AbstractRNG) = res.confs[rand(rng, 1:length(res.confs))]
+
+"Copy a COM-centred conformation into molecule i's body frame and update its extent (no site_off update)."
+function _set_body!(sys::RigidSystem, i::Int, B::AbstractMatrix{Float64})
+    t = sys.templates[sys.tmpl[i]]
+    size(sys.body[i]) == size(B) || (sys.body[i] = zeros(3, t.n_sites))
+    copyto!(sys.body[i], B)
+    ext = 0.0
+    @inbounds for n in 1:t.n_sites
+        (t.site_type[n] > 0 || t.site_q[n] != 0.0) && (ext = max(ext, sqrt(B[1, n]^2 + B[2, n]^2 + B[3, n]^2)))
+    end
+    sys.ext[i] = ext
     return nothing
 end
 
@@ -365,7 +551,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
         R2 >= ff.rc2 && return 0.0
     else
         # no site pair can be within rc if the COMs are farther apart than rc + both extents
-        rmax = ff.rc + ti.extent + tj.extent
+        rmax = ff.rc + sys.ext[i] + sys.ext[j]
         R2 >= rmax * rmax && return 0.0
     end
     si = sys.site_start[i]; sj = sys.site_start[j]
@@ -419,7 +605,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
     if molcut
         R2 >= ff.rc2 && return 0.0, 0.0
     else
-        rmax = ff.rc + ti.extent + tj.extent
+        rmax = ff.rc + sys.ext[i] + sys.ext[j]
         R2 >= rmax * rmax && return 0.0, 0.0
     end
     si = sys.site_start[i]; sj = sys.site_start[j]
@@ -769,8 +955,10 @@ mutable struct RigidMCStats
     rot_att::Int; rot_acc::Int
     reor_att::Int; reor_acc::Int
     vol_att::Int; vol_acc::Int
+    site_att::Int; site_acc::Int       # flexible molecules: single-site displacements
+    swap_att::Int; swap_acc::Int       # flexible molecules: conformer exchanges with the reservoir
 end
-RigidMCStats() = RigidMCStats(0, 0, 0, 0, 0, 0, 0, 0)
+RigidMCStats() = RigidMCStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 "Metropolis translation of molecule i by a uniform random displacement in a cube of half-side δ."
 function mc_translate!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64, st::RigidMCStats)::Bool
@@ -825,6 +1013,65 @@ function mc_reorient!(sys::RigidSystem, ff::SiteForceField, i::Int, st::RigidMCS
 end
 
 """
+    mc_site_move!(sys, ff, i, δ, st) -> accepted
+
+Single-site Cartesian displacement of a random site of flexible molecule i (uniform in a cube of half-side
+δ), accepted on ΔU_intra + ΔU_inter (Frenkel & Smit §13.2; exact for the Cartesian measure of harmonic
+bonds). The COM moves with the site and the body is re-centred, so the molecule-based cutoff and the pair
+pre-filter stay consistent.
+"""
+function mc_site_move!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64, st::RigidMCStats)::Bool
+    t = sys.templates[sys.tmpl[i]]
+    isflexible(t) || return false
+    st.site_att += 1
+    u_old = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i])
+    com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    body_old = copy(sys.body[i]); ext_old = sys.ext[i]
+    X = molecule_sites(sys, i)
+    k = rand(sys.rng, 1:t.n_sites)
+    X[1, k] += (2rand(sys.rng) - 1) * δ; X[2, k] += (2rand(sys.rng) - 1) * δ; X[3, k] += (2rand(sys.rng) - 1) * δ
+    c = X * t.site_mass ./ sum(t.site_mass)
+    set_conformation!(sys, i, X)                       # body = X − c (lab-oriented), quat = identity
+    set_molecule!(sys, i, c, MVector{4,Float64}(1.0, 0.0, 0.0, 0.0))
+    ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.site_acc += 1
+        return true
+    end
+    _set_body!(sys, i, body_old); sys.ext[i] = ext_old
+    set_molecule!(sys, i, com_old, q_old)
+    return false
+end
+
+"""
+    mc_conformer_swap!(sys, ff, i, res, st) -> accepted
+
+Replace the conformation of flexible molecule i by a reservoir conformer in a uniform random orientation
+(COM fixed). The proposal density p_id(c′) ∝ exp(−βU_intra(c′)) cancels the intramolecular Boltzmann factors,
+so the acceptance is min(1, exp(−βΔU_inter)) (the ideal-gas conformer exchange, Frenkel & Smit §13.3).
+"""
+function mc_conformer_swap!(sys::RigidSystem, ff::SiteForceField, i::Int, res::ConformerReservoir, st::RigidMCStats)::Bool
+    t = sys.templates[sys.tmpl[i]]
+    isflexible(t) || return false
+    st.swap_att += 1
+    u_old = removal_energy(sys, ff, i)
+    com = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    body_old = copy(sys.body[i]); ext_old = sys.ext[i]
+    _set_body!(sys, i, draw_conformer(res, sys.rng))
+    set_molecule!(sys, i, com, uniform_random_quaternion(sys.rng))
+    ΔU = removal_energy(sys, ff, i) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.swap_acc += 1
+        return true
+    end
+    _set_body!(sys, i, body_old); sys.ext[i] = ext_old
+    set_molecule!(sys, i, com, q_old)
+    return false
+end
+
+"""
     mc_volume_trial!(sys, ff, Pext, max_dlnV, st; U_current) -> (accepted, U_new)
 
 Random walk in ln V with COM scaling (Frenkel & Smit, Understanding Molecular Simulation, §5.4.2,
@@ -860,16 +1107,23 @@ Widom insertion of a rigid molecule at a uniform random position and orientation
 §7.2.1); the excess chemical potential is −kT ln of the returned average (intermolecular part; the
 tail contribution of the inserted molecule, if any, is added by `widom_lrc_shift`).
 """
-function widom_rigid(sys::RigidSystem, ff::SiteForceField, template_idx::Int; ninsert::Int=1000)
+function widom_rigid(sys::RigidSystem, ff::SiteForceField, template_idx::Int; ninsert::Int=1000,
+                     reservoir::Union{Nothing,ConformerReservoir}=nothing)
     # temporarily append a ghost molecule
     ghost = RigidSystem(sys.templates, vcat(sys.tmpl, template_idx), sys.L, sys.β, sys.rng)
     ghost.com[:, 1:sys.n_mol] .= sys.com
     ghost.quat[:, 1:sys.n_mol] .= sys.quat
     ghost.site_off[:, 1:sys.n_sites_total] .= sys.site_off
+    for i in 1:sys.n_mol
+        ghost.body[i] = sys.body[i]; ghost.ext[i] = sys.ext[i]
+    end
     g = ghost.n_mol
+    flex = isflexible(sys.templates[template_idx])
+    flex && reservoir === nothing && error("widom_rigid: a flexible template needs a ConformerReservoir (ideal-gas conformers)")
     acc = 0.0
     L = sys.L
     for _ in 1:ninsert
+        flex && _set_body!(ghost, g, draw_conformer(reservoir, sys.rng))
         com = MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L)
         set_molecule!(ghost, g, com, uniform_random_quaternion(sys.rng))
         ΔU = removal_energy(ghost, ff, g)
@@ -907,10 +1161,13 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
                        vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
                        widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial,
-                       inverse_widom_molecule::Int=0, R_every::Int=0)
+                       inverse_widom_molecule::Int=0, R_every::Int=0,
+                       reservoirs::Union{Nothing,Vector}=nothing, δ_site::Float64=0.03)
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
+    flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
+    ba_Ui = BlockAverager(block_size)                                      # intramolecular energy per molecule (flexible)
     ba_U = BlockAverager(block_size); ba_P = BlockAverager(block_size)
     ba_rho = BlockAverager(block_size); ba_w = BlockAverager(block_size)
     ba_V = BlockAverager(block_size); ba_wV = BlockAverager(block_size)   # NPT Widom: <V e^{-βΔU}>/<V>
@@ -926,6 +1183,15 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             i = rand(sys.rng, 1:N)
             mc_rotate!(sys, ff, i, δθ, st)
         end
+        # flexible molecules: one displacement attempt per site and one conformer exchange per molecule
+        for i in flex_mols
+            for _ in 1:sys.templates[sys.tmpl[i]].n_sites
+                mc_site_move!(sys, ff, i, δ_site, st)
+            end
+            if reservoirs !== nothing && reservoirs[sys.tmpl[i]] !== nothing
+                mc_conformer_swap!(sys, ff, i, reservoirs[sys.tmpl[i]], st)
+            end
+        end
         if Pext !== nothing && sweep % vol_every == 0
             U = total_energy(sys, ff)
             _, U = mc_volume_trial!(sys, ff, Pext, max_dlnV, st; U_current=U)
@@ -937,8 +1203,10 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             V = sys.L^3
             push!(ba_rho, N / V)
             push!(ba_V, V)
+            isempty(flex_mols) || push!(ba_Ui, total_intra_energy(sys, ff) / length(flex_mols))
             if widom_template > 0 && widom_per_sample > 0
-                w = widom_rigid(sys, ff, widom_template; ninsert=widom_per_sample)
+                w = widom_rigid(sys, ff, widom_template; ninsert=widom_per_sample,
+                                reservoir=reservoirs === nothing ? nothing : reservoirs[widom_template])
                 push!(ba_w, w)
                 push!(ba_wV, V * w)
             end
@@ -959,7 +1227,7 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
         end
     end
     return (U=ba_U, P=ba_P, rho=ba_rho, V=ba_V, widom=ba_w, widomV=ba_wV, stats=st, inv_widom=ba_iw, R=ba_R,
-            R_species=ba_Rs)
+            R_species=ba_Rs, U_intra=ba_Ui)
 end
 
 # ============================================================================
@@ -1171,7 +1439,7 @@ function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
         Rx = _min_image(sys.com[1, j] - sys.com[1, k], L)
         Ry = _min_image(sys.com[2, j] - sys.com[2, k], L)
         Rz = _min_image(sys.com[3, j] - sys.com[3, k], L)
-        dmax = tk.extent + tj.extent + rcap
+        dmax = sys.ext[k] + sys.ext[j] + rcap
         Rx * Rx + Ry * Ry + Rz * Rz > dmax * dmax && continue
         sj = sys.site_start[j]
         found = false; ucap = 0.0
@@ -1463,9 +1731,18 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
                          vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
                          species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing,
-                         overlap_fast_path::Bool=false)
+                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing)
     N = sys.n_mol
     λ = mc_kernel_rate
+    flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
+    if !isempty(flex_mols)
+        reservoirs === nothing && error("run_rigid_ekmc!: flexible molecules need `reservoirs` (one ConformerReservoir per flexible template)")
+        λ > 0.0 && error("run_rigid_ekmc!: the MC-kernel hybrid is not implemented for flexible molecules (use λ = 0)")
+        for i in flex_mols
+            reservoirs[sys.tmpl[i]] === nothing && error("run_rigid_ekmc!: no reservoir for template $(sys.tmpl[i])")
+        end
+    end
+    Uin = [intra_energy_molecule(sys, ff, i) for i in 1:N]      # intramolecular energies, updated at relocations
     vol_period = vol_every_events > 0 ? vol_every_events : vol_every_sweeps * N
     λ >= 0.0 || error("run_rigid_ekmc!: mc_kernel_rate must be ≥ 0")
     vol_pressure in (:partial_average, :instantaneous) ||
@@ -1484,6 +1761,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
     ba_rho = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_V = TimeWeightedBlockAverager(block_events ÷ sample_every)
     ba_RN = TimeWeightedBlockAverager(block_events)                  # R/N, every event (the μ observable)
+    ba_Ui = TimeWeightedBlockAverager(block_events ÷ sample_every)   # intramolecular energy per flexible molecule
     ba_RNV = TimeWeightedBlockAverager(block_events ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
     # per-species μ: exp(βμ_ex,s) = ⟨(1/N_s) Σ_{i∈s} exp(βu_i)⟩_time (Tan 2017 Eq. 8 applied to the
     # molecules of species s; the particle-removal estimator of Shing & Gubbins, Mol. Phys. 46 (1982)
@@ -1540,6 +1818,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                 push!(ba_V, V, dt)
                 push!(ba_RNV, R / N / V, dt)
                 push!(acc_npt, R / N, V, dt)
+                isempty(flex_mols) || push!(ba_Ui, sum(Uin) / length(flex_mols), dt)
             end
             RN = R / N
             push!(ba_RN, RN, dt)
@@ -1563,6 +1842,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
         else
             k = select_by_mobility(ek, sys.rng)
             L = sys.L
+            kflex = isflexible(sys.templates[sys.tmpl[k]])
+            kflex && _set_body!(sys, k, draw_conformer(reservoirs[sys.tmpl[k]], sys.rng))   # ideal-gas conformation
             set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
                           uniform_random_quaternion(sys.rng))
             if overlap_fast_path && ff.cap_overlaps
@@ -1590,12 +1871,14 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                     end
                     ek.events += 1; n_fast += 1
                     t_total += dtf; t_since_vol += dtf
+                    kflex && _set_body!(sys, k, draw_conformer(reservoirs[sys.tmpl[k]], sys.rng))
                     set_molecule!(sys, k, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
                                   uniform_random_quaternion(sys.rng))
                     ncap, ucap = capped_overlaps(sys, ff, k)
                 end
             end
             update_rigid_ekmc_after_move!(ek, sys, ff, k)
+            kflex && (Uin[k] = flex_intra_energy(sys.templates[sys.tmpl[k]], ff, sys.body[k]))
             n_reloc += 1
         end
         ek.events += 1
@@ -1642,5 +1925,5 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
             mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
             RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt,
-            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc)
+            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui)
 end

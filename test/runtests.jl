@@ -258,6 +258,9 @@ include("test_intramolecular.jl")
 # Reaction-field electrostatics vs GROMACS (DESIGN §2; the model GROMACS can run too)
 include("test_rf_gromacs.jl")
 
+# Flexible molecules: intramolecular energies in model units, reservoir, MC vs eKMC (DESIGN §7)
+include("test_flexible.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

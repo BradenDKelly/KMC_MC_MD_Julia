@@ -68,8 +68,14 @@ function trappe_ua_solute(solute::Symbol)
         return (lj=[(3.50, 33.2125), (2.50, 15.0966), (3.12, 85.5473)], sites=sites, types=[1, 2, 2, 2, 3, 0],
                 q=[0.145, 0.040, 0.040, 0.040, -0.683, 0.418], mass=[12.011, 1.008, 1.008, 1.008, 15.9994, 1.008],
                 name="CH3OH (OPLS-AA, rigid)", mixing=:geometric)
+    elseif solute === :methanol_flex
+        # fully flexible OPLS-AA methanol: the rigid geometry as reference, bonded terms from opls_methanol_bonded
+        # (GROMACS units; converted to reduced units in spce_solute_model). DESIGN §7, first flexible target.
+        r = trappe_ua_solute(:methanol)
+        return (lj=r.lj, sites=r.sites, types=r.types, q=r.q, mass=r.mass, name="CH3OH (OPLS-AA, flexible)",
+                mixing=:geometric, flexible=true)
     else
-        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methane_ua or :methanol_ua)")
+        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methanol_flex, :methane_ua or :methanol_ua)")
     end
 end
 
@@ -94,7 +100,12 @@ function spce_solute_model(solute::Symbol; α_per_angstrom::Float64=0.20, rc_ang
     σ_A, ϵ_K, qs = m.σ_angstrom, m.ϵ_kelvin, m.q_scale
     p = trappe_ua_solute(solute)
     types = [t > 0 ? t + 1 : 0 for t in p.types]          # shift past the water O type
-    tmpl = RigidTemplate(p.name, p.sites ./ σ_A, types, p.q .* qs, p.mass)
+    bonded = nothing
+    if get(p, :flexible, false)
+        bt, _ = opls_methanol_bonded()                     # kJ/mol, nm, rad
+        bonded = bonded_to_reduced(bt, σ_A, ϵ_K * 0.0083144626)
+    end
+    tmpl = RigidTemplate(p.name, p.sites ./ σ_A, types, p.q .* qs, p.mass; bonded=bonded)
     σ_types = vcat(1.0, [σ / σ_A for (σ, _) in p.lj])
     ϵ_types = vcat(1.0, [ϵ / ϵ_K for (_, ϵ) in p.lj])
     ff = SiteForceField(σ_types, ϵ_types; rc=rc_angstrom / σ_A, coulomb=coulomb,

@@ -1,0 +1,11 @@
+# GROMACS 2024.3 vacuum SD of one fully flexible OPLS-AA methanol, 300 K, dt = 0.2 fs, 10 ns (first 0.5 ns discarded),
+# reaction field eps_rf = inf, rc = 1.0 nm (gromacs_fe/intra_ref/vac_sd_dt02.*, generated 2026-10-12).
+# Averages and gmx-energy block error estimates, kJ/mol. The dt = 1 fs run gave Potential 28.43(24): the stiff
+# bonds are integrated wrongly at 1 fs (Bond 5.943 vs 6.216 here and vs 6.236 = 5/2 kT for exact canonical sampling).
+# term  mean  err
+Bond 6.216 0.04
+Angle 7.6664 0.032
+Ryckaert-Bell. 1.49412 0.015
+Coulomb-14 14.1836 0.00054
+Coulomb-SR -0.156712 0.000026
+Potential 29.4034 0.071

@@ -191,3 +191,18 @@ end
 
 "GROMACS electric conversion factor ke = e²/(4π ε₀) in kJ mol⁻¹ nm e⁻² (GROMACS manual Table 2.3)."
 const KE_KJMOL_NM = 138.935458
+
+
+"""
+    bonded_to_reduced(bt, σ_angstrom, ϵ_kJmol) -> BondedTerms
+
+Convert bonded terms given in GROMACS units (nm, kJ/mol, rad) to the reduced units of a model with length
+unit σ_angstrom [Å] and energy unit ϵ_kJmol [kJ/mol]: lengths × 10/σ, energies ÷ ϵ, k_b × (σ/10)²/ϵ.
+"""
+function bonded_to_reduced(bt::BondedTerms, σ_angstrom::Float64, ϵ_kJmol::Float64)
+    lu = 10.0 / σ_angstrom                      # nm → reduced length
+    bonds = [HarmonicBond(b.i, b.j, b.b0 * lu, b.kb / lu^2 / ϵ_kJmol) for b in bt.bonds]
+    angles = [HarmonicAngle(a.i, a.j, a.k, a.θ0, a.kθ / ϵ_kJmol) for a in bt.angles]
+    dihedrals = [RBDihedral(d.i, d.j, d.k, d.l, ntuple(n -> d.C[n] / ϵ_kJmol, 6)) for d in bt.dihedrals]
+    return BondedTerms(bt.n_sites, bonds, angles, dihedrals, copy(bt.pairs14), copy(bt.nonbonded), bt.fudge_lj, bt.fudge_qq)
+end

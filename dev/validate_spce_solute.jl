@@ -1,5 +1,6 @@
 """
-One rigid solute (OPLS-AA all-atom methane or methanol; TraPPE-UA `methane_ua`/`methanol_ua` for reference)
+One solute (OPLS-AA all-atom methane or methanol, rigid; `methanol_flex` = fully flexible OPLS-AA methanol with a
+conformer reservoir, DESIGN §7; TraPPE-UA `methane_ua`/`methanol_ua` for reference)
 at infinite dilution in SPC/E water: Metropolis MC (Widom insertion and particle-removal estimators of the
 solute μ_ex) vs hybrid eKMC (per-species ⟨exp(βu)⟩ with delete-one-block jackknife errors). JOURNAL
 2026-10-12 entry 14.
@@ -78,8 +79,25 @@ open(out, "w") do io
     rc_check = ff.rc + m.water.extent + max(m.water.extent, m.solute.extent)
     rc_check < L / 2 || println(io, "# WARNING: rc + molecule extents = $(rc_check) ≥ L/2 = $(L/2)")
 
+    # flexible solute: ideal-gas conformer reservoir (vacuum Metropolis MC, DESIGN §7.2); nothing for rigid solutes
+    flex = MCm.isflexible(m.solute)
+    res = nothing
+    if flex
+        t0 = time()
+        res = MCm.build_reservoir(m.templates, 2, ff, 1 / T, Xoshiro(seed + 7919); M=20000, burnin_sweeps=2000, stride_sweeps=20, δ=0.03)
+        Ures = sum(res.U_intra) / length(res.U_intra)
+        @printf(io, "# conformer reservoir: %d conformers, acceptance %.3f, <U_intra>_ideal = %.3f ± %.3f kJ/mol, %.1f s\n",
+                length(res.confs), res.acceptance, Ures * kJmol_per_eps,
+                sqrt(sum(abs2, res.U_intra .- Ures) / length(res.U_intra)) / sqrt(length(res.U_intra) / 5) * kJmol_per_eps, time() - t0)
+        flush(io)
+    end
+    reservoirs = [nothing, res]
     sys = MCm.RigidSystem(m.templates, vcat(fill(1, N), 2), L, 1 / T, Xoshiro(seed))
     MCm.random_rigid_system!(sys, ff)
+    if flex
+        MCm._set_body!(sys, isol, MCm.draw_conformer(res, sys.rng))
+        MCm.set_molecule!(sys, isol, sys.com[:, isol], MCm.uniform_random_quaternion(sys.rng))
+    end
     const_E = MCm.wolf_constant_energy(sys, ff)
     water_only = MCm.RigidSystem(m.templates, fill(1, N), L, 1 / T, Xoshiro(0))
     ΔU_tail = MCm.lrc_energy(sys, ff) - MCm.lrc_energy(water_only, ff)        # tail energy of the one solute
@@ -94,9 +112,17 @@ open(out, "w") do io
     st = MCm.RigidMCStats()
     δ = 0.1 / m.σ_angstrom * 3.0; δθ = 0.3
     t0 = time()
-    for s in 1:(mc_sweeps ÷ 4), _ in 1:Nt
-        MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), δ, st)
-        MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), δθ, st)
+    for s in 1:(mc_sweeps ÷ 4)
+        for _ in 1:Nt
+            MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), δ, st)
+            MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), δθ, st)
+        end
+        if flex
+            for _ in 1:m.solute.n_sites
+                MCm.mc_site_move!(sys, ff, isol, 0.03, st)
+            end
+            MCm.mc_conformer_swap!(sys, ff, isol, res, st)
+        end
     end
     println(io, "# MC equilibration $(mc_sweeps ÷ 4) sweeps: $(round(time() - t0; digits=1)) s, acc_t=$(st.trans_acc/st.trans_att), acc_r=$(st.rot_acc/st.rot_att)")
     flush(io)
@@ -104,7 +130,7 @@ open(out, "w") do io
     t0 = time()
     mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
                            block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
-                           inverse_widom_molecule=isol, R_every=20)
+                           inverse_widom_molecule=isol, R_every=20, reservoirs=reservoirs, δ_site=0.03)
     t_mc = time() - t0
     w, ew = MCm.mean(mc.widom), MCm.stderr(mc.widom)
     iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
@@ -115,6 +141,9 @@ open(out, "w") do io
             (-T * log(w) + ΔU_tail) * kJmol_per_eps, T * ew / w * kJmol_per_eps,
             (T * log(iw) + ΔU_tail) * kJmol_per_eps, T * eiw / iw * kJmol_per_eps,
             mc.stats.trans_acc / mc.stats.trans_att, mc.stats.rot_acc / mc.stats.rot_att)
+    flex && @printf(io, "# MC flexible solute: <U_intra> = %.3f ± %.3f kJ/mol (ideal gas %.3f); site acc %.3f, conformer-swap acc %.3f\n",
+                    MCm.mean(mc.U_intra) * kJmol_per_eps, MCm.stderr(mc.U_intra) * kJmol_per_eps, Ures * kJmol_per_eps,
+                    mc.stats.site_acc / max(mc.stats.site_att, 1), mc.stats.swap_acc / max(mc.stats.swap_att, 1))
     println(io, "# MC removal-estimator block μ (kJ/mol): ", join(round.((T .* log.(mc.inv_widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     println(io, "# MC Widom block μ (kJ/mol):             ", join(round.((-T .* log.(mc.widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     flush(io)
@@ -138,7 +167,7 @@ open(out, "w") do io
     se = λfac > 0 ? 1 : 100
     ek = MCm.run_rigid_ekmc!(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                              debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
-                             species_mu=true, trace_molecule=isol, species_rate_scale=[1.0, c_sol])
+                             species_mu=true, trace_molecule=isol, species_rate_scale=[1.0, c_sol], reservoirs=reservoirs)
     t_ek = time() - t0
     rw, rs = ek.RN_species[1], ek.RN_species[2]
     μ_w = T * log(MCm.ratio_mean(rw)); eμ_w = T * MCm.ratio_jackknife_stderr(rw; f=log)
@@ -151,6 +180,8 @@ open(out, "w") do io
             length(rs.block_sum_x), MCm.mu_ex(ek.mu, T) * kJmol_per_eps, ek.t_total / ekmc_events, ek.mc_acceptance,
             ek.relocations, ek.bursts, ek.fast_events)
     @printf(io, "# eKMC mu_sol + E_const = %.2f ± %.2f kJ/mol (GROMACS-RF comparable; model %s)\n", (μ_s + E_const) * kJmol_per_eps, eμ_s * kJmol_per_eps, String(coulomb))
+    flex && @printf(io, "# eKMC flexible solute: <U_intra> = %.3f ± %.3f kJ/mol (time-weighted; ideal gas %.3f)\n",
+                    MCm.mean(ek.U_intra) * kJmol_per_eps, MCm.stderr(ek.U_intra) * kJmol_per_eps, Ures * kJmol_per_eps)
     println(io, "# eKMC solute block μ (kJ/mol): ", join(round.((T .* log.(rs.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC water block μ (kJ/mol):  ", join(round.(T .* log.(rw.block_means) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC block times: ", join(round.(rs.block_sum_t; sigdigits=3), " "))

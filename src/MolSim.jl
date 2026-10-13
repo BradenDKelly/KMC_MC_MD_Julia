@@ -17,9 +17,9 @@ module MolSim
         include("MC/Electrostatics.jl")
         include("MC/Fluctuations.jl")
     include("MC/eKMC.jl")
+        include("MC/Intramolecular.jl")
         include("MC/RigidMolecules.jl")
         include("MC/SoluteModels.jl")
-        include("MC/Intramolecular.jl")
         include("MC/MD.jl")
         include("MC/validation/CompareNVT.jl")
     end
