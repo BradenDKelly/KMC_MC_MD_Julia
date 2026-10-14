@@ -273,6 +273,9 @@ include("test_ekmc_checkpoint.jl")
 # Bennett / landing-Widom estimator from the eKMC jump chain (DESIGN §10.3)
 include("test_bennett.jl")
 
+# Flexible OPLS-AA molecules from GROMACS topologies (ethanol, 1-propanol)
+include("test_opls_itp.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

@@ -74,10 +74,18 @@ function trappe_ua_solute(solute::Symbol)
         r = trappe_ua_solute(:methanol)
         return (lj=r.lj, sites=r.sites, types=r.types, q=r.q, mass=r.mass, name="CH3OH (OPLS-AA, flexible)",
                 mixing=:geometric, flexible=true)
+    elseif solute in keys(OPLS_FLEX_ITP)
+        # flexible OPLS-AA molecule read from the GROMACS topology (OPLSTopology.jl): every parameter from oplsaa.ff
+        m = opls_itp_molecule(joinpath(OPLS_FFDIR, OPLS_FLEX_ITP[solute]))
+        return (lj=[(σ * 10.0, ϵ / 0.0083144626) for (σ, ϵ) in m.lj], sites=m.X0 .* 10.0, types=m.types, q=m.q, mass=m.mass,
+                name="$(OPLS_FLEX_ITP[solute]) (OPLS-AA, flexible)", mixing=:geometric, flexible=true, bonded=m.bt)
     else
-        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methanol_flex, :methane_ua or :methanol_ua)")
+        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methanol_flex, :methane_ua, :methanol_ua, $(join(keys(OPLS_FLEX_ITP), ", ")))")
     end
 end
+
+"Flexible OPLS-AA solutes built from the GROMACS topologies shipped in oplsaa.ff (OPLSTopology.jl)."
+const OPLS_FLEX_ITP = Dict(:methanol_itp => "methanol.itp", :ethanol_flex => "ethanol.itp", :propanol_flex => "1propanol.itp")
 
 """
     spce_solute_model(solute; α_per_angstrom=0.20, rc_angstrom=10.0, cutoff=:molecule,
@@ -102,7 +110,7 @@ function spce_solute_model(solute::Symbol; α_per_angstrom::Float64=0.20, rc_ang
     types = [t > 0 ? t + 1 : 0 for t in p.types]          # shift past the water O type
     bonded = nothing
     if get(p, :flexible, false)
-        bt, _ = opls_methanol_bonded()                     # kJ/mol, nm, rad
+        bt = haskey(p, :bonded) ? p.bonded : first(opls_methanol_bonded())   # kJ/mol, nm, rad
         bonded = bonded_to_reduced(bt, σ_A, ϵ_K * 0.0083144626)
     end
     tmpl = RigidTemplate(p.name, p.sites ./ σ_A, types, p.q .* qs, p.mass; bonded=bonded)
