@@ -1538,6 +1538,15 @@ mutable struct RigidEKMCState
     mc_accepted::Int
     mc_events::Int              # number of MC-kernel events
     c::Vector{Float64}          # per-molecule rate scale: m_i = c_i exp(βu_i) (species importance sampling)
+    # fractional molecule (coupling ladder, DESIGN §10.4): pair energies/virials of `frac` with every other molecule
+    # are stored scaled by lam[frac] in pair_u/pair_w (the λ-Hamiltonian); bare_u/bare_w keep the unscaled row,
+    # frac_u/frac_w their sums. frac = 0: no fractional molecule (stock bookkeeping, no overhead).
+    lam::Vector{Float64}
+    frac::Int
+    bare_u::Vector{Float64}
+    bare_w::Vector{Float64}
+    frac_u::Float64
+    frac_w::Float64
 end
 
 """
@@ -1555,7 +1564,7 @@ function init_rigid_ekmc(sys::RigidSystem, ff::SiteForceField; debug_check_every
     c = rate_scale === nothing ? ones(N) : Vector{Float64}(rate_scale)
     length(c) == N && all(c .> 0) || error("init_rigid_ekmc: rate_scale must have one positive entry per molecule")
     ek = RigidEKMCState(zeros(N, N), zeros(N, N), zeros(N), zeros(N), zeros(N), 0.0, debug_check_every, 0,
-                        zeros(N), zeros(N), 0, 0, 0, c)
+                        zeros(N), zeros(N), 0, 0, 0, c, ones(N), 0, zeros(N), zeros(N), 0.0, 0.0)
     rebuild_rigid_ekmc!(ek, sys, ff)
     return ek
 end
@@ -1631,6 +1640,8 @@ end
 
 "Total molecular virial from the maintained pair virials."
 ekmc_virial(ek::RigidEKMCState) = 0.5 * sum(ek.wsum)
+# mobility of molecule i: an absent fractional molecule (λ = 0) is never a mover
+@inline _mob(ek::RigidEKMCState, β::Float64, i::Int) = (i == ek.frac && ek.lam[i] == 0.0) ? 0.0 : ek.c[i] * _mobility(β, ek.phi[i])
 
 "Recompute all pair energies and virials, φ, mobilities and R from scratch."
 function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
@@ -1659,9 +1670,22 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
             ek.wsum[i] += w; ek.wsum[j] += w
         end
     end
+    if ek.frac > 0                                     # fractional molecule: store the bare row, scale the matrix
+        s = ek.frac; λ = ek.lam[s]
+        ek.frac_u = 0.0; ek.frac_w = 0.0
+        @inbounds for j in 1:N
+            ek.bare_u[j] = ek.pair_u[s, j]; ek.bare_w[j] = ek.pair_w[s, j]
+            ek.frac_u += ek.bare_u[j]; ek.frac_w += ek.bare_w[j]
+            ek.pair_u[s, j] = λ * ek.bare_u[j]; ek.pair_u[j, s] = ek.pair_u[s, j]
+            ek.pair_w[s, j] = λ * ek.bare_w[j]; ek.pair_w[j, s] = ek.pair_w[s, j]
+        end
+        @inbounds for i in 1:N
+            ek.phi[i] = sum(view(ek.pair_u, :, i)); ek.wsum[i] = sum(view(ek.pair_w, :, i))
+        end
+    end
     R = 0.0
     for i in 1:N
-        ek.m[i] = ek.c[i] * _mobility(sys.β, ek.phi[i]); R += ek.m[i]
+        ek.m[i] = _mob(ek, sys.β, i); R += ek.m[i]
     end
     ek.R = R
     (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R")
@@ -1673,6 +1697,21 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
     N = sys.n_mol
     β = sys.β
     eval_row!(ek.row_u, ek.row_w, sys, ff, k)          # threaded when N ≥ PARALLEL_MIN_MOL
+    if ek.frac > 0                                      # fractional molecule: bare row kept, matrix entries scaled by λ
+        s = ek.frac; λ = ek.lam[s]
+        if k == s
+            ek.frac_u = 0.0; ek.frac_w = 0.0
+            @inbounds for j in 1:N
+                ek.bare_u[j] = ek.row_u[j]; ek.bare_w[j] = ek.row_w[j]
+                ek.frac_u += ek.row_u[j]; ek.frac_w += ek.row_w[j]
+                ek.row_u[j] *= λ; ek.row_w[j] *= λ
+            end
+        else
+            ek.frac_u += ek.row_u[s] - ek.bare_u[k]; ek.frac_w += ek.row_w[s] - ek.bare_w[k]
+            ek.bare_u[k] = ek.row_u[s]; ek.bare_w[k] = ek.row_w[s]
+            ek.row_u[s] *= λ; ek.row_w[s] *= λ
+        end
+    end
     phik = 0.0; wk = 0.0
     @inbounds for j in 1:N
         j == k && continue
@@ -1681,7 +1720,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         if u_new != u_old
             ek.pair_u[k, j] = u_new; ek.pair_u[j, k] = u_new
             ek.phi[j] += u_new - u_old
-            ek.m[j] = ek.c[j] * _mobility(β, ek.phi[j])
+            ek.m[j] = _mob(ek, β, j)
         end
         if w_new != w_old
             ek.pair_w[k, j] = w_new; ek.pair_w[j, k] = w_new
@@ -1690,7 +1729,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
         phik += u_new; wk += w_new
     end
     ek.phi[k] = phik; ek.wsum[k] = wk
-    ek.m[k] = ek.c[k] * _mobility(β, phik)
+    ek.m[k] = _mob(ek, β, k)
     # R is always resummed: mobilities span ~50 orders of magnitude (a relocated molecule can have
     # exp(βu) ≈ 1e48), so an incremental R = R + Δm suffers catastrophic cancellation when such a term
     # is removed (found by the LJ-diatomic MC↔eKMC test, 2026-10-11). The O(N) sum is negligible; only
@@ -1698,6 +1737,35 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
     R = sum(ek.m)
     ek.R = R
     (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R after moving molecule $k")
+    return nothing
+end
+
+"""
+    set_fractional_coupling!(ek, β, λ_new)
+
+Change the coupling of the fractional molecule from `ek.lam[frac]` to `λ_new` without moving anything: the scaled
+row, every φ_j, φ_s, the virial sums, the mobilities and R follow (O(N)). With λ_new = 0 the molecule is absent
+(m_s = 0). Used by the rung hops of the coupling ladder (DESIGN §10.4).
+"""
+function set_fractional_coupling!(ek::RigidEKMCState, β::Float64, λ_new::Float64)
+    s = ek.frac
+    s > 0 || error("set_fractional_coupling!: no fractional molecule")
+    λ_old = ek.lam[s]
+    N = length(ek.phi)
+    @inbounds for j in 1:N
+        j == s && continue
+        du = (λ_new - λ_old) * ek.bare_u[j]; dw = (λ_new - λ_old) * ek.bare_w[j]
+        ek.pair_u[s, j] = λ_new * ek.bare_u[j]; ek.pair_u[j, s] = ek.pair_u[s, j]
+        ek.pair_w[s, j] = λ_new * ek.bare_w[j]; ek.pair_w[j, s] = ek.pair_w[s, j]
+        ek.phi[j] += du; ek.wsum[j] += dw
+        du != 0.0 && (ek.m[j] = _mob(ek, β, j))
+    end
+    ek.lam[s] = λ_new
+    ek.phi[s] = λ_new * ek.frac_u; ek.wsum[s] = λ_new * ek.frac_w
+    ek.m[s] = _mob(ek, β, s)
+    R = sum(ek.m)
+    ek.R = R
+    (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R after recoupling to λ = $λ_new")
     return nothing
 end
 
@@ -2011,6 +2079,10 @@ mutable struct RigidEKMCRun
     t_total::Float64
     t_since_vol::Float64
     max_dV_current::Float64
+    bar_species::Int
+    bar::Union{Nothing,BennettAccumulator}
+    bar_members::Vector{Int}
+    ladder::Union{Nothing,CouplingLadder}
 end
 
 """
@@ -2027,7 +2099,11 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
                          vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
                          species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing,
-                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing)
+                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing,
+                         bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
+                         ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
+                         ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
+                         ladder_solute_rate_frac::Float64=0.1)
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2050,15 +2126,19 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     p_part_sum = 0.0; p_part_t = 0.0
     rate_scale = species_rate_scale === nothing ? nothing : [species_rate_scale[sys.tmpl[i]] for i in 1:N]
     ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every, rate_scale=rate_scale)
+    # with a coupling ladder the standard observables are read at the coupled rung only: ≈ 1/K of the kMC TIME when η is
+    # flat, but far fewer EVENTS (events crowd into the burst states of the soft rungs; dimer test: 0.6 % of the events at
+    # 11 % of the time), so their blocks are shortened by 10K; check `length(U.block_means)` before trusting the errors
+    std_block = ladder_solute > 0 ? max(sample_every, block_events ÷ (10 * length(ladder_lambda))) : block_events
     acc = ChemicalPotentialAccumulator()
     acc_npt = NPTChemicalPotentialAccumulator()
-    ba_U = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_P = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_rho = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_V = TimeWeightedBlockAverager(block_events ÷ sample_every)
-    ba_RN = TimeWeightedBlockAverager(block_events)                  # R/N, every event (the μ observable)
-    ba_Ui = TimeWeightedBlockAverager(block_events ÷ sample_every)   # intramolecular energy per flexible molecule
-    ba_RNV = TimeWeightedBlockAverager(block_events ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
+    ba_U = TimeWeightedBlockAverager(std_block ÷ sample_every)
+    ba_P = TimeWeightedBlockAverager(std_block ÷ sample_every)
+    ba_rho = TimeWeightedBlockAverager(std_block ÷ sample_every)
+    ba_V = TimeWeightedBlockAverager(std_block ÷ sample_every)
+    ba_RN = TimeWeightedBlockAverager(std_block)                  # R/N, every event (the μ observable)
+    ba_Ui = TimeWeightedBlockAverager(std_block ÷ sample_every)   # intramolecular energy per flexible molecule
+    ba_RNV = TimeWeightedBlockAverager(std_block ÷ sample_every)  # (R/N)/V for blocked NPT μ (A.132)
     # per-species μ: exp(βμ_ex,s) = ⟨(1/N_s) Σ_{i∈s} exp(βu_i)⟩_time (Tan 2017 Eq. 8 applied to the
     # molecules of species s; the particle-removal estimator of Shing & Gubbins, Mol. Phys. 46 (1982)
     # 1109, with the kMC time weights). For a single solute (N_s = 1) it is ⟨exp(βu_solute)⟩.
@@ -2067,10 +2147,30 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     for i in 1:N
         n_spec[sys.tmpl[i]] += 1
     end
-    ba_RNs = species_mu ? [TimeWeightedBlockAverager(block_events) for _ in 1:nspec] :      # every event
+    ba_RNs = species_mu ? [TimeWeightedBlockAverager(std_block) for _ in 1:nspec] :      # every event
                           TimeWeightedBlockAverager[]
     sp_sum = zeros(Float64, nspec)
     trace_phi = Float64[]; trace_dt = Float64[]     # (u_i, Δt) of `trace_molecule` at every sample
+    # Bennett estimator (DESIGN §10.3): landing and time-weighted energy histograms of one species
+    0 <= bar_species <= nspec || error("run_rigid_ekmc!: bar_species must be 0 (off) or a template index")
+    bar = bar_species > 0 ? BennettAccumulator(bar_species, std_block) : nothing
+    bar_members = [i for i in 1:N if sys.tmpl[i] == bar_species]
+    # coupling ladder (DESIGN §10.4): one fractional molecule, started fully coupled
+    ladder = nothing
+    if ladder_solute > 0
+        1 <= ladder_solute <= N || error("run_rigid_ekmc!: ladder_solute out of range")
+        Pext === nothing || error("run_rigid_ekmc!: the coupling ladder is NVT only")
+        λ == 0.0 || error("run_rigid_ekmc!: the coupling ladder is not implemented with the MC-kernel hybrid")
+        overlap_fast_path && error("run_rigid_ekmc!: the coupling ladder is not implemented with the overlap fast path")
+        isfinite(ladder_nu) || error("run_rigid_ekmc!: ladder_nu (hop attempt frequency) is required")
+        # initial weights: given η, or the linear ramp η_k = λ_k·βμ_guess (flat if F(λ) were linear; Wang–Landau refines)
+        η0 = ladder_eta !== nothing ? ladder_eta : ladder_eta_ramp .* ladder_lambda
+        ladder = CouplingLadder(ladder_solute, ladder_lambda, block_events; η=η0, ν=ladder_nu, wl_events=ladder_wl_events,
+                                wl_fmin=ladder_wl_fmin, wl_flat=ladder_wl_flat,
+                                csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac))
+        ek.frac = ladder_solute; ek.lam[ladder_solute] = 1.0
+        rebuild_rigid_ekmc!(ek, sys, ff)
+    end
     t_total = 0.0
     # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`
     # moves set ΔV_max to half the standard deviation of the kMC-time-weighted volume histogram
@@ -2093,7 +2193,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     next_vol = vol_period
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
-    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current)
+    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder)
 end
 
 """
@@ -2164,13 +2264,20 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
     t_total = r.t_total
     t_since_vol = r.t_since_vol
     max_dV_current = r.max_dV_current
+    bar_species = r.bar_species; bar = r.bar; bar_members = r.bar_members
+    ladder = r.ladder
     stop = min(until, events)
     while ev < stop
         (ev & 4095 == 0) && time() > deadline && break
         ev += 1; n_full += 1          # n_full counts the states that get a full update (sampling stride for U, P)
         # weight of the current configuration: draw its Δt here and reuse it in the step
         R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
-        Rtot = R + λ                   # total event rate incl. the MC-kernel event
+        w_up = 0.0; w_dn = 0.0
+        ladder === nothing || ((w_up, w_dn) = hop_rates(ladder, sys.β, ek.frac_u))
+        Rtot = R + λ + w_up + w_dn     # total event rate incl. the MC-kernel event and the rung hops
+        # with a ladder the standard observables are read at the fully coupled rung only, after η is frozen
+        coupled_now = ladder === nothing || (coupled(ladder) && !adapting(ladder))
+        ladder_prod = ladder !== nothing && !adapting(ladder) && ev > burnin_events
         u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
         dt = log(1 / u) / Rtot
         V = sys.L^3
@@ -2178,7 +2285,15 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             # pressure is free from the maintained virial; time-weight it over every event of the block
             p_part_sum += pressure(sys, ff, ekmc_virial(ek); tail=tail_route) * dt; p_part_t += dt
         end
-        if ev > burnin_events
+        ladder_prod && ladder_time!(ladder, sys.β * ek.frac_u, dt)
+        k_before = ladder === nothing ? 0 : ladder.k           # rung occupied during dt (for Wang–Landau)
+        if ev > burnin_events && coupled_now
+            if bar !== nothing
+                bennett_event!(bar)
+                @inbounds for i in bar_members
+                    push_time!(bar, sys.β * ek.phi[i], dt)
+                end
+            end
             if n_full % sample_every == 0
                 Up = 0.5 * sum(ek.phi)
                 push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
@@ -2205,9 +2320,33 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
                 push!(trace_phi, ek.phi[trace_molecule]); push!(trace_dt, dt)
             end
         end
-        # the event: MC-kernel sweep with probability λ/(R+λ), otherwise a relocation
-        if λ > 0.0 && rand(sys.rng) * Rtot < λ
+        # the event: MC-kernel sweep with probability λ/Rtot, a rung hop with (w_up + w_dn)/Rtot, otherwise a relocation
+        # (a random number is drawn only when there is a non-relocation event type, so the stock stream is unchanged)
+        ξev = (λ > 0.0 || ladder !== nothing) ? rand(sys.rng) * Rtot : Inf
+        if λ > 0.0 && ξev < λ
             ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
+        elseif ladder !== nothing && ξev < λ + w_up + w_dn
+            up = ξev < λ + w_up
+            knew = up ? ladder.k + 1 : ladder.k - 1
+            sfr = ladder.solute
+            if ladder.k == 1                           # recoupling from λ = 0: uniform pose (and conformer), bare row scaled by λ_2
+                L = sys.L
+                sflex = isflexible(sys.templates[sys.tmpl[sfr]])
+                sflex && _set_body!(sys, sfr, draw_conformer(reservoirs[sys.tmpl[sfr]], sys.rng))
+                set_molecule!(sys, sfr, MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L),
+                              uniform_random_quaternion(sys.rng))
+                ek.lam[sfr] = ladder.λ[knew]; ek.c[sfr] = ladder.csol[knew]
+                update_rigid_ekmc_after_move!(ek, sys, ff, sfr)
+                sflex && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
+                ladder.n_recouple += 1
+                ladder_prod && ladder_landing!(ladder, sys.β * ek.frac_u)     # a λ = 0 sample of βu_s (jump-chain identity)
+            else
+                ek.c[sfr] = ladder.csol[knew]
+                set_fractional_coupling!(ek, sys.β, ladder.λ[knew])
+                knew == 1 && (ladder.n_decouple += 1)
+            end
+            ladder.k = knew
+            ladder_prod && (ladder.n_hop[knew] += 1)
         else
             k = select_by_mobility(ek, sys.rng)
             L = sys.L
@@ -2237,6 +2376,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
                         if trace_molecule == k          # other molecules: their stale φ is not their energy here
                             push!(trace_phi, ucap); push!(trace_dt, dtf)
                         end
+                        bar !== nothing && sk == bar_species && push_landing!(bar, sys.β * ucap)   # capped landing: e^{−βu′} ≈ 0
                     end
                     ek.events += 1; n_fast += 1
                     t_total += dtf; t_since_vol += dtf
@@ -2247,12 +2387,15 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
                 end
             end
             update_rigid_ekmc_after_move!(ek, sys, ff, k)
+            # landing energy u′_k: a Widom insertion sample into the (N−1)-system (jump-chain identity, DESIGN §10.3)
+            bar !== nothing && ev > burnin_events && coupled_now && sys.tmpl[k] == bar_species && push_landing!(bar, sys.β * ek.phi[k])
             kflex && (Uin[k] = flex_intra_energy(sys.templates[sys.tmpl[k]], ff, sys.body[k]))
             n_reloc += 1
         end
         ek.events += 1
         t_total += dt
         t_since_vol += dt
+        ladder !== nothing && adapting(ladder) && wl_update!(ladder, ev, dt, k_before)
         if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
             phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
             rebuild_rigid_ekmc!(ek, sys, ff)
@@ -2340,7 +2483,7 @@ function rigid_ekmc_results(r::RigidEKMCRun)
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
             mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
             RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt,
-            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui)
+            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui, bar=r.bar, ladder=r.ladder)
 end
 
 """
@@ -2401,7 +2544,14 @@ and redraws the mover without a row evaluation; it neglects the capped partner's
 of order exp(β(φ_partner − u_rest)) — negligible for liquid water, not for a weakly bound solute (see the
 comment in the loop); `fast_events`, `bursts` and `relocations` in the result count the events. The
 diagnostic trace records fast events only when the traced molecule is the mover. R/N and the species sums are accumulated at every event
-(block size `block_events`); U, P, ρ, V every `sample_every` events.
+(block size `block_events`); U, P, ρ, V every `sample_every` events. `bar_species=s` (default 0 = off) collects the
+landing-energy and time-weighted-energy histograms of template s in `bar` (a `BennettAccumulator`: Widom from
+landings, Bennett acceptance ratio, removal estimator; DESIGN §10.3). Cost O(N_s) per event.
+`ladder_solute=i` makes molecule i the fractional molecule of a coupling ladder (DESIGN §10.4, `CouplingLadder`):
+rungs `ladder_lambda` (0 … 1), hop frequency `ladder_nu` (required; of the order of ⟨R⟩), weights `ladder_eta` or
+Wang–Landau over the first `ladder_wl_events` events (`ladder_wl_fmin`, `ladder_wl_flat`); NVT, λ = 0, no fast path.
+U, P, R/N, species μ and `bar` are then accumulated at the fully coupled rung only after η is frozen; the ladder's own
+accumulators give `ladder_mu_occupancy` and `ladder_mu_mbar`; `ladder_summary` reports times per rung and hops.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -2412,14 +2562,21 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          mc_kernel_rate::Float64=0.0, mc_δ::Float64=0.1, mc_δθ::Float64=0.3,
                          vol_every_events::Int=0, species_mu::Bool=false, trace_molecule::Int=0,
                          species_rate_scale::Union{Nothing,AbstractVector{Float64}}=nothing,
-                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing)
+                         overlap_fast_path::Bool=false, reservoirs::Union{Nothing,Vector}=nothing,
+                         bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
+                         ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
+                         ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
+                         ladder_solute_rate_frac::Float64=0.1)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
                             sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
                             adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
                             vol_scheme=vol_scheme, vol_equil_moves=vol_equil_moves, burnin_events=burnin_events,
                             tail_route=tail_route, mc_kernel_rate=mc_kernel_rate, mc_δ=mc_δ, mc_δθ=mc_δθ,
                             vol_every_events=vol_every_events, species_mu=species_mu, trace_molecule=trace_molecule,
-                            species_rate_scale=species_rate_scale, overlap_fast_path=overlap_fast_path, reservoirs=reservoirs)
+                            species_rate_scale=species_rate_scale, overlap_fast_path=overlap_fast_path, reservoirs=reservoirs,
+                            bar_species=bar_species, ladder_solute=ladder_solute, ladder_lambda=ladder_lambda, ladder_nu=ladder_nu,
+                            ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
+                            ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
 end

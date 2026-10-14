@@ -13,6 +13,15 @@ function same_result(a, b)
          x.sum_t == y.sum_t && x.n == y.n) || return false
     end
     all(x.block_sum_x == y.block_sum_x && x.block_sum_t == y.block_sum_t for (x, y) in zip(a.RN_species, b.RN_species)) || return false
+    if a.bar !== nothing || b.bar !== nothing
+        (a.bar !== nothing && b.bar !== nothing && a.bar.land == b.bar.land && a.bar.time == b.bar.time &&
+         a.bar.land_wsum == b.bar.land_wsum && a.bar.time_esum == b.bar.time_esum && a.bar.n_ev == b.bar.n_ev) || return false
+    end
+    if a.ladder !== nothing || b.ladder !== nothing
+        (a.ladder !== nothing && b.ladder !== nothing && a.ladder.k == b.ladder.k && a.ladder.η == b.ladder.η &&
+         a.ladder.t_rung == b.ladder.t_rung && a.ladder.hist == b.ladder.hist && a.ladder.n_recouple == b.ladder.n_recouple &&
+         a.ladder.ev_frozen == b.ladder.ev_frozen) || return false
+    end
     return a.t_total == b.t_total && a.mu.S == b.mu.S && a.mu_npt.S_over_V == b.mu_npt.S_over_V &&
            a.trace_phi == b.trace_phi && a.trace_dt == b.trace_dt && a.vol_moves == b.vol_moves &&
            a.max_dV == b.max_dV && a.relocations == b.relocations && a.mc_events == b.mc_events &&
@@ -35,12 +44,15 @@ end
     cases = [
         ("NVT flexible solute, species μ, trace", flex,
          (; events=events, sample_every=3, block_events=1000, species_mu=true, trace_molecule=N + 1,
-            reservoirs=[nothing, res], debug_check_every=7000)),
+            reservoirs=[nothing, res], debug_check_every=7000, bar_species=2)),
         ("NPT volume moves with ΔV adaptation", rigid,
          (; events=events, sample_every=2, block_events=1000, Pext=1.0, max_dV=1.0, vol_every_sweeps=5,
             adapt_dV_moves=50, adapt_dV_window=10, vol_equil_moves=20)),
         ("MC-kernel hybrid", rigid,
          (; events=events, sample_every=2, block_events=1000, mc_kernel_rate=5.0, mc_δ=0.15, mc_δθ=0.4)),
+        ("coupling ladder with Wang–Landau", flex,
+         (; events=events, sample_every=3, block_events=1000, species_mu=true, reservoirs=[nothing, res],
+            ladder_solute=N + 1, ladder_nu=1.0, ladder_wl_events=8000, debug_check_every=9000)),
     ]
     for (name, sys0, kw) in cases
         @testset "$name" begin

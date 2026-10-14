@@ -18,6 +18,8 @@ module MolSim
         include("MC/Fluctuations.jl")
     include("MC/eKMC.jl")
         include("MC/Intramolecular.jl")
+        include("MC/BennettKMC.jl")
+        include("MC/CouplingLadder.jl")
         include("MC/RigidMolecules.jl")
         include("MC/SoluteModels.jl")
         include("MC/MD.jl")

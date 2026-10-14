@@ -270,6 +270,9 @@ include("test_overlap_cap.jl")
 # Checkpoint/restart of rigid-molecule eKMC (chained long runs)
 include("test_ekmc_checkpoint.jl")
 
+# Bennett / landing-Widom estimator from the eKMC jump chain (DESIGN §10.3)
+include("test_bennett.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

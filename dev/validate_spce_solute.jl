@@ -23,7 +23,8 @@ Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_eve
 Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
-of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_TRACE (1; 0 drops the per-event solute trace).
+of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
+SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol), SPCE_TRACE (1; 0 drops the per-event solute trace).
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
@@ -47,6 +48,12 @@ tag = get(ENV, "SPCE_TAG", "")
 ckpt = get(ENV, "SPCE_CHECKPOINT", "")    # checkpoint file: eKMC continues from it if present (chained jobs); "" = off
 wall = parse(Float64, get(ENV, "SPCE_WALL_SECONDS", "Inf"))   # eKMC wall-time budget of this invocation; checkpoint and exit when spent
 ckpt_every = parse(Float64, get(ENV, "SPCE_CKPT_EVERY", "1800"))   # seconds of eKMC between checkpoints (with SPCE_CHECKPOINT)
+bar_on = get(ENV, "SPCE_BAR", "0") == "1"   # Bennett accumulator on the solute (landing-Widom + BAR, DESIGN §10.3)
+ladder_on = get(ENV, "SPCE_LADDER", "0") == "1"   # coupling ladder on the solute (DESIGN §10.4)
+ladder_λ = parse.(Float64, split(get(ENV, "SPCE_LADDER_LAMBDA", "0,0.01,0.03,0.1,0.2,0.35,0.5,0.7,0.85,1"), ","))
+ladder_νfac = parse(Float64, get(ENV, "SPCE_LADDER_NU", "1.0"))      # ν = fac · ⟨R⟩_MC
+ladder_wlfrac = parse(Float64, get(ENV, "SPCE_LADDER_WL", "0.1"))    # fraction of the events spent on Wang–Landau
+ladder_ramp_kJ = parse(Float64, get(ENV, "SPCE_LADDER_RAMP", "NaN"))  # βμ_guess for the η ramp from this μ (kJ/mol); NaN = MC removal estimate
 trace = get(ENV, "SPCE_TRACE", "1") == "1"   # per-event solute (u, Δt) trace for the tail report (16 bytes/event: off for ≳ 1e8 events)
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -178,7 +185,11 @@ function setup_and_mc(io)
     se = λfac > 0 ? 1 : 100
     r = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                                 debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
-                                species_mu=true, trace_molecule=trace ? isol : 0, species_rate_scale=[1.0, c_sol], reservoirs=reservoirs)
+                                species_mu=true, trace_molecule=trace ? isol : 0, species_rate_scale=[1.0, c_sol], reservoirs=reservoirs,
+                                bar_species=bar_on ? 2 : 0, ladder_solute=ladder_on ? isol : 0, ladder_lambda=ladder_λ,
+                                ladder_nu=ladder_on ? ladder_νfac * R_mc : NaN, ladder_wl_events=ladder_on ? round(Int, ladder_wlfrac * ekmc_events) : 0,
+                                ladder_eta_ramp=ladder_on ? (isnan(ladder_ramp_kJ) ? log(iw) : ladder_ramp_kJ / kJmol_per_eps / T) : 0.0)   # βμ guess: SPCE_LADDER_RAMP or the MC removal estimator
+    ladder_on && println(io, "# coupling ladder: λ = $(ladder_λ), ν = $(ladder_νfac)·⟨R⟩_MC = $(ladder_νfac * R_mc), Wang–Landau over the first $(round(Int, ladder_wlfrac * ekmc_events)) events; U, P, μ_water, mu_sol read at the coupled rung only")
     trace || println(io, "# solute trace off (SPCE_TRACE=0): no tail diagnostics; the trace costs 16 bytes per event")
     ctx = (; out, T, kJmol_per_eps, atm_per_pstar, ΔU_tail, E_const, const_E, Nt, flex, Ures=flex ? Ures : NaN, coulomb, ekmc_events, t_ek=0.0)
     return (sys, r, ff, ctx)
@@ -200,6 +211,31 @@ function ekmc_report(io, ek, ctx)
     @printf(io, "# eKMC mu_sol + E_const = %.2f ± %.2f kJ/mol (GROMACS-RF comparable; model %s)\n", (μ_s + E_const) * kJmol_per_eps, eμ_s * kJmol_per_eps, String(coulomb))
     flex && @printf(io, "# eKMC flexible solute: <U_intra> = %.3f ± %.3f kJ/mol (time-weighted; ideal gas %.3f)\n",
                     MCm.mean(ek.U_intra) * kJmol_per_eps, MCm.stderr(ek.U_intra) * kJmol_per_eps, Ures * kJmol_per_eps)
+    if ek.bar !== nothing
+        corr = (ΔU_tail + E_const) * kJmol_per_eps
+        lw, elw = MCm.landing_widom_mu(ek.bar, T); bm, ebm = MCm.bennett_mu(ek.bar, T); rm, erm = MCm.removal_mu(ek.bar, T)
+        d = MCm.bennett_diagnostics(ek.bar)
+        @printf(io, "# eKMC Bennett (GROMACS-RF comparable, + E_const + tail): landing-Widom = %.2f ± %.2f  BAR = %.2f ± %.2f  removal(check) = %.2f ± %.2f kJ/mol; landings=%d  n_eff_time=%.1f  overlap=%.4f\n",
+                lw * kJmol_per_eps + corr, elw * kJmol_per_eps, bm * kJmol_per_eps + corr, ebm * kJmol_per_eps, rm * kJmol_per_eps + corr, erm * kJmol_per_eps,
+                d.n_landings, d.n_eff_time, d.overlap)
+        nb = MCm.nblocks(ek.bar)
+        println(io, "# eKMC Bennett per-block landings: ", join(ek.bar.land_n, " "))
+        println(io, "# eKMC Bennett landing-Widom per block (kJ/mol): ",
+                join([ek.bar.land_wsum[k] > 0 ? round(-T * log(ek.bar.land_wsum[k] / ek.bar.land_n[k]) * kJmol_per_eps + corr; digits=1) : NaN for k in 1:nb], " "))
+    end
+    if ek.ladder !== nothing
+        corr = (ΔU_tail + E_const) * kJmol_per_eps
+        sm = MCm.ladder_summary(ek.ladder)
+        oc, eoc = MCm.ladder_mu_occupancy(ek.ladder, T); mb, emb = MCm.ladder_mu_mbar(ek.ladder, T)
+        @printf(io, "# eKMC ladder (GROMACS-RF comparable, + E_const + tail): occupancy = %.2f ± %.2f  MBAR = %.2f ± %.2f kJ/mol; recouplings=%d decouplings=%d  WL stages=%d frozen at event %d (f=%.1e)\n",
+                oc * kJmol_per_eps + corr, eoc * kJmol_per_eps, mb * kJmol_per_eps + corr, emb * kJmol_per_eps,
+                sm.n_recouple, sm.n_decouple, sm.wl_stages, sm.ev_frozen, sm.wl_f)
+        println(io, "# eKMC ladder time fraction per rung: ", join(round.(sm.frac_rung; digits=4), " "), "  η = ", join(round.(sm.η; digits=3), " "),
+                "  hops per rung (arrivals) = ", join(sm.n_hop, " "))
+        nb = MCm.nblocks(ek.ladder)
+        println(io, "# eKMC ladder block occupancy μ (kJ/mol): ", join([(t = ek.ladder.t_rung[b]; (t[1] > 0 && t[end] > 0) ?
+                round((T * ((ek.ladder.η[end] - ek.ladder.η[1]) - log(t[end] / t[1]))) * kJmol_per_eps + corr; digits=2) : NaN) for b in 1:nb], " "))
+    end
     println(io, "# eKMC solute block μ (kJ/mol): ", join(round.((T .* log.(rs.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC water block μ (kJ/mol):  ", join(round.(T .* log.(rw.block_means) .* kJmol_per_eps; digits=2), " "))
     println(io, "# eKMC block times: ", join(round.(rs.block_sum_t; sigdigits=3), " "))
