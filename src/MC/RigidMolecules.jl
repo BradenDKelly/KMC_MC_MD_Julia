@@ -1591,6 +1591,19 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
                                                  com_old[3] + (2rand(sys.rng) - 1) * δ), q_old)
     end
     eval_row!(ek.row_u, ek.row_w, sys, ff, i)
+    # fractional molecule (coupling ladder): the trial is a Metropolis step on H_k, so its pairs are scaled by λ; the
+    # bare values are kept aside and committed only on acceptance
+    bare_row = nothing; bare_s = 0.0; bare_sw = 0.0
+    if ek.frac > 0
+        s = ek.frac; λ = ek.lam[s]
+        if i == s
+            bare_row = (copy(ek.row_u), copy(ek.row_w))
+            ek.row_u .*= λ; ek.row_w .*= λ
+        else
+            bare_s = ek.row_u[s]; bare_sw = ek.row_w[s]
+            ek.row_u[s] *= λ; ek.row_w[s] *= λ
+        end
+    end
     ΔU = 0.0
     @inbounds for j in 1:N
         j == i && continue
@@ -1598,6 +1611,16 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
     end
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         β = sys.β
+        if ek.frac > 0
+            s = ek.frac
+            if i == s
+                ek.bare_u .= bare_row[1]; ek.bare_w .= bare_row[2]
+                ek.frac_u = sum(ek.bare_u); ek.frac_w = sum(ek.bare_w)
+            else
+                ek.frac_u += bare_s - ek.bare_u[i]; ek.frac_w += bare_sw - ek.bare_w[i]
+                ek.bare_u[i] = bare_s; ek.bare_w[i] = bare_sw
+            end
+        end
         phii = 0.0; wi = 0.0
         @inbounds for j in 1:N
             j == i && continue
@@ -1606,13 +1629,13 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
             ek.pair_w[i, j] = ek.row_w[j]; ek.pair_w[j, i] = ek.row_w[j]
             if du != 0.0
                 ek.phi[j] += du
-                ek.m[j] = ek.c[j] * _mobility(β, ek.phi[j])
+                ek.m[j] = _mob(ek, β, j)
             end
             ek.wsum[j] += dw
             phii += ek.row_u[j]; wi += ek.row_w[j]
         end
         ek.phi[i] = phii; ek.wsum[i] = wi
-        ek.m[i] = ek.c[i] * _mobility(β, phii)
+        ek.m[i] = _mob(ek, β, i)
         ek.R = sum(ek.m)                      # never incremental (see update_rigid_ekmc_after_move!)
         ek.mc_accepted += 1
         return true
@@ -1636,6 +1659,49 @@ function ekmc_mc_sweep!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
     ek.R = sum(ek.m)
     ek.mc_events += 1
     return nothing
+end
+
+"""
+    ekmc_mc_sweep_local!(ek, sys, ff, δ, δθ, r_loc) -> n_shell
+
+Local Metropolis sweep around the fractional molecule s (DESIGN §10.8, R2c): one translation and one rotation trial
+per molecule for the n_shell molecules whose COM lies within r_loc of the COM of s (s itself fixed during the sweep),
+each selected uniformly from that fixed set, and a trial that would carry the molecule OUT of the sphere is rejected
+(so the selection set is the same before and after every accepted move: symmetric proposal, detailed balance with H_k).
+The shell changes only through relocations and the moves of s. Then one translation and one rotation trial of s itself
+(ordinary symmetric trials). Cost ≈ 2(n_shell + 1) row evaluations instead of 2N.
+"""
+function ekmc_mc_sweep_local!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, δ::Float64, δθ::Float64, r_loc::Float64)
+    s = ek.frac
+    s > 0 || error("ekmc_mc_sweep_local!: no fractional molecule")
+    N = sys.n_mol; L = sys.L; r2 = r_loc * r_loc
+    cs = (sys.com[1, s], sys.com[2, s], sys.com[3, s])
+    inside(i) = begin
+        dx = _min_image(sys.com[1, i] - cs[1], L); dy = _min_image(sys.com[2, i] - cs[2], L); dz = _min_image(sys.com[3, i] - cs[3], L)
+        dx * dx + dy * dy + dz * dz < r2
+    end
+    shell = [i for i in 1:N if i != s && inside(i)]
+    n = length(shell)
+    for _ in 1:n
+        for rot in (false, true)
+            i = shell[rand(sys.rng, 1:n)]
+            com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+            q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+            if ekmc_mc_trial!(ek, sys, ff, i, δ, δθ; rotate=rot) && !inside(i)
+                # the accepted move left the sphere: undo it (rejection keeps the selection set fixed)
+                set_molecule!(sys, i, com_old, q_old)
+                update_rigid_ekmc_after_move!(ek, sys, ff, i)
+                ek.mc_accepted -= 1
+            end
+        end
+    end
+    if ek.lam[s] > 0.0
+        ekmc_mc_trial!(ek, sys, ff, s, δ, δθ; rotate=false)
+        ekmc_mc_trial!(ek, sys, ff, s, δ, δθ; rotate=true)
+    end
+    ek.R = sum(ek.m)
+    ek.mc_events += 1
+    return n
 end
 
 "Total molecular virial from the maintained pair virials."
@@ -2083,6 +2149,7 @@ mutable struct RigidEKMCRun
     bar::Union{Nothing,BennettAccumulator}
     bar_members::Vector{Int}
     ladder::Union{Nothing,CouplingLadder}
+    mc_local_radius::Float64
 end
 
 """
@@ -2103,13 +2170,15 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0)
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
+                         mc_local_radius::Float64=0.0)
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
     if !isempty(flex_mols)
         reservoirs === nothing && error("run_rigid_ekmc!: flexible molecules need `reservoirs` (one ConformerReservoir per flexible template)")
-        λ > 0.0 && error("run_rigid_ekmc!: the MC-kernel hybrid is not implemented for flexible molecules (use λ = 0)")
+        # the MC kernel moves flexible molecules as rigid bodies (intramolecular energy unchanged, so the Metropolis
+        # acceptance on the intermolecular ΔU is exact); conformations are resampled at relocations/recouplings as in stock eKMC
         for i in flex_mols
             reservoirs[sys.tmpl[i]] === nothing && error("run_rigid_ekmc!: no reservoir for template $(sys.tmpl[i])")
         end
@@ -2160,7 +2229,6 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     if ladder_solute > 0
         1 <= ladder_solute <= N || error("run_rigid_ekmc!: ladder_solute out of range")
         Pext === nothing || error("run_rigid_ekmc!: the coupling ladder is NVT only")
-        λ == 0.0 || error("run_rigid_ekmc!: the coupling ladder is not implemented with the MC-kernel hybrid")
         overlap_fast_path && error("run_rigid_ekmc!: the coupling ladder is not implemented with the overlap fast path")
         isfinite(ladder_nu) || error("run_rigid_ekmc!: ladder_nu (hop attempt frequency) is required")
         # initial weights: given η, or the linear ramp η_k = λ_k·βμ_guess (flat if F(λ) were linear; Wang–Landau refines)
@@ -2194,7 +2262,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     next_vol = vol_period
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
-    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder)
+    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius)
 end
 
 """
@@ -2266,7 +2334,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
     t_since_vol = r.t_since_vol
     max_dV_current = r.max_dV_current
     bar_species = r.bar_species; bar = r.bar; bar_members = r.bar_members
-    ladder = r.ladder
+    ladder = r.ladder; mc_local_radius = r.mc_local_radius
     stop = min(until, events)
     while ev < stop
         (ev & 4095 == 0) && time() > deadline && break
@@ -2325,7 +2393,11 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         # (a random number is drawn only when there is a non-relocation event type, so the stock stream is unchanged)
         ξev = (λ > 0.0 || ladder !== nothing) ? rand(sys.rng) * Rtot : Inf
         if λ > 0.0 && ξev < λ
-            ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
+            if mc_local_radius > 0.0 && ek.frac > 0
+                ekmc_mc_sweep_local!(ek, sys, ff, mc_δ, mc_δθ, mc_local_radius)
+            else
+                ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
+            end
         elseif ladder !== nothing && ξev < λ + w_up + w_dn
             up = ξev < λ + w_up
             knew = up ? ladder.k + 1 : ladder.k - 1
@@ -2570,7 +2642,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0)
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
+                         mc_local_radius::Float64=0.0)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
                             sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
                             adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
@@ -2581,7 +2654,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             bar_species=bar_species, ladder_solute=ladder_solute, ladder_lambda=ladder_lambda, ladder_nu=ladder_nu,
                             ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
                             ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac,
-                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp)
+                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, mc_local_radius=mc_local_radius)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
 end

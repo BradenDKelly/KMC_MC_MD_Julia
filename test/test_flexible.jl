@@ -107,7 +107,10 @@ end
                            reservoirs=[nothing, res], δ_site=0.05)
     events = 2_000_000
     @test_throws ErrorException MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=100, block_events=50)                      # needs reservoirs
-    @test_throws ErrorException MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=100, block_events=50, reservoirs=[nothing, res], mc_kernel_rate=1.0)
+    # the MC kernel moves flexible molecules as rigid bodies (allowed since R2c, DESIGN §10.8): it must run and keep U_intra
+    ekh = MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=2000, sample_every=1, block_events=500, reservoirs=[nothing, res], mc_kernel_rate=1.0,
+                              mc_δ=0.15, mc_δθ=0.4, debug_check_every=1000)
+    @test ekh.mc_events > 0 && isfinite(MCm.mean(ekh.U_intra))
     ek = MCm.run_rigid_ekmc!(deepcopy(sys), ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
                              reservoirs=[nothing, res], debug_check_every=events ÷ 4)
     r2 = ek.RN_species[2]

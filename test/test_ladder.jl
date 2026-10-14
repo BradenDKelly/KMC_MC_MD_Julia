@@ -95,6 +95,31 @@ end
     @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
 end
 
+@testset "Coupling ladder + MC kernel (full sweeps and local sweeps around the fractional molecule)" begin
+    N = 32; T = 1.5; ρ = 0.4
+    S = dimer_system(1.0, N, T, ρ, 11)
+    events = 1_500_000
+    stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                reservoirs=[nothing, S.res])
+    r2 = stock.RN_species[2]
+    μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+    for (name, rloc) in (("full sweeps", 0.0), ("local sweeps r=1.8", 1.8))
+        lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                  reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_wl_events=events ÷ 3,
+                                  ladder_eta_ramp=μ_st / T, mc_kernel_rate=ν, mc_δ=0.15, mc_δθ=0.4, mc_local_radius=rloc,
+                                  debug_check_every=events ÷ 5)
+        Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+        μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+        μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+        @info "ladder + MC kernel ($name)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb lad.mc_events lad.mc_acceptance sm.n_recouple
+        @test lad.mc_events > 100 && 0.05 < lad.mc_acceptance < 0.95
+        @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+        @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+        @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+    end
+end
+
 @testset "Coupling ladder: a strongly bound solute switches bound ↔ absent; occupancy = MBAR" begin
     N = 32; T = 1.5; ρ = 0.4
     S = dimer_system(2.0, N, T, ρ, 11)                           # stock: ~90 solute landings per 1.5e6 events (JOURNAL entry 37)

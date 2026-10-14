@@ -53,6 +53,10 @@ end
         ("coupling ladder with Wang–Landau", flex,
          (; events=events, sample_every=3, block_events=1000, species_mu=true, reservoirs=[nothing, res],
             ladder_solute=N + 1, ladder_nu=1.0, ladder_wl_events=8000, debug_check_every=9000)),
+        ("coupling ladder + local MC kernel + adaptive η", flex,
+         (; events=events, sample_every=3, block_events=1000, species_mu=true, reservoirs=[nothing, res],
+            ladder_solute=N + 1, ladder_nu=1.0, ladder_adapt_blocks=true, mc_kernel_rate=1.0, mc_δ=0.15, mc_δθ=0.4,
+            mc_local_radius=1.8, debug_check_every=9000)),
     ]
     for (name, sys0, kw) in cases
         @testset "$name" begin
