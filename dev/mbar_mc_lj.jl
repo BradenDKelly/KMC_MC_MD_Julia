@@ -52,7 +52,7 @@ function mc_sweep!(sys, ff, λ, δ, rng)
     return acc / sys.n_mol
 end
 
-out = joinpath(outdir, "mbar_mc_lj_eps$(ε_s)_N$(N)_seed$(seed).txt")
+out = joinpath(outdir, "mbar_mc_lj_eps$(ε_s)_N$(N)_seed$(seed)$(get(ENV, "TAG", "")).txt")   # TAG: keep earlier runs
 K = length(λs); nblk = 20; per_blk = max(1, sweeps ÷ nblk)
 H = [[zeros(nb) for _ in 1:K] for _ in 1:nblk]                   # per block, per rung: counts
 nsamp = zeros(Int, nblk, K)

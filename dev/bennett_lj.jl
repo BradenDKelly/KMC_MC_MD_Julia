@@ -17,7 +17,7 @@ site = zeros(3, 1)
 solv = MCm.RigidTemplate("LJ", site, [1], [0.0], [1.0]); solu = MCm.RigidTemplate("S", site, [2], [0.0], [1.0])
 ff = MCm.SiteForceField([1.0, 1.0], [1.0, ε_s]; rc=2.5, coulomb=:none, mixing=:geometric)
 ff = first(MCm.kT_overlap_cap(ff, [solv, solu], T; U_kT=100.0))
-out = joinpath(outdir, "bennett_lj_eps$(ε_s)_N$(N)_seed$(seed)$(get(ENV, "LADDER", "0") == "1" ? "_ladder" : "").txt")
+out = joinpath(outdir, "bennett_lj_eps$(ε_s)_N$(N)_seed$(seed)$(get(ENV, "LADDER", "0") == "1" ? "_ladder" : "")$(get(ENV, "TAG", "")).txt")   # TAG: keep earlier runs
 open(out, "w") do io
     println(io, "# Bennett V1  $(Dates.now())  ε_s=$ε_s N=$N ρ*=$ρ T*=$T events=$events mc_sweeps=$sweeps seed=$seed")
     # Widom reference into the pure solvent
