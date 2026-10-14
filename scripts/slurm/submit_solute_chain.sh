@@ -5,8 +5,9 @@
 set -e
 PIECES=${1:?number of pieces}
 ARRAY=${2:-1-6}
-SCRIPT=/shared/kmc_polyatomic/KMC_MC_MD_Julia/scripts/slurm/spce_solute_chain.sbatch
-prev=$(sbatch --parsable --array="$ARRAY" --export=ALL "$SCRIPT")
+SCRIPT=${PROJECT:-/shared/kmc_polyatomic/KMC_MC_MD_Julia}/scripts/slurm/spce_solute_chain.sbatch
+# FIRST_DEP=<jobid>: start the first piece only after that job succeeds (e.g. a Pkg.test run of the same code)
+prev=$(sbatch --parsable --array="$ARRAY" ${FIRST_DEP:+--dependency=afterok:$FIRST_DEP} --export=ALL "$SCRIPT")
 echo "$prev"
 for ((k = 2; k <= PIECES; k++)); do
     prev=$(sbatch --parsable --array="$ARRAY" --dependency=aftercorr:"$prev" --export=ALL "$SCRIPT")

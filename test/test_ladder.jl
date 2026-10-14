@@ -69,6 +69,32 @@ end
     @test within3σ(MCm.mean(lad.P), MCm.stderr(lad.P), MCm.mean(stock.P), MCm.stderr(stock.P))
 end
 
+@testset "Coupling ladder: production re-flattening from bad η (no Wang–Landau)" begin
+    N = 32; T = 1.5; ρ = 0.4
+    S = dimer_system(1.0, N, T, ρ, 11)
+    events = 2_000_000
+    stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                reservoirs=[nothing, S.res])
+    r2 = stock.RN_species[2]
+    μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+    K = length(MCm.LADDER_LAMBDA_DEFAULT)
+    lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 50, species_mu=true,
+                              reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_eta=zeros(K), ladder_eta_ramp=μ_st / T,
+                              ladder_adapt_blocks=true)
+    Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+    @test length(Ld.η_blocks) == MCm.nblocks(Ld) && Ld.η_blocks[1] == zeros(K) && Ld.η != zeros(K)
+    μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+    μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+    # flatness improves: spread of the rung times in the last 5 blocks vs the first 5
+    spread(bs) = (t = sum(Ld.t_rung[b] for b in bs); maximum(t) / max(minimum(t), eps()))
+    nb = MCm.nblocks(Ld)
+    @info "ladder adaptive η (easy solute, η₀ = 0, no WL)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb spread(1:5) spread(nb-4:nb) sm.η
+    @test spread(nb-4:nb) < spread(1:5)
+    @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+    @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+end
+
 @testset "Coupling ladder: a strongly bound solute switches bound ↔ absent; occupancy = MBAR" begin
     N = 32; T = 1.5; ρ = 0.4
     S = dimer_system(2.0, N, T, ρ, 11)                           # stock: ~90 solute landings per 1.5e6 events (JOURNAL entry 37)

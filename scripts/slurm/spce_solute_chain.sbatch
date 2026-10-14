@@ -17,7 +17,7 @@
 
 export JULIA_DEPOT_PATH=/shared/kmc_polyatomic/julia_depot
 JULIA=/shared/julia_depot/juliaup/julia-1.12.5+0.x64.linux.gnu/bin/julia
-PROJECT=/shared/kmc_polyatomic/KMC_MC_MD_Julia
+PROJECT=${PROJECT:-/shared/kmc_polyatomic/KMC_MC_MD_Julia}   # a git worktree may be used for a development branch
 OUT=/shared/kmc_polyatomic/KMC_MC_MD_Julia/dev/results/spce_solute
 CKDIR=/shared/kmc_polyatomic/checkpoints
 
@@ -33,7 +33,7 @@ export SPCE_WALL_SECONDS=${SPCE_WALL_SECONDS:-12600}
 mkdir -p "$OUT" "$CKDIR"
 export SPCE_CHECKPOINT=$CKDIR/${SOLUTE}_N${N}_seed${SEED}${SPCE_TAG}.jls
 
-echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED coulomb=$SPCE_COULOMB cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA trace=$SPCE_TRACE wall=$SPCE_WALL_SECONDS ckpt=$SPCE_CHECKPOINT start=$(date)"
+echo "project=$PROJECT host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED coulomb=$SPCE_COULOMB cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA trace=$SPCE_TRACE wall=$SPCE_WALL_SECONDS ckpt=$SPCE_CHECKPOINT start=$(date)"
 cd "$PROJECT" || exit 1
 "$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_solute.jl "$SOLUTE" "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
 echo "end=$(date)"

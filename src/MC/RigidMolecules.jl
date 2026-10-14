@@ -2103,7 +2103,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1)
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0)
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2167,7 +2167,8 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         η0 = ladder_eta !== nothing ? ladder_eta : ladder_eta_ramp .* ladder_lambda
         ladder = CouplingLadder(ladder_solute, ladder_lambda, block_events; η=η0, ν=ladder_nu, wl_events=ladder_wl_events,
                                 wl_fmin=ladder_wl_fmin, wl_flat=ladder_wl_flat,
-                                csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac))
+                                csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac),
+                                adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp)
         ek.frac = ladder_solute; ek.lam[ladder_solute] = 1.0
         rebuild_rigid_ekmc!(ek, sys, ff)
     end
@@ -2552,6 +2553,9 @@ rungs `ladder_lambda` (0 … 1), hop frequency `ladder_nu` (required; of the ord
 Wang–Landau over the first `ladder_wl_events` events (`ladder_wl_fmin`, `ladder_wl_flat`); NVT, λ = 0, no fast path.
 U, P, R/N, species μ and `bar` are then accumulated at the fully coupled rung only after η is frozen; the ladder's own
 accumulators give `ladder_mu_occupancy` and `ladder_mu_mbar`; `ladder_summary` reports times per rung and hops.
+`ladder_adapt_blocks=true` re-flattens η at every production block boundary from the previous block's rung times (the
+occupancy estimator uses the η in force in each block; MBAR is η-independent) — for solvents where WL cannot converge
+within its budget (water, JOURNAL entry 45).
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -2566,7 +2570,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1)
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
                             sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
                             adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
@@ -2576,7 +2580,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             species_rate_scale=species_rate_scale, overlap_fast_path=overlap_fast_path, reservoirs=reservoirs,
                             bar_species=bar_species, ladder_solute=ladder_solute, ladder_lambda=ladder_lambda, ladder_nu=ladder_nu,
                             ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
-                            ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac)
+                            ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac,
+                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
 end

@@ -55,11 +55,16 @@ mutable struct CouplingLadder
     n_recouple::Int
     n_decouple::Int
     csol::Vector{Float64}                      # per-rung rate scale of the fractional molecule (exact: constant at fixed k)
+    # production-time re-flattening (JOURNAL entry 45): at every block boundary η_k ← η_k − damp·ln(t_k/t̄) from the previous
+    # block; the η in force during each block is stored, and the occupancy estimator combines blocks with their own η
+    adapt_blocks::Bool
+    adapt_damp::Float64
+    η_blocks::Vector{Vector{Float64}}
 end
 function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η::Union{Nothing,Vector{Float64}}=nothing,
                         ν::Float64, wl_events::Int=0, wl_f0::Float64=1.0, wl_fmin::Float64=1e-3, wl_flat::Float64=0.8,
                         βu_min::Float64=-150.0, βu_max::Float64=1050.0, dβu::Float64=0.1,
-                        csol::Union{Nothing,Vector{Float64}}=nothing)
+                        csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0)
     K = length(λ)
     K >= 2 || error("CouplingLadder: at least two rungs")
     (λ[1] == 0.0 && λ[end] == 1.0 && issorted(λ) && allunique(λ)) || error("CouplingLadder: λ must increase from 0 to 1")
@@ -70,7 +75,7 @@ function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η:
     CouplingLadder(solute, copy(λ), ηv, K, ν, wl_events > 0 ? wl_f0 : 0.0, wl_fmin, wl_flat, zeros(K), wl_events,
                    0, wl_events > 0 ? 0 : -1, block_events, 0, βu_min, dβu, nb,
                    Vector{Float64}[], Vector{Float64}[], Vector{Vector{Float64}}[], zeros(Int, K), 0, 0,
-                   csol === nothing ? ones(K) : copy(csol))
+                   csol === nothing ? ones(K) : copy(csol), adapt_blocks, adapt_damp, Vector{Float64}[])
 end
 
 """
@@ -93,7 +98,19 @@ _lblock(L::CouplingLadder) = (L.n_ev - 1) ÷ L.block_events + 1
 function _ensure_lblock!(L::CouplingLadder, b::Int)
     K = nrungs(L)
     while length(L.t_rung) < b
+        if L.adapt_blocks && !isempty(L.t_rung)
+            # re-flatten from the block just completed: η_k ← η_k − damp·ln(t_k/t̄), unvisited rungs get +damp·ln K, step clamped to ±3
+            t = L.t_rung[end]; tbar = sum(t) / K
+            if tbar > 0
+                for k in 1:K
+                    δ = t[k] > 0 ? -L.adapt_damp * log(t[k] / tbar) : L.adapt_damp * log(K)
+                    L.η[k] += clamp(δ, -3.0, 3.0)
+                end
+                L.η .-= L.η[end]
+            end
+        end
         push!(L.t_rung, zeros(K)); push!(L.t2_rung, zeros(K)); push!(L.hist, [zeros(L.nbins) for _ in 1:K])
+        push!(L.η_blocks, copy(L.η))                       # η in force during this block
     end
 end
 nblocks(L::CouplingLadder) = length(L.t_rung)
@@ -160,15 +177,18 @@ function ladder_landing!(L::CouplingLadder, βu_s::Float64)
     return nothing
 end
 
+# occupancy estimator with the η in force in each block: t_K^b e^{−η_K^b} / (t_1^b e^{−η_1^b}) = Z_K/Z_1 for every block, so
+# e^{−βμ} = Σ_b t_K^b e^{−η_K^b} / Σ_b t_1^b e^{−η_1^b} (reduces to (η_K − η_1) − ln(t_K/t_1) for constant η)
 function _occupancy_solve(L::CouplingLadder, skip::Int)
     K = nrungs(L)
-    t1 = 0.0; tK = 0.0
+    s1 = 0.0; sK = 0.0
     for b in 1:nblocks(L)
         b == skip && continue
-        t1 += L.t_rung[b][1]; tK += L.t_rung[b][K]
+        η = b <= length(L.η_blocks) ? L.η_blocks[b] : L.η
+        s1 += L.t_rung[b][1] * exp(-η[1]); sK += L.t_rung[b][K] * exp(-η[K])
     end
-    (t1 > 0 && tK > 0) || return NaN
-    return (L.η[K] - L.η[1]) - log(tK / t1)
+    (s1 > 0 && sK > 0) || return NaN
+    return -log(sK / s1)
 end
 function _jackknife(f, L::CouplingLadder, T::Float64)
     n = nblocks(L)
@@ -286,5 +306,6 @@ function ladder_summary(L::CouplingLadder)
     for b in 1:nblocks(L); t .+= L.t_rung[b]; end
     land = sum(sum(L.hist[b][1]) for b in 1:nblocks(L); init=0.0)
     return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
-            landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f)
+            landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f,
+            adapt_blocks=L.adapt_blocks, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]))
 end
