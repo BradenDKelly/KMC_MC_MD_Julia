@@ -23,7 +23,7 @@ Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_eve
 Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
-of one invocation), SPCE_TRACE (1; 0 drops the per-event solute trace).
+of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_TRACE (1; 0 drops the per-event solute trace).
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
@@ -46,6 +46,7 @@ elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 tag = get(ENV, "SPCE_TAG", "")
 ckpt = get(ENV, "SPCE_CHECKPOINT", "")    # checkpoint file: eKMC continues from it if present (chained jobs); "" = off
 wall = parse(Float64, get(ENV, "SPCE_WALL_SECONDS", "Inf"))   # eKMC wall-time budget of this invocation; checkpoint and exit when spent
+ckpt_every = parse(Float64, get(ENV, "SPCE_CKPT_EVERY", "1800"))   # seconds of eKMC between checkpoints (with SPCE_CHECKPOINT)
 trace = get(ENV, "SPCE_TRACE", "1") == "1"   # per-event solute (u, Δt) trace for the tail report (16 bytes/event: off for ≳ 1e8 events)
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -225,13 +226,23 @@ else
     isempty(ckpt) || save_checkpoint(ckpt, (sys, r, ff, ctx))
     io = open(ctx.out, "a")
 end
-t0 = time()
-MCm.advance_rigid_ekmc!(r, sys, ff; wall_seconds=wall)
-ctx = merge(ctx, (; t_ek=ctx.t_ek + time() - t0))
+# eKMC in slices of SPCE_CKPT_EVERY seconds with a checkpoint after each, so a requeued or killed job loses at most
+# one slice (Slurm requeued 205893_1 twice, JOURNAL entry 32); the slices do not change the trajectory (test_ekmc_checkpoint.jl)
+t_start = time()
+while r.ev < r.events
+    left = wall - (time() - t_start)
+    left > 0 || break
+    t0 = time()
+    MCm.advance_rigid_ekmc!(r, sys, ff; wall_seconds=isempty(ckpt) ? left : min(left, ckpt_every))
+    global ctx = merge(ctx, (; t_ek=ctx.t_ek + time() - t0))
+    if r.ev < r.events && !isempty(ckpt)
+        save_checkpoint(ckpt, (sys, r, ff, ctx))
+        println(io, "# checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  eKMC wall time so far $(round(ctx.t_ek; digits=0)) s"); flush(io)
+    end
+end
 if r.ev < r.events
     isempty(ckpt) && error("eKMC stopped at event $(r.ev) of $(r.events) without a checkpoint path (set SPCE_CHECKPOINT)")
-    save_checkpoint(ckpt, (sys, r, ff, ctx))
-    println(io, "# checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  eKMC wall time so far $(round(ctx.t_ek; digits=0)) s"); close(io)
+    close(io)
     println("checkpoint written at event $(r.ev) of $(r.events)"); exit(0)
 end
 ekmc_report(io, MCm.rigid_ekmc_results(r), ctx)
