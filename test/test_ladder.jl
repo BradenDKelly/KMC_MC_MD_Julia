@@ -168,3 +168,48 @@ end
         @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
     end
 end
+
+# time-averaged intramolecular energy of the flexible solute by Metropolis MC (block standard error, 20 blocks)
+function mc_uintra(S, sweeps)
+    sys = deepcopy(S.sys); st = MCm.RigidMCStats(); Ui = Float64[]
+    for sw in 1:sweeps
+        for _ in 1:S.Nt
+            MCm.mc_translate!(sys, S.ff, rand(sys.rng, 1:S.Nt), 0.15, st); MCm.mc_rotate!(sys, S.ff, rand(sys.rng, 1:S.Nt), 0.4, st)
+        end
+        MCm.mc_site_move!(sys, S.ff, S.Nt, 0.05, st); MCm.mc_conformer_swap!(sys, S.ff, S.Nt, S.res, st)
+        sw > sweeps ÷ 10 && push!(Ui, MCm.intra_energy_molecule(sys, S.ff, S.Nt))
+    end
+    nb = 20; n = length(Ui) ÷ nb; bm = [sum(Ui[(b-1)*n+1:b*n]) / n for b in 1:nb]; m = sum(bm) / nb
+    return sum(Ui) / length(Ui), sqrt(sum(abs2, bm .- m) / (nb - 1) / nb)
+end
+
+@testset "Coupling ladder + rejection-free local moves of the fractional molecule (with and without the λ = 0 hub)" begin
+    N = 32; T = 1.5; ρ = 0.4
+    for ε_s in (1.0, 2.0)
+        S = dimer_system(ε_s, N, T, ρ, 11)
+        events = 2_000_000
+        stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                    reservoirs=[nothing, S.res])
+        r2 = stock.RN_species[2]
+        μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+        ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+        # ⟨U_intra⟩ reference: Metropolis with site moves and conformer swaps (stock eKMC changes the conformer only at
+        # relocations of the solute, which are rare at ε_s = 2: stock gave 0.40 ± 0.08 vs MC 0.80 ± 0.04, job 207603)
+        Ui_mc, eUi_mc = mc_uintra(S, 20_000)
+        for hub in (true, false)
+            lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                      reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_wl_events=events ÷ 3,
+                                      ladder_eta_ramp=μ_st / T, ladder_jump=hub, ladder_local=true, debug_check_every=events ÷ 4)
+            Ld = lad.ladder; sm = MCm.ladder_summary(Ld); lm = lad.lmoves
+            μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+            μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+            @info "ladder + L-moves (ε_s = $ε_s, hub = $hub)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb lm.n_move lm.n_move_rung lm.n_refresh sm.frac_rung sm.res_frac sm.pose_frac
+            @test all(lm.n_move .> 100) && all(lm.n_move_rung[2:end] .> 0) && lm.n_move_rung[1] == 0
+            @test all(sm.t_rung .> 0)
+            @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+            @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+            @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+            @test within3σ(MCm.mean(lad.U_intra), MCm.stderr(lad.U_intra), Ui_mc, eUi_mc)
+        end
+    end
+end

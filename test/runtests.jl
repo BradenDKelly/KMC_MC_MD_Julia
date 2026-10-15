@@ -277,6 +277,9 @@ include("test_bennett.jl")
 include("test_opls_itp.jl")
 include("test_random_packing.jl")
 
+# Rejection-free local moves of the fractional molecule and the vacuum eKMC conformer pool (DESIGN §11)
+include("test_local_moves.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")

@@ -21,6 +21,7 @@ module MolSim
         include("MC/OPLSTopology.jl")
         include("MC/BennettKMC.jl")
         include("MC/CouplingLadder.jl")
+        include("MC/LocalMoves.jl")
         include("MC/RigidMolecules.jl")
         include("MC/SoluteModels.jl")
         include("MC/MD.jl")

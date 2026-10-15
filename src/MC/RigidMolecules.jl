@@ -424,6 +424,85 @@ function build_reservoir(templates::Vector{RigidTemplate}, template_idx::Int, ff
     return ConformerReservoir(template_idx, confs, Us, acc / att)
 end
 
+"""
+    build_reservoir_ekmc(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03,
+                         ν=1.0, νD=1.0)
+
+Vacuum conformer reservoir by rejection-free continuous-time sampling (DESIGN §11.3 E3; no Metropolis step). The
+molecule carries one candidate displacement per site (d_n uniform in a cube of half-side δ, the L-move construction of
+`LocalMoves` applied to single sites): event n moves site n by d_n and stores −d_n in the slot, at rate
+ν exp(−½β[U_intra(x + d_n) − U_intra(x)]) (detailed balance on the space augmented by the slots); a refresh event of
+rate νD redraws all slots. Conformers are recorded at equally spaced kMC times τ (time sampling of a continuous-time
+chain gives draws from its stationary density e^{−βU_intra}); τ = stride_sweeps · n_sites · ⟨Δt⟩ of the burn-in
+(`burnin_sweeps` · n_sites events), i.e. the spacing of the Metropolis reservoir measured in events. `acceptance` of the
+result holds the fraction of events that were moves (not refreshes).
+"""
+function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
+                              rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
+                              δ::Float64=0.03, ν::Float64=1.0, νD::Float64=1.0)
+    t = templates[template_idx]
+    isflexible(t) || error("build_reservoir_ekmc: template $(t.name) is rigid")
+    n = t.n_sites
+    X = copy(t.sites_body)
+    U = flex_intra_energy(t, ff, X)
+    D = [(2rand(rng) - 1) * δ for _ in 1:3, _ in 1:n]          # slot n: displacement of site n
+    Uc = zeros(n); w = zeros(n)
+    function cand!()                                           # candidate energies of all slots
+        for k in 1:n
+            for d in 1:3; X[d, k] += D[d, k]; end
+            Uc[k] = flex_intra_energy(t, ff, X)
+            for d in 1:3; X[d, k] -= D[d, k]; end
+        end
+    end
+    cand!()
+    m = t.site_mass; mtot = sum(m)
+    confs = Matrix{Float64}[]; Us = Float64[]
+    nmoves = 0; nev = 0
+    t_burn = 0.0; nburn = burnin_sweeps * n
+    τ = NaN; t_next = 0.0; tnow = 0.0
+    while length(confs) < M
+        W = 0.0
+        for k in 1:n
+            w[k] = ν * exp(min(-0.5 * β * (Uc[k] - U), MOBILITY_LOG_MAX)); W += w[k]
+        end
+        Rtot = W + νD
+        ξ0 = rand(rng); ξ0 = max(eps(Float64), min(ξ0, 1.0 - eps(Float64)))
+        dt = log(1 / ξ0) / Rtot
+        nev += 1
+        if nev <= nburn
+            t_burn += dt
+            if nev == nburn
+                τ = stride_sweeps * n * t_burn / nburn; t_next = τ; tnow = 0.0
+            end
+        else
+            # the current state occupies [tnow, tnow + dt): record it at every sampling time inside
+            while t_next < tnow + dt && length(confs) < M
+                c = X * m ./ mtot
+                push!(confs, X .- c); push!(Us, U)
+                t_next += τ
+            end
+            tnow += dt
+        end
+        ξ = rand(rng) * Rtot
+        if ξ < W
+            k = n
+            for i in 1:n
+                ξ < w[i] && (k = i; break)
+                ξ -= w[i]
+            end
+            for d in 1:3; X[d, k] += D[d, k]; D[d, k] = -D[d, k]; end
+            U = Uc[k]
+            nmoves += 1
+        else
+            for k in 1:n, d in 1:3
+                D[d, k] = (2rand(rng) - 1) * δ
+            end
+        end
+        cand!()
+    end
+    return ConformerReservoir(template_idx, confs, Us, nmoves / nev)
+end
+
 "Uniformly drawn conformation (a reference into the reservoir — do not modify)."
 @inline draw_conformer(res::ConformerReservoir, rng::AbstractRNG) = res.confs[rand(rng, 1:length(res.confs))]
 
@@ -2153,6 +2232,7 @@ mutable struct RigidEKMCRun
     bar_members::Vector{Int}
     ladder::Union{Nothing,CouplingLadder}
     mc_local_radius::Float64
+    lmoves::Union{Nothing,LocalMoves}
 end
 
 """
@@ -2174,7 +2254,9 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
                          ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
-                         mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN)
+                         mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
+                         ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
+                         local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN)
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2240,10 +2322,24 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                                 wl_fmin=ladder_wl_fmin, wl_flat=ladder_wl_flat,
                                 csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac),
                                 adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp,
-                                jump=ladder_jump, jump_ν=isnan(ladder_jump_nu) ? ladder_nu : ladder_jump_nu)
+                                jump=ladder_jump, jump_ν=isnan(ladder_jump_nu) ? ladder_nu : ladder_jump_nu,
+                                jump_max=ladder_jump_max > 0 ? ladder_jump_max : length(ladder_lambda))
         ek.frac = ladder_solute; ek.lam[ladder_solute] = 1.0
         ladder_jump && (ek.c[ladder_solute] = ladder.csol[end])     # hub: no relocation at the coupled rung either
         rebuild_rigid_ekmc!(ek, sys, ff)
+    end
+    # rejection-free local moves of the fractional molecule (DESIGN §11.2): default slots 3 T + 3 R (+ 2 C if flexible),
+    # step sizes mc_δ / mc_δθ, ν_L = ν_D = ladder_nu unless given
+    lmoves = nothing
+    if ladder_local
+        ladder === nothing && error("run_rigid_ekmc!: ladder_local needs the coupling ladder (ladder_solute)")
+        sflex = isflexible(sys.templates[sys.tmpl[ladder_solute]])
+        kinds = isempty(local_kinds) ? vcat(fill(LM_T, 3), fill(LM_R, 3), sflex ? fill(LM_C, 2) : Int[]) : local_kinds
+        (!sflex && any(==(LM_C), kinds)) && error("run_rigid_ekmc!: conformer slots for a rigid molecule")
+        lmoves = LocalMoves(sys, ladder_solute, length(ladder_lambda); kinds=kinds,
+                            a=isnan(local_a) ? mc_δ : local_a, θmax=isnan(local_θ) ? mc_δθ : local_θ,
+                            ν=isnan(local_nu) ? ladder_nu : local_nu, νD=isnan(local_nuD) ? ladder_nu : local_nuD,
+                            reservoir=sflex ? reservoirs[sys.tmpl[ladder_solute]] : nothing)
     end
     t_total = 0.0
     # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`
@@ -2267,7 +2363,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     next_vol = vol_period
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
-    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius)
+    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius, lmoves)
 end
 
 """
@@ -2339,16 +2435,19 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
     t_since_vol = r.t_since_vol
     max_dV_current = r.max_dV_current
     bar_species = r.bar_species; bar = r.bar; bar_members = r.bar_members
-    ladder = r.ladder; mc_local_radius = r.mc_local_radius
+    ladder = r.ladder; mc_local_radius = r.mc_local_radius; lmoves = r.lmoves
     stop = min(until, events)
     while ev < stop
         (ev & 4095 == 0) && time() > deadline && break
         ev += 1; n_full += 1          # n_full counts the states that get a full update (sampling stride for U, P)
         # weight of the current configuration: draw its Δt here and reuse it in the step
         R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
-        w_up = 0.0; w_dn = 0.0; w_hub = 0.0
+        w_up = 0.0; w_dn = 0.0; w_hub = 0.0; w_loc = 0.0; w_ref = 0.0
         ladder === nothing || ((w_up, w_dn) = hop_rates(ladder, sys.β, ek.frac_u); w_hub = hub_rate(ladder, sys.β, ek.frac_u))
-        Rtot = R + λ + w_up + w_dn + w_hub   # total event rate incl. the MC-kernel event, the rung hops and the λ = 0 hub jumps
+        if lmoves !== nothing && ek.lam[lmoves.mol] > 0.0     # L-moves and the refresh of their candidates (λ > 0 only)
+            w_loc = lm_total_rate!(lmoves, sys, ff, sys.β, ek.lam[lmoves.mol], ek.frac_u); w_ref = lmoves.νD
+        end
+        Rtot = R + λ + w_up + w_dn + w_hub + w_loc + w_ref   # total event rate incl. the MC-kernel event, the rung hops, the λ = 0 hub jumps and the L-moves
         # with a ladder the standard observables are read at the fully coupled rung only, after η is frozen
         coupled_now = ladder === nothing || (coupled(ladder) && !adapting(ladder))
         ladder_prod = ladder !== nothing && !adapting(ladder) && ev > burnin_events
@@ -2403,6 +2502,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             else
                 ekmc_mc_sweep!(ek, sys, ff, mc_δ, mc_δθ)
             end
+            lmoves === nothing || (lmoves.stale = true)
         elseif ladder !== nothing && ξev < λ + w_up + w_dn
             up = ξev < λ + w_up
             knew = up ? ladder.k + 1 : ladder.k - 1
@@ -2416,6 +2516,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
                 ek.lam[sfr] = ladder.λ[knew]; ek.c[sfr] = ladder.csol[knew]
                 update_rigid_ekmc_after_move!(ek, sys, ff, sfr)
                 sflex && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
+                lmoves === nothing || (lmoves.stale = true)
                 ladder.n_recouple += 1
                 ladder_prod && ladder_landing!(ladder, sys.β * ek.frac_u)     # a λ = 0 sample of βu_s (jump-chain identity)
             else
@@ -2438,6 +2539,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
                 ek.lam[sfr] = ladder.λ[knew]; ek.c[sfr] = ladder.csol[knew]
                 update_rigid_ekmc_after_move!(ek, sys, ff, sfr)
                 sflex && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
+                lmoves === nothing || (lmoves.stale = true)
                 ladder.n_recouple += 1
                 ladder_prod && ladder_landing!(ladder, sys.β * ek.frac_u)     # uniform pose: a λ = 0 sample of βu_s
             else
@@ -2448,6 +2550,18 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             end
             ladder.k = knew
             ladder_prod && (ladder.n_jump[knew] += 1)
+        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc
+            # L-move of the fractional molecule (DESIGN §11.2): slot chosen ∝ its rate, inverse stored in the slot
+            sfr = lmoves.mol
+            jfired = lm_fire!(lmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub))
+            lmoves.kinds[jfired] == LM_C && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
+            if ladder_prod
+                lmoves.n_move_rung[ladder.k] += 1
+                ladder_pose_moved!(ladder)
+            end
+        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc + w_ref
+            sfr = lmoves.mol
+            lm_refresh!(lmoves, sys, isflexible(sys.templates[sys.tmpl[sfr]]) ? reservoirs[sys.tmpl[sfr]] : nothing)
         else
             k = select_by_mobility(ek, sys.rng)
             L = sys.L
@@ -2491,6 +2605,16 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             # landing energy u′_k: a Widom insertion sample into the (N−1)-system (jump-chain identity, DESIGN §10.3)
             bar !== nothing && ev > burnin_events && coupled_now && sys.tmpl[k] == bar_species && push_landing!(bar, sys.β * ek.phi[k])
             kflex && (Uin[k] = flex_intra_energy(sys.templates[sys.tmpl[k]], ff, sys.body[k]))
+            if lmoves !== nothing
+                if k == lmoves.mol
+                    lmoves.stale = true
+                    ladder_prod && ladder_pose_moved!(ladder)
+                elseif ek.lam[lmoves.mol] > 0.0
+                    lm_molecule_moved!(lmoves, sys, ff, k)
+                else
+                    lmoves.stale = true                     # λ = 0: rebuild at the next recoupling instead
+                end
+            end
             n_reloc += 1
         end
         ek.events += 1
@@ -2503,6 +2627,10 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             (maximum(abs.(phi_saved .- ek.phi)) > 1e-8 || abs(R_saved - ek.R) / ek.R > 1e-8 ||
              abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))) &&
                 @warn "rigid eKMC bookkeeping drift" maximum(abs.(phi_saved .- ek.phi)) abs(R_saved - ek.R) / ek.R
+            if lmoves !== nothing && !lmoves.stale
+                cu = copy(lmoves.cand_u); lm_rebuild!(lmoves, sys, ff)
+                maximum(abs.(cu .- lmoves.cand_u)) > 1e-8 && @warn "L-move candidate energy drift" maximum(abs.(cu .- lmoves.cand_u))
+            end
         end
         if Pext !== nothing && ev >= next_vol
             next_vol += vol_period
@@ -2584,7 +2712,7 @@ function rigid_ekmc_results(r::RigidEKMCRun)
             t_total=t_total, ek=ek, vol_moves=vol_moves, max_dV=max_dV_current, dV_history=dV_history,
             mc_events=ek.mc_events, mc_acceptance=ek.mc_trials > 0 ? ek.mc_accepted / ek.mc_trials : NaN,
             RN_species=ba_RNs, trace_phi=trace_phi, trace_dt=trace_dt,
-            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui, bar=r.bar, ladder=r.ladder)
+            fast_events=n_fast, bursts=n_bursts, relocations=n_reloc, U_intra=ba_Ui, bar=r.bar, ladder=r.ladder, lmoves=r.lmoves)
 end
 
 """
@@ -2658,6 +2786,11 @@ accumulators give `ladder_mu_occupancy` and `ladder_mu_mbar`; `ladder_summary` r
 `ladder_adapt_blocks=true` re-flattens η at every production block boundary from the previous block's rung times (the
 occupancy estimator uses the η in force in each block; MBAR is η-independent) — for solvents where WL cannot converge
 within its budget (water, JOURNAL entry 45).
+`ladder_jump_max=m` limits the hub to rungs 3…m (both directions). `ladder_local=true` adds rejection-free local moves of the
+fractional molecule at every rung with λ > 0 (`LocalMoves`, DESIGN §11.2): `local_kinds` slots (default 3 translations,
+3 rotations, 2 conformer swaps if flexible), half-widths `local_a` (default `mc_δ`) and `local_θ` (default `mc_δθ`),
+per-candidate prefactor `local_nu` and refresh rate `local_nuD` (both default `ladder_nu`); counters in `lmoves`,
+residence diagnostics (`res_frac`, `pose_frac`) in `ladder_summary`.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -2673,7 +2806,9 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
                          ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
-                         mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN)
+                         mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
+                         ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
+                         local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
                             sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
                             adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
@@ -2685,7 +2820,9 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
                             ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac,
                             ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, mc_local_radius=mc_local_radius,
-                            ladder_jump=ladder_jump, ladder_jump_nu=ladder_jump_nu)
+                            ladder_jump=ladder_jump, ladder_jump_nu=ladder_jump_nu, ladder_jump_max=ladder_jump_max,
+                            ladder_local=ladder_local, local_kinds=local_kinds, local_a=local_a, local_θ=local_θ,
+                            local_nu=local_nu, local_nuD=local_nuD)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
 end

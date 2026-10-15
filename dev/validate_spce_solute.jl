@@ -24,7 +24,9 @@ Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAM
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
-SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace).
+SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
+DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool). mc_sweeps = 0 runs the
+MC-free pipeline (DESIGN §11.3): SPCE_EKMC_BURNIN, SPCE_NU_PILOT events of stock eKMC replace the Metropolis stage.
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
@@ -57,6 +59,15 @@ ladder_ramp_kJ = parse(Float64, get(ENV, "SPCE_LADDER_RAMP", "NaN"))  # βμ_gue
 ladder_adapt = get(ENV, "SPCE_LADDER_ADAPT", "0") == "1"   # re-flatten η at production block boundaries
 ladder_jump = get(ENV, "SPCE_LADDER_JUMP", "0") == "1"     # λ = 0 hub: direct jumps 1 ↔ m ≥ 3, no fractional relocation at m ≥ 3 (JOURNAL 56)
 mc_local_A = parse(Float64, get(ENV, "SPCE_MC_LOCAL", "0"))   # Å: MC-kernel sweeps restricted to this radius around the solute (0 = full sweeps)
+local_on = get(ENV, "SPCE_LOCAL", "0") == "1"             # rejection-free local moves of the fractional molecule (DESIGN §11.2)
+jump_max = parse(Int, get(ENV, "SPCE_JUMP_MAX", "0"))       # hub limited to rungs 3…SPCE_JUMP_MAX (0 = all)
+res_mode = get(ENV, "SPCE_RESERVOIR", "mc")                 # conformer pool: mc (vacuum Metropolis) | ekmc (vacuum rejection-free, §11.3 E3)
+res_mode in ("mc", "ekmc") || error("SPCE_RESERVOIR must be mc or ekmc")
+# mc_sweeps = 0: MC-free pipeline (DESIGN §11.3, user 2026-10-14): E1 eKMC burn-in of SPCE_EKMC_BURNIN events (default
+# 4000·(N+1), the per-molecule move count of the Metropolis stage), E2 ν and the η-ramp guess from a stock eKMC pilot of
+# SPCE_NU_PILOT events (default the same) — time-weighted ⟨(1/N_w) Σ exp(βu_i)⟩ of the water, the canonical quantity ⟨R⟩_MC estimates
+ekmc_burnin = parse(Int, get(ENV, "SPCE_EKMC_BURNIN", string(4000 * (N + 1))))
+nu_pilot = parse(Int, get(ENV, "SPCE_NU_PILOT", string(4000 * (N + 1))))
 trace = get(ENV, "SPCE_TRACE", "1") == "1"   # per-event solute (u, Δt) trace for the tail report (16 bytes/event: off for ≳ 1e8 events)
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -103,10 +114,12 @@ function setup_and_mc(io)
     res = nothing
     if flex
         t0 = time()
-        res = MCm.build_reservoir(m.templates, 2, ff, 1 / T, Xoshiro(seed + 7919); M=20000, burnin_sweeps=2000, stride_sweeps=20, δ=0.03)
+        res = res_mode == "mc" ?
+            MCm.build_reservoir(m.templates, 2, ff, 1 / T, Xoshiro(seed + 7919); M=20000, burnin_sweeps=2000, stride_sweeps=20, δ=0.03) :
+            MCm.build_reservoir_ekmc(m.templates, 2, ff, 1 / T, Xoshiro(seed + 7919); M=20000, burnin_sweeps=2000, stride_sweeps=20, δ=0.03)
         Ures = sum(res.U_intra) / length(res.U_intra)
-        @printf(io, "# conformer reservoir: %d conformers, acceptance %.3f, <U_intra>_ideal = %.3f ± %.3f kJ/mol, %.1f s\n",
-                length(res.confs), res.acceptance, Ures * kJmol_per_eps,
+        @printf(io, "# conformer reservoir (%s): %d conformers, acceptance %.3f, <U_intra>_ideal = %.3f ± %.3f kJ/mol, %.1f s\n",
+                res_mode == "mc" ? "vacuum Metropolis" : "vacuum rejection-free eKMC, acceptance = move fraction", length(res.confs), res.acceptance, Ures * kJmol_per_eps,
                 sqrt(sum(abs2, res.U_intra .- Ures) / length(res.U_intra)) / sqrt(length(res.U_intra) / 5) * kJmol_per_eps, time() - t0)
         flush(io)
     end
@@ -129,62 +142,82 @@ function setup_and_mc(io)
     E_const = MCm.coulomb_molecule_constant(m.solute, ff)
     println(io, "# solute Coulomb constant E_const = $(round(E_const * kJmol_per_eps; digits=4)) kJ/mol (model $(coulomb)); mu + E_const is the GROMACS-RF comparable value")
 
-    # --- Metropolis MC: equilibrate + production (Widom insertion and removal estimators of the solute) ---
-    st = MCm.RigidMCStats()
     δ = 0.1 / m.σ_angstrom * 3.0; δθ = 0.3
-    t0 = time()
-    for s in 1:(mc_sweeps ÷ 4)
-        for _ in 1:Nt
-            MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), δ, st)
-            MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), δθ, st)
-        end
-        if flex
-            for _ in 1:m.solute.n_sites
-                MCm.mc_site_move!(sys, ff, isol, 0.03, st)
+    if mc_sweeps > 0
+        # --- Metropolis MC: equilibrate + production (Widom insertion and removal estimators of the solute) ---
+        st = MCm.RigidMCStats()
+        t0 = time()
+        for s in 1:(mc_sweeps ÷ 4)
+            for _ in 1:Nt
+                MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), δ, st)
+                MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), δθ, st)
             end
-            MCm.mc_conformer_swap!(sys, ff, isol, res, st)
+            if flex
+                for _ in 1:m.solute.n_sites
+                    MCm.mc_site_move!(sys, ff, isol, 0.03, st)
+                end
+                MCm.mc_conformer_swap!(sys, ff, isol, res, st)
+            end
         end
-    end
-    println(io, "# MC equilibration $(mc_sweeps ÷ 4) sweeps: $(round(time() - t0; digits=1)) s, acc_t=$(st.trans_acc/st.trans_att), acc_r=$(st.rot_acc/st.rot_att)")
-    flush(io)
-    sys_mc = deepcopy(sys)
-    t0 = time()
-    mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
-                           block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
-                           inverse_widom_molecule=isol, R_every=20, reservoirs=reservoirs, δ_site=0.03)
-    t_mc = time() - t0
-    w, ew = MCm.mean(mc.widom), MCm.stderr(mc.widom)
-    iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
-    U_mc = (MCm.mean(mc.U) * Nt + const_E) / Nt * kJmol_per_eps
-    @printf(io, "MC   sweeps=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_sol_widom=%.2f ± %.2f kJ/mol  mu_sol_removal=%.2f ± %.2f kJ/mol  acc_t=%.3f acc_r=%.3f\n",
-            mc_sweeps, t_mc, U_mc, MCm.stderr(mc.U) * kJmol_per_eps,
-            MCm.mean(mc.P) * atm_per_pstar, MCm.stderr(mc.P) * atm_per_pstar,
-            (-T * log(w) + ΔU_tail) * kJmol_per_eps, T * ew / w * kJmol_per_eps,
-            (T * log(iw) + ΔU_tail) * kJmol_per_eps, T * eiw / iw * kJmol_per_eps,
-            mc.stats.trans_acc / mc.stats.trans_att, mc.stats.rot_acc / mc.stats.rot_att)
-    flex && @printf(io, "# MC flexible solute: <U_intra> = %.3f ± %.3f kJ/mol (ideal gas %.3f); site acc %.3f, conformer-swap acc %.3f\n",
-                    MCm.mean(mc.U_intra) * kJmol_per_eps, MCm.stderr(mc.U_intra) * kJmol_per_eps, Ures * kJmol_per_eps,
-                    mc.stats.site_acc / max(mc.stats.site_att, 1), mc.stats.swap_acc / max(mc.stats.swap_att, 1))
-    println(io, "# MC removal-estimator block μ (kJ/mol): ", join(round.((T .* log.(mc.inv_widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
-    println(io, "# MC Widom block μ (kJ/mol):             ", join(round.((-T .* log.(mc.widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
-    flush(io)
+        println(io, "# MC equilibration $(mc_sweeps ÷ 4) sweeps: $(round(time() - t0; digits=1)) s, acc_t=$(st.trans_acc/st.trans_att), acc_r=$(st.rot_acc/st.rot_att)")
+        flush(io)
+        sys_mc = deepcopy(sys)
+        t0 = time()
+        mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
+                               block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
+                               inverse_widom_molecule=isol, R_every=20, reservoirs=reservoirs, δ_site=0.03)
+        t_mc = time() - t0
+        w, ew = MCm.mean(mc.widom), MCm.stderr(mc.widom)
+        iw, eiw = MCm.mean(mc.inv_widom), MCm.stderr(mc.inv_widom)
+        U_mc = (MCm.mean(mc.U) * Nt + const_E) / Nt * kJmol_per_eps
+        @printf(io, "MC   sweeps=%d time=%.0fs  U/N=%.3f ± %.3f kJ/mol  P=%.1f ± %.1f atm  mu_sol_widom=%.2f ± %.2f kJ/mol  mu_sol_removal=%.2f ± %.2f kJ/mol  acc_t=%.3f acc_r=%.3f\n",
+                mc_sweeps, t_mc, U_mc, MCm.stderr(mc.U) * kJmol_per_eps,
+                MCm.mean(mc.P) * atm_per_pstar, MCm.stderr(mc.P) * atm_per_pstar,
+                (-T * log(w) + ΔU_tail) * kJmol_per_eps, T * ew / w * kJmol_per_eps,
+                (T * log(iw) + ΔU_tail) * kJmol_per_eps, T * eiw / iw * kJmol_per_eps,
+                mc.stats.trans_acc / mc.stats.trans_att, mc.stats.rot_acc / mc.stats.rot_att)
+        flex && @printf(io, "# MC flexible solute: <U_intra> = %.3f ± %.3f kJ/mol (ideal gas %.3f); site acc %.3f, conformer-swap acc %.3f\n",
+                        MCm.mean(mc.U_intra) * kJmol_per_eps, MCm.stderr(mc.U_intra) * kJmol_per_eps, Ures * kJmol_per_eps,
+                        mc.stats.site_acc / max(mc.stats.site_att, 1), mc.stats.swap_acc / max(mc.stats.swap_att, 1))
+        println(io, "# MC removal-estimator block μ (kJ/mol): ", join(round.((T .* log.(mc.inv_widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
+        println(io, "# MC Widom block μ (kJ/mol):             ", join(round.((-T .* log.(mc.widom.block_means) .+ ΔU_tail) .* kJmol_per_eps; digits=2), " "))
+        flush(io)
+
 
     # --- eKMC (MC-kernel hybrid) from the same equilibrated configuration ---
     t0 = time()
-    # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
-    # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
-    R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
-    # species rate scaling: the solute gets the share SPCE_SOLUTE_SHARE of the relocation bursts (exact:
-    # a constant factor on one species' rate keeps detailed balance, DESIGN §5c / JOURNAL entry 19)
     share = parse(Float64, get(ENV, "SPCE_SOLUTE_SHARE", "0"))     # 0 = no rate scaling (default; equal-rate scaling fails for strongly bound solutes, JOURNAL entry 20)
-    R_w = isfinite(R_mc) ? MCm.mean(mc.R_species[1]) : NaN
-    R_s = isfinite(R_mc) ? MCm.mean(mc.R_species[2]) : NaN
+    if mc_sweeps > 0
+        # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
+        # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
+        R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
+        # species rate scaling: the solute gets the share SPCE_SOLUTE_SHARE of the relocation bursts (exact:
+        # a constant factor on one species' rate keeps detailed balance, DESIGN §5c / JOURNAL entry 19)
+        R_w = isfinite(R_mc) ? MCm.mean(mc.R_species[1]) : NaN
+        R_s = isfinite(R_mc) ? MCm.mean(mc.R_species[2]) : NaN
+        R_mc_err = isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)
+    else
+        # E1 + E2: stock eKMC (solute fully coupled, no ladder) burn-in then pilot; ν etc. from the pilot's time averages
+        tp = time()
+        rp = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_burnin + nu_pilot, burnin_events=ekmc_burnin, sample_every=100,
+                                     block_events=max(25, nu_pilot ÷ 25), species_mu=true, reservoirs=reservoirs)
+        MCm.advance_rigid_ekmc!(rp, sys, ff)
+        rpr = MCm.rigid_ekmc_results(rp)
+        R_w = MCm.ratio_mean(rpr.RN_species[1]); R_s = MCm.ratio_mean(rpr.RN_species[2])
+        R_mc = R_w * N / Nt + R_s / Nt                               # per-molecule ⟨R/N⟩ as ⟨R⟩_MC
+        R_mc_err = R_w * MCm.ratio_jackknife_stderr(rpr.RN_species[1])
+        iw = R_s                                                     # stock eKMC removal estimate exp(βμ) of the solute
+        @printf(io, "# MC-free setup (DESIGN §11.3): eKMC burn-in %d events + pilot %d events, %.0f s; pilot U/N=%.3f kJ/mol  <R_water>=%.4e  <exp(βu_solute)>=%.4e (mu_sol_removal=%.2f kJ/mol)\n",
+                ekmc_burnin, nu_pilot, time() - tp, (MCm.mean(rpr.U) * Nt + const_E) / Nt * kJmol_per_eps, R_w, R_s,
+                (T * log(R_s) + ΔU_tail) * kJmol_per_eps)
+        flush(io)
+    end
     c_sol = (share > 0 && isfinite(R_w) && isfinite(R_s) && R_s > 0) ? share / (1 - share) * R_w / R_s : 1.0
     R_eff = isfinite(R_mc) ? R_w + c_sol * R_s : NaN
     λ = λfac > 0 ? λfac * (isfinite(R_eff) ? R_eff : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
     println(io, "# species rate scale: <R_water>_MC=$(R_w)  <R_solute>_MC=$(R_s)  c_solute=$(c_sol)  (solute share $(share))"); flush(io)
-    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(isempty(mc.R.block_means) ? NaN : MCm.stderr(mc.R)), source=$(isfinite(R_mc) ? "mc" : "pilot"))"); flush(io)
+    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(R_mc_err), source=$(mc_sweeps > 0 ? (isfinite(R_mc) ? "mc" : "pilot") : "eKMC pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     r = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                                 debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
@@ -192,8 +225,10 @@ function setup_and_mc(io)
                                 bar_species=bar_on ? 2 : 0, ladder_solute=ladder_on ? isol : 0, ladder_lambda=ladder_λ,
                                 ladder_nu=ladder_on ? ladder_νfac * R_mc : NaN, ladder_wl_events=ladder_on ? round(Int, ladder_wlfrac * ekmc_events) : 0,
                                 ladder_eta_ramp=ladder_on ? (isnan(ladder_ramp_kJ) ? log(iw) : ladder_ramp_kJ / kJmol_per_eps / T) : 0.0,   # βμ guess: SPCE_LADDER_RAMP or the MC removal estimator
-                                ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump)
+                                ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
+                                ladder_jump_max=jump_max, ladder_local=local_on)
     ladder_on && println(io, "# coupling ladder: λ = $(ladder_λ), ν = $(ladder_νfac)·⟨R⟩_MC = $(ladder_νfac * R_mc), Wang–Landau over the first $(round(Int, ladder_wlfrac * ekmc_events)) events; λ=0 hub $(ladder_jump); U, P, μ_water, mu_sol read at the coupled rung only")
+    local_on && println(io, "# L-moves (DESIGN §11.2): slots $(r.lmoves.kinds) (1 T, 2 R, 3 C), a = $(round(r.lmoves.a * m.σ_angstrom; digits=3)) Å, θ_max = $(r.lmoves.θmax) rad, ν_L = ν_D = $(r.lmoves.ν); hub limited to rungs ≤ $(r.ladder.jump_max)")
     mc_local_A > 0 && println(io, "# MC kernel: local sweeps within $(mc_local_A) Å of the solute (rate λ = $(λfac)·⟨R⟩_MC)")
     trace || println(io, "# solute trace off (SPCE_TRACE=0): no tail diagnostics; the trace costs 16 bytes per event")
     ctx = (; out, T, kJmol_per_eps, atm_per_pstar, ΔU_tail, E_const, const_E, Nt, flex, Ures=flex ? Ures : NaN, coulomb, ekmc_events, t_ek=0.0)
@@ -237,6 +272,10 @@ function ekmc_report(io, ek, ctx)
                 sm.n_recouple, sm.n_decouple, sm.wl_stages, sm.ev_frozen, sm.wl_f)
         println(io, "# eKMC ladder time fraction per rung: ", join(round.(sm.frac_rung; digits=4), " "), "  η = ", join(round.(sm.η; digits=3), " "),
                 "  hops per rung (arrivals) = ", join(sm.n_hop, " "), "  hub jumps (arrivals) = ", join(sm.n_jump, " "))
+        println(io, "# eKMC ladder D0: longest rung residence / rung time = ", join(round.(sm.res_frac; digits=4), " "),
+                "  longest pose residence / rung time = ", join(round.(sm.pose_frac; digits=4), " "))
+        ek.lmoves === nothing || println(io, "# eKMC L-moves fired per kind (T R C) = ", join(ek.lmoves.n_move, " "), "  per rung (production) = ",
+                                        join(ek.lmoves.n_move_rung, " "), "  refreshes = ", ek.lmoves.n_refresh, "  candidate rebuilds = ", ek.lmoves.n_rebuild)
         nb = MCm.nblocks(ek.ladder)
         println(io, "# eKMC ladder block occupancy μ (kJ/mol): ", join([(t = ek.ladder.t_rung[b]; (t[1] > 0 && t[end] > 0) ?
                 round((T * ((ek.ladder.η[end] - ek.ladder.η[1]) - log(t[end] / t[1]))) * kJmol_per_eps + corr; digits=2) : NaN) for b in 1:nb], " "))

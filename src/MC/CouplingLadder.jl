@@ -13,7 +13,7 @@ Optional λ = 0 hub (`jump=true`, JOURNAL entry 56): direct jumps between rung 1
 
     m → 1:  w = a exp(½(η_1 − η_m)) exp(βλ_m u_s)        1 → m:  w = a exp(½(η_m − η_1)), pose (and conformer) uniform
 
-(the 1 ↔ 2 hops above are the m = 2 case), and NO same-rung relocation of the fractional molecule at rungs ≥ 3
+(the 1 ↔ 2 hops above are the m = 2 case; `jump_max` < K limits the hub to rungs 3…jump_max, both directions), and NO same-rung relocation of the fractional molecule at rungs ≥ 3
 (c_m = 0). A uniform relocation of a large solute at an intermediate rung lands on solvent ~10⁵ times before it lands
 well (ethanol in SPC/E), and every such bounce is an event; here the molecule leaves any rung for λ = 0 in one event,
 and a bad landing at rung m leaves again at once (its jump rate carries exp(βλ_m u_s)), so a failed recoupling costs
@@ -74,12 +74,20 @@ mutable struct CouplingLadder
     jump::Bool
     jump_ν::Float64
     n_jump::Vector{Int}                        # production hub jumps per arrival rung
+    jump_max::Int                              # hub jumps connect rung 1 with rungs 3…jump_max only (default K)
+    # residence diagnostics (DESIGN §11.1 D0, production): longest uninterrupted stay per rung, and longest stay per rung
+    # without any move of the fractional molecule (pose residence; closed by ladder_pose_moved! and by rung changes)
+    res_k::Int
+    res_t::Float64
+    res_max::Vector{Float64}
+    pres_t::Float64
+    pres_max::Vector{Float64}
 end
 function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η::Union{Nothing,Vector{Float64}}=nothing,
                         ν::Float64, wl_events::Int=0, wl_f0::Float64=1.0, wl_fmin::Float64=1e-3, wl_flat::Float64=0.8,
                         βu_min::Float64=-150.0, βu_max::Float64=1050.0, dβu::Float64=0.1,
                         csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0,
-                        jump::Bool=false, jump_ν::Float64=ν)
+                        jump::Bool=false, jump_ν::Float64=ν, jump_max::Int=length(λ))
     K = length(λ)
     K >= 2 || error("CouplingLadder: at least two rungs")
     (λ[1] == 0.0 && λ[end] == 1.0 && issorted(λ) && allunique(λ)) || error("CouplingLadder: λ must increase from 0 to 1")
@@ -87,11 +95,12 @@ function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η:
     ηv = η === nothing ? zeros(K) : copy(η)
     length(ηv) == K || error("CouplingLadder: η needs one weight per rung")
     nb = ceil(Int, (βu_max - βu_min) / dβu)
+    3 <= jump_max <= K || error("CouplingLadder: jump_max must be in 3…K")
     CouplingLadder(solute, copy(λ), ηv, K, ν, wl_events > 0 ? wl_f0 : 0.0, wl_fmin, wl_flat, zeros(K), wl_events,
                    0, wl_events > 0 ? 0 : -1, block_events, 0, βu_min, dβu, nb,
                    Vector{Float64}[], Vector{Float64}[], Vector{Vector{Float64}}[], zeros(Int, K), 0, 0,
                    _hub_csol(csol === nothing ? ones(K) : copy(csol), jump), adapt_blocks, adapt_damp, Vector{Float64}[],
-                   jump, jump_ν, zeros(Int, K))
+                   jump, jump_ν, zeros(Int, K), jump_max, 0, 0.0, zeros(K), 0.0, zeros(K))
 end
 # with the λ = 0 hub the fractional molecule is not relocated at rungs ≥ 3 (it moves through rung 1)
 function _hub_csol(c::Vector{Float64}, jump::Bool)
@@ -161,25 +170,24 @@ function hub_rate(L::CouplingLadder, β::Float64, u_s::Float64)
     k = L.k; K = nrungs(L)
     if k == 1
         w = 0.0
-        for m in 3:K
+        for m in 3:L.jump_max
             w += L.jump_ν * exp(min(0.5 * (L.η[m] - L.η[1]), MOBILITY_LOG_MAX))
         end
         return w
-    elseif k >= 3
+    elseif 3 <= k <= L.jump_max
         return L.jump_ν * exp(min(0.5 * (L.η[1] - L.η[k]) + β * L.λ[k] * u_s, MOBILITY_LOG_MAX))
     end
     return 0.0
 end
-"Target rung of a hub jump from rung 1, drawn ∝ e^{½(η_m − η_1)}, m ≥ 3."
+"Target rung of a hub jump from rung 1, drawn ∝ e^{½(η_m − η_1)}, 3 ≤ m ≤ jump_max."
 function hub_target(L::CouplingLadder, rng)
-    K = nrungs(L)
-    w = [exp(min(0.5 * (L.η[m] - L.η[1]), MOBILITY_LOG_MAX)) for m in 3:K]
+    w = [exp(min(0.5 * (L.η[m] - L.η[1]), MOBILITY_LOG_MAX)) for m in 3:L.jump_max]
     ξ = rand(rng) * sum(w)
     for (i, x) in enumerate(w)
         ξ < x && return i + 2
         ξ -= x
     end
-    return K
+    return L.jump_max
 end
 
 """
@@ -217,8 +225,27 @@ function ladder_time!(L::CouplingLadder, βu_s::Float64, dt::Float64)
     L.n_ev += 1
     b = _lblock(L); _ensure_lblock!(L, b)
     k = L.k
+    if k != L.res_k                                     # a new residence: close the previous one
+        _close_residence!(L)
+        L.res_k = k
+    end
+    L.res_t += dt; L.pres_t += dt
     L.t_rung[b][k] += dt; L.t2_rung[b][k] += dt * dt
     k > 1 && (L.hist[b][k][_lbin(L, βu_s)] += dt)
+    return nothing
+end
+function _close_residence!(L::CouplingLadder)
+    if L.res_k > 0
+        L.res_max[L.res_k] = max(L.res_max[L.res_k], L.res_t)
+        L.pres_max[L.res_k] = max(L.pres_max[L.res_k], L.pres_t)
+    end
+    L.res_t = 0.0; L.pres_t = 0.0
+    return nothing
+end
+"Production: the fractional molecule has moved without a rung change (closes the pose residence)."
+function ladder_pose_moved!(L::CouplingLadder)
+    L.res_k > 0 && (L.pres_max[L.res_k] = max(L.pres_max[L.res_k], L.pres_t))
+    L.pres_t = 0.0
     return nothing
 end
 "Production: a recoupling landing with bare solute energy βu_s′ (a λ = 0 sample)."
@@ -357,7 +384,15 @@ function ladder_summary(L::CouplingLadder)
     t = zeros(K)
     for b in 1:nblocks(L); t .+= L.t_rung[b]; end
     land = sum(sum(L.hist[b][1]) for b in 1:nblocks(L); init=0.0)
+    # D0: longest residence (rung; pose) per rung as a fraction of that rung's production time, the open one included
+    rmax = copy(L.res_max); pmax = copy(L.pres_max)
+    if L.res_k > 0
+        rmax[L.res_k] = max(rmax[L.res_k], L.res_t); pmax[L.res_k] = max(pmax[L.res_k], L.pres_t)
+    end
+    res_frac = [t[k] > 0 ? rmax[k] / t[k] : NaN for k in 1:K]
+    pose_frac = [t[k] > 0 ? pmax[k] / t[k] : NaN for k in 1:K]
     return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_jump=copy(L.n_jump), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
             landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f,
-            adapt_blocks=L.adapt_blocks, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]))
+            adapt_blocks=L.adapt_blocks, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]),
+            res_frac=res_frac, pose_frac=pose_frac)
 end
