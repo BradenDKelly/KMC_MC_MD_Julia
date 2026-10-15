@@ -26,7 +26,8 @@ SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), S
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
 SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
 DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool). mc_sweeps = 0 runs the
-MC-free pipeline (DESIGN §11.3): SPCE_EKMC_BURNIN, SPCE_NU_PILOT events of stock eKMC replace the Metropolis stage.
+MC-free pipeline (DESIGN §11.3): SPCE_EKMC_BURNIN, SPCE_NU_PILOT events of stock eKMC replace the Metropolis stage;
+SPCE_NU_SOURCE=ekmc with mc_sweeps > 0 keeps MC only as the starting configuration and takes ν from an eKMC pilot.
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
@@ -68,6 +69,11 @@ res_mode in ("mc", "ekmc") || error("SPCE_RESERVOIR must be mc or ekmc")
 # SPCE_NU_PILOT events (default the same) — time-weighted ⟨(1/N_w) Σ exp(βu_i)⟩ of the water, the canonical quantity ⟨R⟩_MC estimates
 ekmc_burnin = parse(Int, get(ENV, "SPCE_EKMC_BURNIN", string(4000 * (N + 1))))
 nu_pilot = parse(Int, get(ENV, "SPCE_NU_PILOT", string(4000 * (N + 1))))
+# ν source when the Metropolis stage runs: mc (⟨R⟩ of the MC production, default) | ekmc (stock eKMC pilot of SPCE_NU_PILOT events
+# from the MC-equilibrated configuration, no extra burn-in: MC then only supplies the starting configuration; JOURNAL 65)
+nu_source = get(ENV, "SPCE_NU_SOURCE", mc_sweeps > 0 ? "mc" : "ekmc")
+nu_source in ("mc", "ekmc") || error("SPCE_NU_SOURCE must be mc or ekmc")
+mc_sweeps == 0 && nu_source == "mc" && error("SPCE_NU_SOURCE=mc needs mc_sweeps > 0")
 trace = get(ENV, "SPCE_TRACE", "1") == "1"   # per-event solute (u, Δt) trace for the tail report (16 bytes/event: off for ≳ 1e8 events)
 
 m = MCm.spce_solute_model(solute; α_per_angstrom=α_A, rc_angstrom=10.0, cutoff=cutoff, coulomb=coulomb, epsilon_rf=ε_rf)
@@ -184,11 +190,12 @@ function setup_and_mc(io)
         flush(io)
 
 
+    end
     # --- eKMC (MC-kernel hybrid) from the same equilibrated configuration ---
     t0 = time()
     λ_from = get(ENV, "SPCE_LAMBDA_FROM", "mc")
     share = parse(Float64, get(ENV, "SPCE_SOLUTE_SHARE", "0"))     # 0 = no rate scaling (default; equal-rate scaling fails for strongly bound solutes, JOURNAL entry 20)
-    if mc_sweeps > 0
+    if nu_source == "mc"
         # λ = λfac × ⟨R⟩: ⟨R⟩ from the Metropolis production samples (relaxed-state relocation rate, robust) unless
         # SPCE_LAMBDA_FROM=pilot asks for the old 2e4-event pure-eKMC pilot (which can miss the relaxed states)
         R_mc = (λ_from == "mc" && !isempty(mc.R.block_means)) ? MCm.mean(mc.R) : NaN
@@ -200,16 +207,17 @@ function setup_and_mc(io)
     else
         # E1 + E2: stock eKMC (solute fully coupled, no ladder) burn-in then pilot; ν etc. from the pilot's time averages
         tp = time()
-        rp = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_burnin + nu_pilot, burnin_events=ekmc_burnin, sample_every=100,
+        nb_in = mc_sweeps > 0 ? 0 : ekmc_burnin                    # after a Metropolis stage: pilot only
+        rp = MCm.init_rigid_ekmc_run(sys, ff; events=nb_in + nu_pilot, burnin_events=nb_in, sample_every=100,
                                      block_events=max(25, nu_pilot ÷ 25), species_mu=true, reservoirs=reservoirs)
         MCm.advance_rigid_ekmc!(rp, sys, ff)
         rpr = MCm.rigid_ekmc_results(rp)
         R_w = MCm.ratio_mean(rpr.RN_species[1]); R_s = MCm.ratio_mean(rpr.RN_species[2])
         R_mc = R_w * N / Nt + R_s / Nt                               # per-molecule ⟨R/N⟩ as ⟨R⟩_MC
         R_mc_err = R_w * MCm.ratio_jackknife_stderr(rpr.RN_species[1])
-        iw = R_s                                                     # stock eKMC removal estimate exp(βμ) of the solute
-        @printf(io, "# MC-free setup (DESIGN §11.3): eKMC burn-in %d events + pilot %d events, %.0f s; pilot U/N=%.3f kJ/mol  <R_water>=%.4e  <exp(βu_solute)>=%.4e (mu_sol_removal=%.2f kJ/mol)\n",
-                ekmc_burnin, nu_pilot, time() - tp, (MCm.mean(rpr.U) * Nt + const_E) / Nt * kJmol_per_eps, R_w, R_s,
+        mc_sweeps > 0 || (iw = R_s)                                  # η-ramp guess: MC removal estimate if MC ran, else the stock eKMC one
+        @printf(io, "# eKMC setup (DESIGN §11.3; MC stage %s): eKMC burn-in %d events + pilot %d events, %.0f s; pilot U/N=%.3f kJ/mol  <R_water>=%.4e  <exp(βu_solute)>=%.4e (mu_sol_removal=%.2f kJ/mol)\n",
+                mc_sweeps > 0 ? "ran, start configuration only" : "off", nb_in, nu_pilot, time() - tp, (MCm.mean(rpr.U) * Nt + const_E) / Nt * kJmol_per_eps, R_w, R_s,
                 (T * log(R_s) + ΔU_tail) * kJmol_per_eps)
         flush(io)
     end
@@ -217,7 +225,7 @@ function setup_and_mc(io)
     R_eff = isfinite(R_mc) ? R_w + c_sol * R_s : NaN
     λ = λfac > 0 ? λfac * (isfinite(R_eff) ? R_eff : MCm.estimate_relocation_rate(deepcopy(sys), ff; events=20_000)) : 0.0
     println(io, "# species rate scale: <R_water>_MC=$(R_w)  <R_solute>_MC=$(R_s)  c_solute=$(c_sol)  (solute share $(share))"); flush(io)
-    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(R_mc_err), source=$(mc_sweeps > 0 ? (isfinite(R_mc) ? "mc" : "pilot") : "eKMC pilot"))"); flush(io)
+    println(io, "# eKMC fast_path=$(fast_path); MC-kernel hybrid: SPCE_LAMBDA=$(λfac), λ=$(λ) (⟨R⟩_MC=$(R_mc) ± $(R_mc_err), source=$(nu_source == "mc" ? (isfinite(R_mc) ? "mc" : "pilot") : "eKMC pilot"))"); flush(io)
     se = λfac > 0 ? 1 : 100
     r = MCm.init_rigid_ekmc_run(sys, ff; events=ekmc_events, overlap_fast_path=fast_path, sample_every=se, block_events=max(25, ekmc_events ÷ 25),
                                 debug_check_every=ekmc_events ÷ 10, mc_kernel_rate=λ, mc_δ=δ, mc_δθ=δθ,
