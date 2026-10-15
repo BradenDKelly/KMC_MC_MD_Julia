@@ -368,6 +368,60 @@ function total_intra_energy(sys::RigidSystem, ff::SiteForceField)::Float64
 end
 
 """
+    rotatable_bonds(t::RigidTemplate) -> Vector{Tuple{Int,Int,Vector{Int}}}
+
+Bonds (a, b) of a flexible template that are not in a ring and have at least one more atom on each side; for each,
+the atoms that a torsion move rotates (the smaller side, without its axis atom). Rotating that fragment about the
+a–b axis by φ is volume-preserving in Cartesian coordinates (an orthogonal map of the moved atoms; the axis atoms do
+not move) and its inverse is the rotation by −φ, so a symmetric φ density gives a symmetric proposal (JOURNAL 79–80).
+"""
+function rotatable_bonds(t::RigidTemplate)
+    bt = t.bonded
+    bt === nothing && return Tuple{Int,Int,Vector{Int}}[]
+    n = t.n_sites
+    adj = [Int[] for _ in 1:n]
+    for b in bt.bonds
+        push!(adj[b.i], b.j); push!(adj[b.j], b.i)
+    end
+    out = Tuple{Int,Int,Vector{Int}}[]
+    for b in bt.bonds
+        a, c = b.i, b.j
+        # side of c without crossing a–c
+        seen = falses(n); seen[c] = true; stack = [c]; ring = false
+        while !isempty(stack)
+            x = pop!(stack)
+            for y in adj[x]
+                (x == c && y == a) && continue
+                y == a && (ring = true; continue)
+                seen[y] || (seen[y] = true; push!(stack, y))
+            end
+        end
+        ring && continue
+        side_c = findall(seen); side_a = setdiff(1:n, side_c)
+        (length(side_c) >= 2 && length(side_a) >= 2) || continue
+        mov = length(side_c) <= length(side_a) ? setdiff(side_c, [c]) : setdiff(side_a, [a])
+        push!(out, (a, c, mov))
+    end
+    return out
+end
+
+"Rotate the sites `mov` of X (3 × n, any frame) by φ about the axis through sites a and b (Rodrigues)."
+function rotate_fragment!(X::AbstractMatrix{Float64}, a::Int, b::Int, mov::Vector{Int}, φ::Float64)
+    ux = X[1, b] - X[1, a]; uy = X[2, b] - X[2, a]; uz = X[3, b] - X[3, a]
+    nu = sqrt(ux^2 + uy^2 + uz^2); ux /= nu; uy /= nu; uz /= nu
+    cφ = cos(φ); sφ = sin(φ)
+    @inbounds for m in mov
+        vx = X[1, m] - X[1, a]; vy = X[2, m] - X[2, a]; vz = X[3, m] - X[3, a]
+        d = ux * vx + uy * vy + uz * vz
+        cx = uy * vz - uz * vy; cy = uz * vx - ux * vz; cz = ux * vy - uy * vx
+        X[1, m] = X[1, a] + vx * cφ + cx * sφ + ux * d * (1 - cφ)
+        X[2, m] = X[2, a] + vy * cφ + cy * sφ + uy * d * (1 - cφ)
+        X[3, m] = X[3, a] + vz * cφ + cz * sφ + uz * d * (1 - cφ)
+    end
+    return X
+end
+
+"""
     ConformerReservoir
 
 Sample of isolated-molecule (ideal-gas) conformations of one flexible template, p_id(c) ∝ exp(−βU_intra(c)),
@@ -386,17 +440,21 @@ struct ConformerReservoir
 end
 
 """
-    build_reservoir(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03)
+    build_reservoir(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03,
+                    torsion=false, φmax=π)
 
 Vacuum Metropolis MC on one molecule of `template_idx`: a sweep = one displacement attempt per site
 (uniform in a cube of half-side δ, reduced units). `M` conformations are stored every `stride_sweeps`
-sweeps after `burnin_sweeps`.
+sweeps after `burnin_sweeps`. `torsion=true` adds, per sweep, one rigid-fragment torsion attempt per rotatable bond
+(random bond, φ uniform in [−φmax, φmax], `rotatable_bonds`): single-site steps of δ do not cross heavy-atom torsion
+barriers (1-propanol C–C–C–O: 0 flips in 4e5 sweeps, JOURNAL 79).
 """
 function build_reservoir(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
                          rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
-                         δ::Float64=0.03)
+                         δ::Float64=0.03, torsion::Bool=false, φmax::Float64=Float64(π))
     t = templates[template_idx]
     isflexible(t) || error("build_reservoir: template $(t.name) is rigid")
+    rb = torsion ? rotatable_bonds(t) : Tuple{Int,Int,Vector{Int}}[]
     X = copy(t.sites_body)
     U = flex_intra_energy(t, ff, X)
     confs = Matrix{Float64}[]; Us = Float64[]
@@ -414,6 +472,18 @@ function build_reservoir(templates::Vector{RigidTemplate}, template_idx::Int, ff
                 U = Un; acc += 1
             else
                 X[1, k] = o1; X[2, k] = o2; X[3, k] = o3
+            end
+        end
+        for _ in 1:length(rb)                                  # torsion moves (torsion = true)
+            (a, b, mov) = rb[rand(rng, 1:length(rb))]
+            Xo = X[:, mov]
+            rotate_fragment!(X, a, b, mov, (2rand(rng) - 1) * φmax)
+            Un = flex_intra_energy(t, ff, X)
+            att += 1
+            if Un <= U || rand(rng) < exp(-β * (Un - U))
+                U = Un; acc += 1
+            else
+                X[:, mov] .= Xo
             end
         end
         if sweep > burnin_sweeps && (sweep - burnin_sweeps) % stride_sweeps == 0
@@ -436,13 +506,20 @@ rate νD redraws all slots. Conformers are recorded at equally spaced kMC times 
 chain gives draws from its stationary density e^{−βU_intra}); τ = stride_sweeps · n_sites · ⟨Δt⟩ of the burn-in
 (`burnin_sweeps` · n_sites events), i.e. the spacing of the Metropolis reservoir measured in events. `acceptance` of the
 result holds the fraction of events that were moves (not refreshes).
+`torsion=true` adds one slot per rotatable bond (`rotatable_bonds`): rotate the fragment by Φ_j (uniform in [−φmax, φmax]),
+store −Φ_j, rate ν exp(−½β ΔU_intra); the refresh redraws them too (JOURNAL 79–80: single-site slots alone do not cross
+heavy-atom torsion barriers).
 """
 function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
                               rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
-                              δ::Float64=0.03, ν::Float64=1.0, νD::Float64=1.0)
+                              δ::Float64=0.03, ν::Float64=1.0, νD::Float64=1.0, torsion::Bool=false, φmax::Float64=Float64(π))
     t = templates[template_idx]
     isflexible(t) || error("build_reservoir_ekmc: template $(t.name) is rigid")
     n = t.n_sites
+    rb = torsion ? rotatable_bonds(t) : Tuple{Int,Int,Vector{Int}}[]   # one torsion slot per rotatable bond (torsion = true)
+    nt = length(rb)
+    Φ = [(2rand(rng) - 1) * φmax for _ in 1:nt]
+    Ut = zeros(nt); wt = zeros(nt)
     X = copy(t.sites_body)
     U = flex_intra_energy(t, ff, X)
     D = [(2rand(rng) - 1) * δ for _ in 1:3, _ in 1:n]          # slot n: displacement of site n
@@ -452,6 +529,12 @@ function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::In
             for d in 1:3; X[d, k] += D[d, k]; end
             Uc[k] = flex_intra_energy(t, ff, X)
             for d in 1:3; X[d, k] -= D[d, k]; end
+        end
+        for j in 1:nt
+            (a, b, mov) = rb[j]
+            Xo = X[:, mov]
+            rotate_fragment!(X, a, b, mov, Φ[j]); Ut[j] = flex_intra_energy(t, ff, X)
+            X[:, mov] .= Xo
         end
     end
     cand!()
@@ -465,7 +548,11 @@ function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::In
         for k in 1:n
             w[k] = ν * exp(min(-0.5 * β * (Uc[k] - U), MOBILITY_LOG_MAX)); W += w[k]
         end
-        Rtot = W + νD
+        Wt = 0.0
+        for j in 1:nt
+            wt[j] = ν * exp(min(-0.5 * β * (Ut[j] - U), MOBILITY_LOG_MAX)); Wt += wt[j]
+        end
+        Rtot = W + Wt + νD
         ξ0 = rand(rng); ξ0 = max(eps(Float64), min(ξ0, 1.0 - eps(Float64)))
         dt = log(1 / ξ0) / Rtot
         nev += 1
@@ -493,9 +580,22 @@ function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::In
             for d in 1:3; X[d, k] += D[d, k]; D[d, k] = -D[d, k]; end
             U = Uc[k]
             nmoves += 1
+        elseif ξ < W + Wt
+            ξ -= W; j = nt
+            for i in 1:nt
+                ξ < wt[i] && (j = i; break)
+                ξ -= wt[i]
+            end
+            (a, b, mov) = rb[j]
+            rotate_fragment!(X, a, b, mov, Φ[j]); Φ[j] = -Φ[j]          # the slot now holds the move back
+            U = Ut[j]
+            nmoves += 1
         else
             for k in 1:n, d in 1:3
                 D[d, k] = (2rand(rng) - 1) * δ
+            end
+            for j in 1:nt
+                Φ[j] = (2rand(rng) - 1) * φmax
             end
         end
         cand!()
@@ -1322,8 +1422,9 @@ mutable struct RigidMCStats
     vol_att::Int; vol_acc::Int
     site_att::Int; site_acc::Int       # flexible molecules: single-site displacements
     swap_att::Int; swap_acc::Int       # flexible molecules: conformer exchanges with the reservoir
+    tors_att::Int; tors_acc::Int       # flexible molecules: rigid-fragment torsion rotations (JOURNAL 80)
 end
-RigidMCStats() = RigidMCStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+RigidMCStats() = RigidMCStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 "Metropolis translation of molecule i by a uniform random displacement in a cube of half-side δ."
 function mc_translate!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64, st::RigidMCStats)::Bool
@@ -1402,6 +1503,41 @@ function mc_site_move!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64
     ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.site_acc += 1
+        return true
+    end
+    _set_body!(sys, i, body_old); sys.ext[i] = ext_old
+    set_molecule!(sys, i, com_old, q_old)
+    return false
+end
+
+"""
+    mc_torsion_move!(sys, ff, i, φmax, st) -> accepted
+
+Metropolis torsion move of flexible molecule i (yardstick for the rejection-free LM_D slot, JOURNAL 80): a random
+rotatable bond (`rotatable_bonds`), the fragment rotated by φ uniform in [−φmax, φmax] in the body frame, body re-centred
+and the COM shifted at fixed orientation (volume-preserving, symmetric), accepted on ΔU_intra + ΔU_inter. Single-site
+moves alone do not cross heavy-atom torsion barriers (JOURNAL 79).
+"""
+function mc_torsion_move!(sys::RigidSystem, ff::SiteForceField, i::Int, φmax::Float64, st::RigidMCStats)::Bool
+    t = sys.templates[sys.tmpl[i]]
+    isflexible(t) || return false
+    rb = rotatable_bonds(t)
+    isempty(rb) && return false
+    st.tors_att += 1
+    u_old = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i])
+    com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
+    q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
+    body_old = copy(sys.body[i]); ext_old = sys.ext[i]
+    Y = copy(sys.body[i])
+    (a, b, mov) = rb[rand(sys.rng, 1:length(rb))]
+    rotate_fragment!(Y, a, b, mov, (2rand(sys.rng) - 1) * φmax)
+    c = (Y * t.site_mass) ./ sum(t.site_mass); Y .-= c
+    sh = quaternion_to_rotation_matrix(q_old) * c
+    _set_body!(sys, i, Y)
+    set_molecule!(sys, i, MVector{3,Float64}(com_old[1] + sh[1], com_old[2] + sh[2], com_old[3] + sh[3]), q_old)
+    ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
+    if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
+        st.tors_acc += 1
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1521,13 +1657,14 @@ hybrid's MC-kernel rate λ (λ = fac·⟨R⟩ gives a relocation fraction ≈ 1/
 eKMC pilot of 2e4 events estimates ⟨R⟩ as M/t_total and can miss the relaxed states entirely in a dense
 liquid (2026-10-12: λ from the pilot ranged over 1e-2 … 4e3 between seeds of the same system, and at λ ≫ R the
 solute is never relocated, so its μ degenerates to the Metropolis removal estimator).
+`torsion_φ > 0` adds, per sweep and flexible molecule, one `mc_torsion_move!` per rotatable bond (half-angle torsion_φ).
 """
 function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Float64, δθ::Float64,
                        Pext::Union{Nothing,Float64}=nothing, max_dlnV::Float64=0.1,
                        vol_every::Int=1, sample_every::Int=1, block_size::Int=10,
                        widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial,
                        inverse_widom_molecule::Int=0, R_every::Int=0,
-                       reservoirs::Union{Nothing,Vector}=nothing, δ_site::Float64=0.03)
+                       reservoirs::Union{Nothing,Vector}=nothing, δ_site::Float64=0.03, torsion_φ::Float64=0.0)
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
@@ -1555,6 +1692,11 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
             end
             if reservoirs !== nothing && reservoirs[sys.tmpl[i]] !== nothing
                 mc_conformer_swap!(sys, ff, i, reservoirs[sys.tmpl[i]], st)
+            end
+            if torsion_φ > 0.0                                             # torsion moves (JOURNAL 80)
+                for _ in 1:length(rotatable_bonds(sys.templates[sys.tmpl[i]]))
+                    mc_torsion_move!(sys, ff, i, torsion_φ, st)
+                end
             end
         end
         if Pext !== nothing && sweep % vol_every == 0
@@ -2258,6 +2400,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
+                         local_internal::Bool=false, local_site_a::Float64=0.03, local_φ::Float64=NaN,
                          local_solvent::Bool=false, solvent_kinds::Vector{Int}=Int[], solvent_a::Float64=NaN,
                          solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN)
     N = sys.n_mol
@@ -2337,12 +2480,19 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     if ladder_local
         ladder === nothing && error("run_rigid_ekmc!: ladder_local needs the coupling ladder (ladder_solute)")
         sflex = isflexible(sys.templates[sys.tmpl[ladder_solute]])
-        kinds = isempty(local_kinds) ? vcat(fill(LM_T, 3), fill(LM_R, 3), sflex ? fill(LM_C, 2) : Int[]) : local_kinds
-        (!sflex && any(==(LM_C), kinds)) && error("run_rigid_ekmc!: conformer slots for a rigid molecule")
+        kinds = isempty(local_kinds) ? vcat(fill(LM_T, 3), fill(LM_R, 3), sflex ? fill(LM_C, 2) : Int[]) : copy(local_kinds)
+        # local_internal (JOURNAL 80): + 4 single-site slots and, with a rotatable bond, 2 torsion slots
+        if local_internal && isempty(local_kinds)
+            sflex || error("run_rigid_ekmc!: local_internal needs a flexible fractional molecule")
+            append!(kinds, fill(LM_S, 4))
+            isempty(rotatable_bonds(sys.templates[sys.tmpl[ladder_solute]])) || append!(kinds, fill(LM_D, 2))
+        end
+        (!sflex && any(k -> k in (LM_C, LM_S, LM_D), kinds)) && error("run_rigid_ekmc!: conformer/site/torsion slots for a rigid molecule")
         lmoves = LocalMoves(sys, ladder_solute, length(ladder_lambda); kinds=kinds,
                             a=isnan(local_a) ? mc_δ : local_a, θmax=isnan(local_θ) ? mc_δθ : local_θ,
                             ν=isnan(local_nu) ? ladder_nu : local_nu, νD=isnan(local_nuD) ? ladder_nu : local_nuD,
-                            reservoir=sflex ? reservoirs[sys.tmpl[ladder_solute]] : nothing)
+                            reservoir=sflex ? reservoirs[sys.tmpl[ladder_solute]] : nothing,
+                            site_a=local_site_a, φmax=isnan(local_φ) ? mc_δθ : local_φ)
     end
     # rejection-free local moves of every rigid molecule except the fractional one (DESIGN §11.2 stage 2): default slots
     # 3 T + 3 R, half-widths mc_δ / mc_δθ, ν = solvent_nu (default ladder_nu; required without a ladder), ν_D = ν
@@ -2577,7 +2727,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             # L-move of the fractional molecule (DESIGN §11.2): slot chosen ∝ its rate, inverse stored in the slot
             sfr = lmoves.mol
             jfired = lm_fire!(lmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub))
-            lmoves.kinds[jfired] == LM_C && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
+            lmoves.kinds[jfired] in (LM_C, LM_S, LM_D) && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
             slmoves === nothing || slm_moved!(slmoves, sys, ff, sfr)
             if ladder_prod
                 lmoves.n_move_rung[ladder.k] += 1
@@ -2826,7 +2976,10 @@ within its budget (water, JOURNAL entry 45).
 `ladder_jump_max=m` limits the hub to rungs 3…m (both directions). `ladder_local=true` adds rejection-free local moves of the
 fractional molecule at every rung with λ > 0 (`LocalMoves`, DESIGN §11.2): `local_kinds` slots (default 3 translations,
 3 rotations, 2 conformer swaps if flexible), half-widths `local_a` (default `mc_δ`) and `local_θ` (default `mc_δθ`),
-per-candidate prefactor `local_nu` and refresh rate `local_nuD` (both default `ladder_nu`); counters in `lmoves`,
+per-candidate prefactor `local_nu` and refresh rate `local_nuD` (both default `ladder_nu`); `local_internal=true` (flexible
+fractional molecule, JOURNAL 80) adds 4 single-site slots (LM_S, half-width `local_site_a`, default 0.03 as the MC-stage site
+move) and, if the molecule has a rotatable bond, 2 torsion slots (LM_D, half-angle `local_φ`, default `mc_δθ`), whose rates
+carry ΔU_intra unscaled by λ; counters in `lmoves`,
 residence diagnostics (`res_frac`, `pose_frac`) in `ladder_summary`. `local_solvent=true` gives every rigid molecule other than
 the fractional one rejection-free local moves (`SolventLocalMoves`, DESIGN §11.2 stage 2): slots `solvent_kinds` (default 3
 translations + 3 rotations), half-widths `solvent_a`/`solvent_θ` (default `mc_δ`/`mc_δθ`), per-candidate prefactor `solvent_nu`
@@ -2849,6 +3002,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
+                         local_internal::Bool=false, local_site_a::Float64=0.03, local_φ::Float64=NaN,
                          local_solvent::Bool=false, solvent_kinds::Vector{Int}=Int[], solvent_a::Float64=NaN,
                          solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
@@ -2864,7 +3018,8 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, mc_local_radius=mc_local_radius,
                             ladder_jump=ladder_jump, ladder_jump_nu=ladder_jump_nu, ladder_jump_max=ladder_jump_max,
                             ladder_local=ladder_local, local_kinds=local_kinds, local_a=local_a, local_θ=local_θ,
-                            local_nu=local_nu, local_nuD=local_nuD, local_solvent=local_solvent, solvent_kinds=solvent_kinds,
+                            local_nu=local_nu, local_nuD=local_nuD, local_internal=local_internal, local_site_a=local_site_a,
+                            local_φ=local_φ, local_solvent=local_solvent, solvent_kinds=solvent_kinds,
                             solvent_a=solvent_a, solvent_θ=solvent_θ, solvent_nu=solvent_nu, solvent_nuD=solvent_nuD)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
