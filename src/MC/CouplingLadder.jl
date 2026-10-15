@@ -9,6 +9,16 @@ exp(β[H_k(x) − H_k(x∖i)])), rung hops are rejection-free events:
                            landing energy is a sample of the λ = 0 ensemble (jump-chain identity)
     2 → 1 (decoupling):    w = ν exp(½(η_1 − η_2)) exp(βλ_2 u_s)
 
+Optional λ = 0 hub (`jump=true`, JOURNAL entry 56): direct jumps between rung 1 and every rung m ≥ 3,
+
+    m → 1:  w = a exp(½(η_1 − η_m)) exp(βλ_m u_s)        1 → m:  w = a exp(½(η_m − η_1)), pose (and conformer) uniform
+
+(the 1 ↔ 2 hops above are the m = 2 case), and NO same-rung relocation of the fractional molecule at rungs ≥ 3
+(c_m = 0). A uniform relocation of a large solute at an intermediate rung lands on solvent ~10⁵ times before it lands
+well (ethanol in SPC/E), and every such bounce is an event; here the molecule leaves any rung for λ = 0 in one event,
+and a bad landing at rung m leaves again at once (its jump rate carries exp(βλ_m u_s)), so a failed recoupling costs
+two events. Detailed balance: e^{−βλ_m u_s + η_m}·w(m→1) = e^{η_1}·w(1→m) = a e^{½(η_1+η_m)}; removing a move type
+keeps the rest exact, ergodicity comes through the hub (and the MC kernel's local moves if on).
 At rung 1 the molecule is absent (m_s = 0, pose integrated out: weight V e^{−βU_rest + η_1}). Stock eKMC is the
 ladder {0, 1} with zero sojourn at λ = 0 (DESIGN §10.4). u_s is the BARE (unscaled, capped) energy of s with the rest.
 The fractional-molecule idea is CFCMC (Shi & Maginn, J. Chem. Theory Comput. 3 (2007) 1451); the weights η are
@@ -60,11 +70,16 @@ mutable struct CouplingLadder
     adapt_blocks::Bool
     adapt_damp::Float64
     η_blocks::Vector{Vector{Float64}}
+    # λ = 0 hub (JOURNAL entry 56): direct jumps 1 ↔ m (m ≥ 3) with attempt frequency jump_ν; c_m = 0 for m ≥ 3
+    jump::Bool
+    jump_ν::Float64
+    n_jump::Vector{Int}                        # production hub jumps per arrival rung
 end
 function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η::Union{Nothing,Vector{Float64}}=nothing,
                         ν::Float64, wl_events::Int=0, wl_f0::Float64=1.0, wl_fmin::Float64=1e-3, wl_flat::Float64=0.8,
                         βu_min::Float64=-150.0, βu_max::Float64=1050.0, dβu::Float64=0.1,
-                        csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0)
+                        csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0,
+                        jump::Bool=false, jump_ν::Float64=ν)
     K = length(λ)
     K >= 2 || error("CouplingLadder: at least two rungs")
     (λ[1] == 0.0 && λ[end] == 1.0 && issorted(λ) && allunique(λ)) || error("CouplingLadder: λ must increase from 0 to 1")
@@ -75,7 +90,13 @@ function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η:
     CouplingLadder(solute, copy(λ), ηv, K, ν, wl_events > 0 ? wl_f0 : 0.0, wl_fmin, wl_flat, zeros(K), wl_events,
                    0, wl_events > 0 ? 0 : -1, block_events, 0, βu_min, dβu, nb,
                    Vector{Float64}[], Vector{Float64}[], Vector{Vector{Float64}}[], zeros(Int, K), 0, 0,
-                   csol === nothing ? ones(K) : copy(csol), adapt_blocks, adapt_damp, Vector{Float64}[])
+                   _hub_csol(csol === nothing ? ones(K) : copy(csol), jump), adapt_blocks, adapt_damp, Vector{Float64}[],
+                   jump, jump_ν, zeros(Int, K))
+end
+# with the λ = 0 hub the fractional molecule is not relocated at rungs ≥ 3 (it moves through rung 1)
+function _hub_csol(c::Vector{Float64}, jump::Bool)
+    jump && (c[3:end] .= 0.0)
+    return c
 end
 
 """
@@ -128,6 +149,37 @@ function hop_rates(L::CouplingLadder, β::Float64, u_s::Float64)
                         L.ν * exp(min(0.5 * (-β * (L.λ[k-1] - L.λ[k]) * u_s + L.η[k-1] - L.η[k]), MOBILITY_LOG_MAX))
     end
     return up, down
+end
+
+"""
+    hub_rate(L, β, u_s) -> total rate of the λ = 0 hub jumps from the current rung (0 without the hub, and at rung 2)
+
+Rung m ≥ 3: a e^{½(η_1 − η_m) + βλ_m u_s} to rung 1. Rung 1: Σ_{m≥3} a e^{½(η_m − η_1)}; `hub_target` draws m.
+"""
+function hub_rate(L::CouplingLadder, β::Float64, u_s::Float64)
+    L.jump || return 0.0
+    k = L.k; K = nrungs(L)
+    if k == 1
+        w = 0.0
+        for m in 3:K
+            w += L.jump_ν * exp(min(0.5 * (L.η[m] - L.η[1]), MOBILITY_LOG_MAX))
+        end
+        return w
+    elseif k >= 3
+        return L.jump_ν * exp(min(0.5 * (L.η[1] - L.η[k]) + β * L.λ[k] * u_s, MOBILITY_LOG_MAX))
+    end
+    return 0.0
+end
+"Target rung of a hub jump from rung 1, drawn ∝ e^{½(η_m − η_1)}, m ≥ 3."
+function hub_target(L::CouplingLadder, rng)
+    K = nrungs(L)
+    w = [exp(min(0.5 * (L.η[m] - L.η[1]), MOBILITY_LOG_MAX)) for m in 3:K]
+    ξ = rand(rng) * sum(w)
+    for (i, x) in enumerate(w)
+        ξ < x && return i + 2
+        ξ -= x
+    end
+    return K
 end
 
 """
@@ -305,7 +357,7 @@ function ladder_summary(L::CouplingLadder)
     t = zeros(K)
     for b in 1:nblocks(L); t .+= L.t_rung[b]; end
     land = sum(sum(L.hist[b][1]) for b in 1:nblocks(L); init=0.0)
-    return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
+    return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_jump=copy(L.n_jump), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
             landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f,
             adapt_blocks=L.adapt_blocks, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]))
 end

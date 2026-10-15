@@ -140,3 +140,31 @@ end
     @test all(sm.t_rung .> 0)
     @test within3σ(μ_oc, eμ_oc, μ_mb, eμ_mb)
 end
+
+@testset "Coupling ladder with the λ = 0 hub (direct jumps 1 ↔ m, no relocation of the fractional molecule at m ≥ 3)" begin
+    N = 32; T = 1.5; ρ = 0.4
+    for ε_s in (1.0, 2.0)
+        S = dimer_system(ε_s, N, T, ρ, 11)
+        events = 2_000_000
+        stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                    reservoirs=[nothing, S.res])
+        r2 = stock.RN_species[2]
+        μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+        ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+        lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                  reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_wl_events=events ÷ 3,
+                                  ladder_eta_ramp=μ_st / T, ladder_jump=true, debug_check_every=events ÷ 4)
+        Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+        μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+        μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+        rK = lad.RN_species[2]
+        μ_K, eμ_K = T * log(MCm.ratio_mean(rK)), T * MCm.ratio_jackknife_stderr(rK; f=log)
+        @info "ladder + λ=0 hub (ε_s = $ε_s)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb μ_K eμ_K sm.n_jump sm.n_hop sm.frac_rung sm.η
+        @test Ld.jump && all(Ld.csol[3:end] .== 0.0) && Ld.csol[2] > 0.0
+        @test sum(sm.n_jump[3:end]) > 50 && sm.n_jump[1] > 50 && all(sm.t_rung .> 0)
+        @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+        @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+        @test within3σ(μ_K, eμ_K, μ_st, eμ_st)                  # removal estimator at the coupled rung (c = 0: exp(βu) used directly)
+        @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+    end
+end
