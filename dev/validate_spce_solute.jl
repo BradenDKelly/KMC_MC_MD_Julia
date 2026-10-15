@@ -25,12 +25,14 @@ eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
 SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
-DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool). mc_sweeps = 0 runs the
+DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool), SPCE_SOLVENT_LOCAL (0; 1 = rejection-free local moves of every
+water, SolventLocalMoves, ν = ν_D = the ladder ν). mc_sweeps = 0 runs the
 MC-free pipeline (DESIGN §11.3): SPCE_EKMC_BURNIN, SPCE_NU_PILOT events of stock eKMC replace the Metropolis stage;
 SPCE_NU_SOURCE=ekmc with mc_sweeps > 0 keeps MC only as the starting configuration and takes ν from an eKMC pilot.
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
+t_script = time()   # SPCE_WALL_SECONDS counts from here, so a first piece's set-up (reservoir, MC or eKMC burn-in) is inside the budget
 const MCm = MolSim.MC
 
 solute = Symbol(length(ARGS) >= 1 ? ARGS[1] : "methane")
@@ -49,7 +51,7 @@ elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
 λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))      # 0 = stock eKMC (default, user 2026-10-12); >0 = λ-hybrid, λ = fac·⟨R⟩_MC
 tag = get(ENV, "SPCE_TAG", "")
 ckpt = get(ENV, "SPCE_CHECKPOINT", "")    # checkpoint file: eKMC continues from it if present (chained jobs); "" = off
-wall = parse(Float64, get(ENV, "SPCE_WALL_SECONDS", "Inf"))   # eKMC wall-time budget of this invocation; checkpoint and exit when spent
+wall = parse(Float64, get(ENV, "SPCE_WALL_SECONDS", "Inf"))   # wall-time budget of this invocation (set-up included, JOURNAL 70); checkpoint and exit when spent
 ckpt_every = parse(Float64, get(ENV, "SPCE_CKPT_EVERY", "1800"))   # seconds of eKMC between checkpoints (with SPCE_CHECKPOINT)
 bar_on = get(ENV, "SPCE_BAR", "0") == "1"   # Bennett accumulator on the solute (landing-Widom + BAR, DESIGN §10.3)
 ladder_on = get(ENV, "SPCE_LADDER", "0") == "1"   # coupling ladder on the solute (DESIGN §10.4)
@@ -62,6 +64,7 @@ ladder_jump = get(ENV, "SPCE_LADDER_JUMP", "0") == "1"     # λ = 0 hub: direct 
 mc_local_A = parse(Float64, get(ENV, "SPCE_MC_LOCAL", "0"))   # Å: MC-kernel sweeps restricted to this radius around the solute (0 = full sweeps)
 local_on = get(ENV, "SPCE_LOCAL", "0") == "1"             # rejection-free local moves of the fractional molecule (DESIGN §11.2)
 jump_max = parse(Int, get(ENV, "SPCE_JUMP_MAX", "0"))       # hub limited to rungs 3…SPCE_JUMP_MAX (0 = all)
+solvent_local = get(ENV, "SPCE_SOLVENT_LOCAL", "0") == "1"   # rejection-free local moves of every water (DESIGN §11.2 stage 2)
 res_mode = get(ENV, "SPCE_RESERVOIR", "mc")                 # conformer pool: mc (vacuum Metropolis) | ekmc (vacuum rejection-free, §11.3 E3)
 res_mode in ("mc", "ekmc") || error("SPCE_RESERVOIR must be mc or ekmc")
 # mc_sweeps = 0: MC-free pipeline (DESIGN §11.3, user 2026-10-14): E1 eKMC burn-in of SPCE_EKMC_BURNIN events (default
@@ -208,8 +211,13 @@ function setup_and_mc(io)
         # E1 + E2: stock eKMC (solute fully coupled, no ladder) burn-in then pilot; ν etc. from the pilot's time averages
         tp = time()
         nb_in = mc_sweeps > 0 ? 0 : ekmc_burnin                    # after a Metropolis stage: pilot only
+        # with SPCE_SOLVENT_LOCAL the burn-in and pilot also move every water locally (stock eKMC leaves a quench frozen,
+        # JOURNAL 66/69); their ν = SPCE_SOLVENT_NU, default exp(β μ_ref) with the published SPC/E μ_ref = −29.5 kJ/mol as in
+        # dev/validate_spce_melt.jl (ν only sets frequencies; production uses the pilot's ⟨R⟩ as for every other slot)
+        νs_pilot = parse(Float64, get(ENV, "SPCE_SOLVENT_NU", string(exp(-29.5 / kJmol_per_eps / T))))
         rp = MCm.init_rigid_ekmc_run(sys, ff; events=nb_in + nu_pilot, burnin_events=nb_in, sample_every=100,
-                                     block_events=max(25, nu_pilot ÷ 25), species_mu=true, reservoirs=reservoirs)
+                                     block_events=max(25, nu_pilot ÷ 25), species_mu=true, reservoirs=reservoirs,
+                                     local_solvent=solvent_local, solvent_nu=solvent_local ? νs_pilot : NaN)
         MCm.advance_rigid_ekmc!(rp, sys, ff)
         rpr = MCm.rigid_ekmc_results(rp)
         R_w = MCm.ratio_mean(rpr.RN_species[1]); R_s = MCm.ratio_mean(rpr.RN_species[2])
@@ -217,7 +225,7 @@ function setup_and_mc(io)
         R_mc_err = R_w * MCm.ratio_jackknife_stderr(rpr.RN_species[1])
         mc_sweeps > 0 || (iw = R_s)                                  # η-ramp guess: MC removal estimate if MC ran, else the stock eKMC one
         @printf(io, "# eKMC setup (DESIGN §11.3; MC stage %s): eKMC burn-in %d events + pilot %d events, %.0f s; pilot U/N=%.3f kJ/mol  <R_water>=%.4e  <exp(βu_solute)>=%.4e (mu_sol_removal=%.2f kJ/mol)\n",
-                mc_sweeps > 0 ? "ran, start configuration only" : "off", nb_in, nu_pilot, time() - tp, (MCm.mean(rpr.U) * Nt + const_E) / Nt * kJmol_per_eps, R_w, R_s,
+                mc_sweeps > 0 ? "ran, start configuration only" : (solvent_local ? "off; solvent L-moves on" : "off"), nb_in, nu_pilot, time() - tp, (MCm.mean(rpr.U) * Nt + const_E) / Nt * kJmol_per_eps, R_w, R_s,
                 (T * log(R_s) + ΔU_tail) * kJmol_per_eps)
         flush(io)
     end
@@ -234,9 +242,11 @@ function setup_and_mc(io)
                                 ladder_nu=ladder_on ? ladder_νfac * R_mc : NaN, ladder_wl_events=ladder_on ? round(Int, ladder_wlfrac * ekmc_events) : 0,
                                 ladder_eta_ramp=ladder_on ? (isnan(ladder_ramp_kJ) ? log(iw) : ladder_ramp_kJ / kJmol_per_eps / T) : 0.0,   # βμ guess: SPCE_LADDER_RAMP or the MC removal estimator
                                 ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
-                                ladder_jump_max=jump_max, ladder_local=local_on)
+                                ladder_jump_max=jump_max, ladder_local=local_on, local_solvent=solvent_local,
+                                solvent_nu=solvent_local ? R_mc : NaN)   # water slots at the unscaled ⟨R⟩ even when SPCE_LADDER_NU boosts the solute
     ladder_on && println(io, "# coupling ladder: λ = $(ladder_λ), ν = $(ladder_νfac)·⟨R⟩_MC = $(ladder_νfac * R_mc), Wang–Landau over the first $(round(Int, ladder_wlfrac * ekmc_events)) events; λ=0 hub $(ladder_jump); U, P, μ_water, mu_sol read at the coupled rung only")
     local_on && println(io, "# L-moves (DESIGN §11.2): slots $(r.lmoves.kinds) (1 T, 2 R, 3 C), a = $(round(r.lmoves.a * m.σ_angstrom; digits=3)) Å, θ_max = $(r.lmoves.θmax) rad, ν_L = ν_D = $(r.lmoves.ν); hub limited to rungs ≤ $(r.ladder.jump_max)")
+    solvent_local && println(io, "# solvent L-moves: $(length(r.slmoves.mols)) movers × slots $(r.slmoves.kinds), ν = ν_D = $(r.slmoves.ν)")
     mc_local_A > 0 && println(io, "# MC kernel: local sweeps within $(mc_local_A) Å of the solute (rate λ = $(λfac)·⟨R⟩_MC)")
     trace || println(io, "# solute trace off (SPCE_TRACE=0): no tail diagnostics; the trace costs 16 bytes per event")
     ctx = (; out, T, kJmol_per_eps, atm_per_pstar, ΔU_tail, E_const, const_E, Nt, flex, Ures=flex ? Ures : NaN, coulomb, ekmc_events, t_ek=0.0)
@@ -316,7 +326,7 @@ else
 end
 # eKMC in slices of SPCE_CKPT_EVERY seconds with a checkpoint after each, so a requeued or killed job loses at most
 # one slice (Slurm requeued 205893_1 twice, JOURNAL entry 32); the slices do not change the trajectory (test_ekmc_checkpoint.jl)
-t_start = time()
+t_start = t_script
 while r.ev < r.events
     left = wall - (time() - t_start)
     left > 0 || break
