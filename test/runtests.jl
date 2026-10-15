@@ -275,6 +275,7 @@ include("test_bennett.jl")
 
 # Flexible OPLS-AA molecules from GROMACS topologies (ethanol, 1-propanol)
 include("test_opls_itp.jl")
+include("test_random_packing.jl")
 
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS

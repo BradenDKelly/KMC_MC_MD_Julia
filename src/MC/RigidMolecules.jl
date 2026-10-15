@@ -903,16 +903,19 @@ end
 
 Place molecules one by one at uniform random positions/orientations, rejecting placements whose
 pair energy with the molecules already placed is capped (overlapping). Equilibrate afterwards.
+Molecules are placed largest extent first (stable order otherwise): a large solute placed last into a
+liquid-density box of solvent finds no free cavity (1-propanol in 500 SPC/E, seed 1, JOURNAL 54).
 """
 function random_rigid_system!(sys::RigidSystem, ff::SiteForceField; max_tries::Int=10_000)
     L = sys.L
-    for i in 1:sys.n_mol
+    order = sortperm(sys.ext; rev=true, alg=Base.Sort.DEFAULT_STABLE)
+    for (k, i) in enumerate(order)
         placed = false
         for _ in 1:max_tries
             com = MVector{3,Float64}(rand(sys.rng) * L, rand(sys.rng) * L, rand(sys.rng) * L)
             set_molecule!(sys, i, com, uniform_random_quaternion(sys.rng))
             ok = true
-            for j in 1:i-1
+            for j in view(order, 1:k-1)
                 u = pair_energy(sys, ff, i, j)
                 if u >= minimum(ff.ucap_mix) * 0.999
                     ok = false; break
