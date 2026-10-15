@@ -36,4 +36,7 @@ export SPCE_CHECKPOINT=$CKDIR/${SOLUTE}_N${N}_seed${SEED}${SPCE_TAG}.jls
 echo "project=$PROJECT host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED coulomb=$SPCE_COULOMB cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA trace=$SPCE_TRACE wall=$SPCE_WALL_SECONDS ckpt=$SPCE_CHECKPOINT start=$(date)"
 cd "$PROJECT" || exit 1
 "$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_solute.jl "$SOLUTE" "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"
-echo "end=$(date)"
+rc=$?
+echo "end=$(date) exit=$rc"
+# return Julia's status so that afterok/aftercorr dependencies do not release the next piece after a failure (JOURNAL 65)
+exit $rc
