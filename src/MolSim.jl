@@ -22,6 +22,7 @@ module MolSim
         include("MC/BennettKMC.jl")
         include("MC/CouplingLadder.jl")
         include("MC/LocalMoves.jl")
+        include("MC/SolventLocalMoves.jl")
         include("MC/RigidMolecules.jl")
         include("MC/SoluteModels.jl")
         include("MC/MD.jl")
