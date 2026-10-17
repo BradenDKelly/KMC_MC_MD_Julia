@@ -173,7 +173,12 @@ end
     MolSim.MC.pressure(st_lrc, p_lrc, T)
     
     # Measure allocations with LRC
-    alloc_total_energy_lrc = @allocated MolSim.MC.total_energy(st_lrc, p_lrc)
+    # the LJ pair kernel itself must not allocate; with several threads total_energy runs the threaded loop, whose
+    # task spawning allocates, so the kernel is measured on the serial path and the two paths are compared
+    MolSim.MC.total_pair_energy_serial(st_lrc, p_lrc)
+    alloc_total_energy_lrc = @allocated MolSim.MC.total_pair_energy_serial(st_lrc, p_lrc)
+    @test MolSim.MC.total_energy(st_lrc, p_lrc) ≈ MolSim.MC.total_pair_energy_serial(st_lrc, p_lrc) +
+          (p_lrc.use_lrc ? st_lrc.N * p_lrc.lrc_u_per_particle : 0.0) rtol = 1e-12
     alloc_pressure_lrc = @allocated MolSim.MC.pressure(st_lrc, p_lrc, T)
     
     @test alloc_total_energy_lrc <= 64
@@ -188,7 +193,12 @@ end
     MolSim.MC.pressure(st_no_lrc, p_no_lrc, T_no_lrc)
     
     # Measure allocations without LRC
-    alloc_total_energy_no_lrc = @allocated MolSim.MC.total_energy(st_no_lrc, p_no_lrc)
+    # the LJ pair kernel itself must not allocate; with several threads total_energy runs the threaded loop, whose
+    # task spawning allocates, so the kernel is measured on the serial path and the two paths are compared
+    MolSim.MC.total_pair_energy_serial(st_no_lrc, p_no_lrc)
+    alloc_total_energy_no_lrc = @allocated MolSim.MC.total_pair_energy_serial(st_no_lrc, p_no_lrc)
+    @test MolSim.MC.total_energy(st_no_lrc, p_no_lrc) ≈ MolSim.MC.total_pair_energy_serial(st_no_lrc, p_no_lrc) +
+          (p_no_lrc.use_lrc ? st_no_lrc.N * p_no_lrc.lrc_u_per_particle : 0.0) rtol = 1e-12
     alloc_pressure_no_lrc = @allocated MolSim.MC.pressure(st_no_lrc, p_no_lrc, T_no_lrc)
     
     @test alloc_total_energy_no_lrc <= 64

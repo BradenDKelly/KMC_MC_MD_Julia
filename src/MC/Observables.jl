@@ -104,6 +104,21 @@ Double-count-safe: only counts pairs i<j.
 Uses mixed parameters if multicomponent (type information from st.types).
 """
 function total_energy(st, p)::Float64
+    energy = (nthreads() > 1 && st.N >= 200) ? _total_pair_energy_threaded(st, p) : total_pair_energy_serial(st, p)
+    # Add long-range correction if enabled
+    if p.use_lrc
+        energy += st.N * p.lrc_u_per_particle
+    end
+    return energy
+end
+
+"""
+    total_pair_energy_serial(st, p)::Float64
+
+The LJ pair sum of `total_energy` on the calling thread (no tail); allocation-free. `total_energy` uses it with one
+thread or N < 200, and the threaded loop `_total_pair_energy_threaded` otherwise (same pairs, other summation order).
+"""
+function total_pair_energy_serial(st, p)::Float64
     energy = 0.0
     N = st.N
     L = st.L
@@ -113,53 +128,6 @@ function total_energy(st, p)::Float64
     types = st.types
     use_mixed = p.n_types > 1
     
-    if nthreads() > 1 && N >= 200
-        sums = zeros(Float64, Base.Threads.maxthreadid())
-        @threads for i in 1:N
-            tid = threadid()
-            type_i = types[i]
-            local_sum = 0.0
-            for j in (i+1):N
-                type_j = types[j]
-                
-                # Compute distance vector
-                dr_x = pos[1, j] - pos[1, i]
-                dr_y = pos[2, j] - pos[2, i]
-                dr_z = pos[3, j] - pos[3, i]
-                
-                # Apply minimum image convention
-                if dr_x > L_half
-                    dr_x = dr_x - L
-                elseif dr_x < -L_half
-                    dr_x = dr_x + L
-                end
-                if dr_y > L_half
-                    dr_y = dr_y - L
-                elseif dr_y < -L_half
-                    dr_y = dr_y + L
-                end
-                if dr_z > L_half
-                    dr_z = dr_z - L
-                elseif dr_z < -L_half
-                    dr_z = dr_z + L
-                end
-                
-                r2 = dr_x*dr_x + dr_y*dr_y + dr_z*dr_z
-                
-                if r2 < rc2 && r2 > 0.0
-                    # Use mixed parameters for multicomponent
-                    if use_mixed
-                        local_sum += lj_pair_u_from_r2_mixed(r2, type_i, type_j, p)
-                    else
-                        # Single-component backward compatibility
-                        local_sum += lj_pair_u_from_r2(r2, p)
-                    end
-                end
-            end
-            sums[tid] += local_sum
-        end
-        energy = sum(sums)
-    else
         @inbounds for i in 1:N
             type_i = types[i]
             for j in (i+1):N
@@ -200,13 +168,65 @@ function total_energy(st, p)::Float64
                 end
             end
         end
-    end
+    return energy
+end
+
+"Threaded LJ pair sum of `total_energy` (per-thread partial sums; spawning the tasks allocates)."
+function _total_pair_energy_threaded(st, p)::Float64
+    energy = 0.0
+    N = st.N
+    L = st.L
+    L_half = 0.5 * L
+    rc2 = p.rc2
+    pos = st.pos
+    types = st.types
+    use_mixed = p.n_types > 1
     
-    # Add long-range correction if enabled
-    if p.use_lrc
-        energy += st.N * p.lrc_u_per_particle
+    sums = zeros(Float64, Base.Threads.maxthreadid())
+    @threads for i in 1:N
+        tid = threadid()
+        type_i = types[i]
+        local_sum = 0.0
+        for j in (i+1):N
+            type_j = types[j]
+            
+            # Compute distance vector
+            dr_x = pos[1, j] - pos[1, i]
+            dr_y = pos[2, j] - pos[2, i]
+            dr_z = pos[3, j] - pos[3, i]
+            
+            # Apply minimum image convention
+            if dr_x > L_half
+                dr_x = dr_x - L
+            elseif dr_x < -L_half
+                dr_x = dr_x + L
+            end
+            if dr_y > L_half
+                dr_y = dr_y - L
+            elseif dr_y < -L_half
+                dr_y = dr_y + L
+            end
+            if dr_z > L_half
+                dr_z = dr_z - L
+            elseif dr_z < -L_half
+                dr_z = dr_z + L
+            end
+            
+            r2 = dr_x*dr_x + dr_y*dr_y + dr_z*dr_z
+            
+            if r2 < rc2 && r2 > 0.0
+                # Use mixed parameters for multicomponent
+                if use_mixed
+                    local_sum += lj_pair_u_from_r2_mixed(r2, type_i, type_j, p)
+                else
+                    # Single-component backward compatibility
+                    local_sum += lj_pair_u_from_r2(r2, p)
+                end
+            end
+        end
+        sums[tid] += local_sum
     end
-    
+    energy = sum(sums)
     return energy
 end
 
