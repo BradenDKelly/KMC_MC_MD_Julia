@@ -27,7 +27,7 @@ function nist_rigid_system(cfg, rc)
         end
         MCe.molecule_from_sites!(sys, i, lab)
     end
-    MCe.attach_ewald!(sys, ff; n2max=27)                      # the NIST wave-vector set (|n|² < 27)
+    MCe.attach_ewald!(sys, ff; n2max=27, precision=:double)   # the NIST wave-vector set (|n|² < 27)
     return sys, ff, (L=L, M=M, pos=pos, q=q, σ=σ, ε=ε, mol=mol)
 end
 
@@ -57,14 +57,14 @@ end
 end
 
 # small SPC/E box in reduced units with Ewald parameters from rtol = 1e-5 (GROMACS default ewald-rtol)
-function ewald_water(N, seed; rc_angstrom=4.5, equil=50)
+function ewald_water(N, seed; rc_angstrom=4.5, equil=50, precision=:double)
     ρ = 0.0334                                                 # molecules / Å³
     α = MCe.ewald_alpha_for(rc_angstrom, 1e-5)
     m = MCe.spce_model(; α_per_angstrom=α, rc_angstrom=rc_angstrom, coulomb=:ewald)
     L = cbrt(N / ρ) / m.σ_angstrom
     sys = MCe.RigidSystem([m.template], fill(1, N), L, m.ϵ_kelvin / 300.0, Xoshiro(seed))
     MCe.random_rigid_system!(sys, m.ff)
-    MCe.attach_ewald!(sys, m.ff; rtol=1e-5)
+    MCe.attach_ewald!(sys, m.ff; rtol=1e-5, precision=precision)
     st = MCe.RigidMCStats()
     for _ in 1:equil, _ in 1:N
         MCe.mc_translate!(sys, m.ff, rand(sys.rng, 1:N), 0.1, st); MCe.mc_rotate!(sys, m.ff, rand(sys.rng, 1:N), 0.3, st)
@@ -196,7 +196,7 @@ end
         t = sys.templates[sys.tmpl[i]]
         MCe.molecule_from_sites!(sys, i, pos_nm[:, k+1:k+t.n_sites] .* (10 / σ_A)); k += t.n_sites
     end
-    MCe.attach_ewald!(sys, ff; n2max=401)                      # |n| ≤ 20: Fourier sum converged far below 1e-5
+    MCe.attach_ewald!(sys, ff; n2max=401, precision=:double)   # |n| ≤ 20: Fourier sum converged far below 1e-5
     ffn = MCe.SiteForceField([ff.σ_mix[a, a] for a in 1:ff.n_types], [ff.ϵ_mix[a, a] for a in 1:ff.n_types]; rc=ff.rc,
                              coulomb=:none, cutoff=:site, mixing=:geometric, cap_overlaps=true)
     Uc = (MCe.total_pair_energy(sys, ff) - MCe.total_pair_energy(sys, ffn)) * kJ
@@ -209,4 +209,56 @@ end
     @test isapprox(e24.total * kJ, sum(ref["pme"]); rtol=2e-5)
     @test isapprox((e24.real + e24.self + e24.intra) * kJ, ref["pme"][1]; rtol=2e-5)
     @info "Ewald/SPME vs GROMACS (kJ/mol)" Uc sum(ref["ewald"]) e24.fourier * kJ ref["pme"][2] e24.total * kJ sum(ref["pme"])
+end
+
+# Higham, Accuracy and Stability of Numerical Algorithms (2nd ed., 2002), Lemma 3.1/§3.1: a computed sum of n products in
+# floating point with unit roundoff u differs from the exact one by at most γ_n Σ|terms|, γ_n = n u/(1 − n u); the inputs
+# rounded to Float32 (S, c: three factors) add three more roundings per term.
+γ32(n) = (u = eps(Float32) / 2; n * u / (1 - n * u))
+
+@testset "Mixed precision (GROMACS convention): Float32 products within the rounding bound; Float64 accumulation" begin
+    m, sys, _ = ewald_water(40, 12; precision=:double)
+    ff = m.ff; N = sys.n_mol; R = sys.recip; Nk = MCe.n_kvectors(R)
+    sysm = deepcopy(sys); MCe.set_recip_backend!(sysm.recip, :cpu; precision=:mixed)
+    @test eltype(sysm.recip.Sd) == ComplexF32 && eltype(sysm.recip.S) == ComplexF64
+    k = 7
+    rd = zeros(N); rm = zeros(N); w = zeros(N)
+    MCe.eval_row!(rd, w, sys, ff, k); MCe.eval_row!(rm, w, sysm, ff, k)
+    Sk = R.S[:, k]
+    bound = [γ32(Nk + 4) * sum(R.c .* abs.(Sk) .* abs.(R.S[:, j])) for j in 1:N]
+    @test all(abs.(rm .- rd) .<= bound)
+    @test maximum(abs.(rm .- rd)) > 0.0                      # the products really ran in single precision
+    # eKMC with mixed precision: φ drift after n events is within n × 2 × (per-row bound); the rebuild is exact Float64
+    ek = MCe.init_rigid_ekmc(sysm, ff)
+    Smax = maximum(abs.(R.S)); Bφ = γ32(Nk + 4) * sum(R.c) * Smax^2
+    n = 200
+    for _ in 1:n
+        kk = MCe.select_by_mobility(ek, sysm.rng)
+        MCe.set_molecule!(sysm, kk, sysm.L .* rand(sysm.rng, 3), MCe.uniform_random_quaternion(sysm.rng))
+        MCe.update_rigid_ekmc_after_move!(ek, sysm, ff, kk)
+    end
+    φ = copy(ek.phi)
+    MCe.rebuild_rigid_ekmc!(ek, sysm, ff)
+    @test maximum(abs.(φ .- ek.phi)) <= 2n * N * Bφ
+    sysd = deepcopy(sysm); MCe.set_recip_backend!(sysd.recip, :cpu; precision=:double)
+    ekd = MCe.init_rigid_ekmc(sysd, ff)
+    @test maximum(abs.(ekd.phi .- ek.phi)) < 1e-9              # the mixed-precision rebuild is the Float64 one
+    # solvent L-move candidates: one ΔS product in single precision within its bound
+    S = MCe.SolventLocalMoves(sysm, ff, collect(1:N-1); kinds=[MCe.LM_T, MCe.LM_R], a=0.1, θmax=0.3, ν=1.0, νD=1.0)
+    @test eltype(S.crSd) == ComplexF32
+    kk = 3
+    MCe.set_molecule!(sysm, kk, sysm.L .* rand(sysm.rng, 3), MCe.uniform_random_quaternion(sysm.rng))
+    MCe.update_rigid_ekmc_after_move!(ek, sysm, ff, kk)
+    cr0 = copy(S.cr_u)
+    MCe.slm_moved!(S, sysm, ff, kk)
+    Δm = S.cr_u .- cr0
+    dS = sysm.recip.dS
+    exact = [real(sum(sysm.recip.c .* conj.(S.crS[:, c]) .* dS)) for c in 1:size(S.crS, 2)]
+    bnd = [γ32(Nk + 4) * sum(sysm.recip.c .* abs.(S.crS[:, c]) .* abs.(dS)) for c in 1:size(S.crS, 2)]
+    K = length(S.kinds)
+    for ii in eachindex(S.mols), j in 1:K
+        S.mols[ii] == kk && continue
+        c = (ii - 1) * K + j
+        @test abs(Δm[j, ii] - exact[c]) <= bnd[c] + 4eps(Float64) * abs(cr0[j, ii])
+    end
 end

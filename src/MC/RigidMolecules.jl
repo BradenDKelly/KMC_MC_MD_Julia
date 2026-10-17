@@ -2016,7 +2016,8 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     end
     if _has_recip(sys, ff)                           # Fourier pair terms ψ_ij = Σ_k c_k Re[S_i^* S_j]: one product Sᴴ diag(c) S
         Rr = sys.recip
-        Ψ = real.(Array(Rr.Sd' * (Rr.cd .* Rr.Sd)))      # on the reciprocal-space backend
+        # on the backend with :double; with :mixed the rebuild is the exact Float64 resynchronisation (host)
+        Ψ = Rr.precision === :double ? real.(Array(Rr.Sd' * (Rr.cd .* Rr.Sd))) : real.(Rr.S' * (Rr.c .* Rr.S))
         @inbounds for j in 1:N, i in 1:N
             i == j || (ek.pair_u[i, j] += Ψ[i, j])
         end
@@ -2893,19 +2894,30 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         t_total += dt
         t_since_vol += dt
         ladder !== nothing && adapting(ladder) && wl_update!(ladder, ev, dt, k_before)
+        if _has_recip(sys, ff) && sys.recip.precision === :mixed && ek.events % RECIP_RESYNC_EVENTS == 0
+            # mixed precision (GROMACS convention): exact Float64 rebuild removes the single-precision increment drift
+            rebuild_rigid_ekmc!(ek, sys, ff)
+            lmoves === nothing || (lmoves.stale = true)
+            slmoves === nothing || slm_rebuild_all!(slmoves, sys, ff)
+        end
         if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
             phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
             rebuild_rigid_ekmc!(ek, sys, ff)
-            (maximum(abs.(phi_saved .- ek.phi)) > 1e-8 || abs(R_saved - ek.R) / ek.R > 1e-8 ||
-             abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))) &&
-                @warn "rigid eKMC bookkeeping drift" maximum(abs.(phi_saved .- ek.phi)) abs(R_saved - ek.R) / ek.R
+            # with :mixed reciprocal-space precision the single-precision increments drift by design (removed by the
+            # rebuild just made): the drift is reported as information, not as a bookkeeping error
+            mixed = _has_recip(sys, ff) && sys.recip.precision === :mixed
+            dφ = maximum(abs.(phi_saved .- ek.phi)); dR = abs(R_saved - ek.R) / ek.R
+            if dφ > 1e-8 || dR > 1e-8 || abs(W_saved - ekmc_virial(ek)) > 1e-8 * max(1.0, abs(W_saved))
+                mixed ? (@info "rigid eKMC mixed-precision drift (resynchronised)" dφ dR) : (@warn "rigid eKMC bookkeeping drift" dφ dR)
+            end
             if lmoves !== nothing && !lmoves.stale
                 cu = copy(lmoves.cand_u); lm_rebuild!(lmoves, sys, ff)
-                maximum(abs.(cu .- lmoves.cand_u)) > 1e-8 && @warn "L-move candidate energy drift" maximum(abs.(cu .- lmoves.cand_u))
+                dc = maximum(abs.(cu .- lmoves.cand_u))
+                dc > 1e-8 && (mixed ? (@info "L-move mixed-precision drift (resynchronised)" dc) : (@warn "L-move candidate energy drift" dc))
             end
             if slmoves !== nothing
                 d = slm_check!(slmoves, sys, ff)
-                d > 1e-8 && @warn "solvent L-move candidate energy drift" d
+                d > 1e-8 && (mixed ? (@info "solvent L-move mixed-precision drift (resynchronised)" d) : (@warn "solvent L-move candidate energy drift" d))
             end
         end
         if Pext !== nothing && ev >= next_vol

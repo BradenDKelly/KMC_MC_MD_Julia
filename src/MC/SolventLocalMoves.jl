@@ -52,8 +52,8 @@ mutable struct SolventLocalMoves
     cr_u::Matrix{Float64}               # K × M Fourier + image energy of each candidate with all but i and frac
     cr_s::Matrix{Float64}               # K × M Fourier energy of each candidate with the fractional molecule
     cr_tmp::Vector{ComplexF64}          # K·M scratch
-    crSd::AbstractMatrix{ComplexF64}    # crS on the reciprocal-space backend (=== crS on the CPU)
-    cr_tmpd::AbstractVector{ComplexF64}
+    crSd::AbstractMatrix                # crS on the reciprocal-space backend (=== crS for :cpu/:double; ComplexF32 for :mixed)
+    cr_tmpd::AbstractVector
 end
 
 function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Float64, θmax::Float64, ν::Float64,
@@ -139,7 +139,7 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
     end
     if R !== nothing && S.crSd !== S.crS                # upload this mover's K candidate columns
         cols = (ii - 1) * K + 1:ii * K
-        copyto!(view(S.crSd, :, cols), S.crS[:, cols])
+        _upload!(view(S.crSd, :, cols), S.crS[:, cols])
     end
     _slm_restore!(S, sys, i)
     S.n_rebuild += 1
@@ -187,7 +187,7 @@ function slm_moved!(S::SolventLocalMoves, sys, ff, m::Int)
     R = _has_recip(sys, ff) ? sys.recip : nothing
     if R !== nothing                                    # Fourier part of every candidate: crSᴴ (c ∘ ΔS_m)
         R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")
-        R.vd === R.work ? copyto!(R.work, R.dS) : copyto!(R.vd, R.dS)
+        R.vd === R.work ? copyto!(R.work, R.dS) : _upload!(R.vd, R.dS)
         R.cwd .= R.cd .* R.vd
         mul!(S.cr_tmpd, S.crSd', R.cwd)
         to_host!(S.cr_tmp, S.cr_tmpd)
@@ -210,10 +210,11 @@ function _slm_bind_recip!(S::SolventLocalMoves, R)
         S.crS = zeros(ComplexF64, n_kvectors(R), KM)
         S.crSd = S.crS; S.cr_tmpd = S.cr_tmp
     end
-    if R.backend === :cpu
+    if R.Sd === R.S                                     # :cpu, :double: the host arrays themselves
         S.crSd = S.crS; S.cr_tmpd = S.cr_tmp
-    elseif S.crSd === S.crS || size(S.crSd) != size(S.crS)
-        S.crSd = backend_array(R.backend, S.crS); S.cr_tmpd = backend_array(R.backend, S.cr_tmp)
+    elseif S.crSd === S.crS || size(S.crSd) != size(S.crS) || eltype(S.crSd) != eltype(R.Sd) || typeof(S.crSd) != typeof(R.Sd)
+        S.crSd = backend_array(R.backend, convert(Matrix{eltype(R.Sd)}, S.crS))
+        S.cr_tmpd = backend_array(R.backend, zeros(eltype(R.Sd), length(S.cr_tmp)))
     end
     return nothing
 end

@@ -22,7 +22,7 @@ for i in 1:sys.n_mol
     t = sys.templates[sys.tmpl[i]]
     MCm.molecule_from_sites!(sys, i, pos_nm[:, k+1:k+t.n_sites] .* (10 / σ_A)); global k += t.n_sites
 end
-R = MCm.attach_ewald!(sys, ff; rtol=1e-5)
+R = MCm.attach_ewald!(sys, ff; rtol=1e-5, precision=:double)
 ffn = MCm.SiteForceField([ff.σ_mix[a, a] for a in 1:ff.n_types], [ff.ϵ_mix[a, a] for a in 1:ff.n_types]; rc=ff.rc,
                          coulomb=:none, cutoff=:site, mixing=:geometric, cap_overlaps=true)
 Ucoul = (MCm.total_pair_energy(sys, ff) - MCm.total_pair_energy(sys, ffn)) * kJ

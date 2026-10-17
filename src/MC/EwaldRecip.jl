@@ -17,8 +17,15 @@ e_m is the energy of m with its own periodic images (Ewald energy of m alone in 
 independent of the exclusion list); the vacuum intramolecular Coulomb energy of a flexible molecule stays in U_intra.
 Total intermolecular Coulomb energy = Σ_{m<n} (real_mn + ψ_mn) + Σ_m e_m = `ewald_energy(...).total` (the NIST sum).
 
-Backends (DESIGN §13.3 E2): the products run on `R.Sd`, `R.cd`, … which are the host arrays themselves (`:cpu`) or device
-copies (`:cuda`, in the package extension MolSimCUDAExt, loaded with `using CUDA`; the CPU-only build never needs CUDA).
+Backends (DESIGN §13.3 E2): the products run on `R.Sd`, `R.cd`, … which are the host arrays themselves (`:cpu`, `:double`)
+or copies (`:cuda`, in the package extension MolSimCUDAExt, loaded with `using CUDA`; the CPU-only build never needs CUDA).
+Precision (user, 2026-10-17: "keep the precision that gromacs does"): `:mixed` (default) is the GROMACS mixed-precision
+convention — state-like arrays in single precision, critical accumulations in double (GROMACS reference manual,
+"Definitions": coordinates, velocities and forces single, "critical variables" such as the virial double). Here the
+backend copies of the structure factors, weights and candidate structure factors and the products are ComplexF32/Float32;
+the host keeps the committed S, Stot, image energies in Float64 and every result (pair energies, φ, candidate energies,
+rates, totals) is accumulated in Float64. The single-precision increments drift by O(u_Float32) per event; the eKMC loop
+removes it with an exact Float64 rebuild every `RECIP_RESYNC_EVENTS` events. `:double` keeps everything in Float64.
 The per-molecule work (structure factor of the moved molecule, image energy) stays on the host; per event one column
 (N_k complex) goes up and one row (N complex) or one candidate vector (K·M complex) comes back.
 e_m depends on the pose of m only (orientation; conformation if flexible), so it is part of m's removal energy and of
@@ -59,20 +66,32 @@ mutable struct EwaldRecip
     ez::Vector{ComplexF64}
     n_commit::Int
     backend::Symbol               # :cpu or :cuda
-    Sd::AbstractMatrix{ComplexF64}   # S on the backend (=== S on the CPU)
-    cd::AbstractVector{Float64}      # c on the backend
-    vd::AbstractVector{ComplexF64}   # an N_k vector on the backend (S_k or ΔS_k)
-    cwd::AbstractVector{ComplexF64}  # c ∘ vd on the backend
-    tmpNd::AbstractVector{ComplexF64}
+    precision::Symbol             # :mixed (GROMACS convention, default) or :double
+    Sd::AbstractMatrix            # S on the backend (=== S for :cpu/:double; ComplexF32 copy for :mixed)
+    cd::AbstractVector            # c on the backend
+    vd::AbstractVector            # an N_k vector on the backend (S_k or ΔS_k)
+    cwd::AbstractVector           # c ∘ vd on the backend
+    tmpNd::AbstractVector
 end
 
-"Device array for `backend` (identity on the CPU; `:cuda` is provided by MolSimCUDAExt)."
+"Events between exact Float64 rebuilds of the eKMC bookkeeping with `:mixed` precision (a frequency choice: the
+rebuild costs ~N²N_k, i.e. ≲ 2 % of 10⁴ events for N = 500 SPC/E; it removes the O(u_Float32)-per-event drift)."
+const RECIP_RESYNC_EVENTS = 10_000
+
+"Backend array for `backend` (the array itself on the CPU; `:cuda` is provided by MolSimCUDAExt)."
 backend_array(::Val{:cpu}, A::AbstractArray) = A
 backend_array(::Val{B}, A::AbstractArray) where {B} =
     error("reciprocal-space backend :$B is not available (for :cuda load CUDA.jl first: `using CUDA`)")
 backend_array(b::Symbol, A::AbstractArray) = backend_array(Val(b), A)
-"Copy a backend vector into a host vector (no-op when they are the same array)."
-to_host!(dst::Array, src::AbstractArray) = (dst === src || copyto!(dst, src); dst)
+"Copy a backend array into a host array, converting the element type if needed (no-op when they are the same array)."
+function to_host!(dst::Array, src::AbstractArray)
+    dst === src && return dst
+    eltype(dst) == eltype(src) ? copyto!(dst, src) : (dst .= Array(src))
+    return dst
+end
+"Copy a host array into a backend array (or a contiguous view of one), converting the element type if needed."
+_upload!(dst::AbstractArray, src::AbstractArray) =
+    eltype(dst) == eltype(src) ? copyto!(dst, src) : copyto!(dst, convert(Array{eltype(dst)}, src))
 
 """
     ewald_alpha_for(rc, rtol) -> α
@@ -127,27 +146,30 @@ function EwaldRecip(sys; α::Float64, ke::Float64, n2max::Int)
     R = EwaldRecip(sys.L, α, ke, n2max, nmax, nx, ny, nz, c, zeros(ComplexF64, Nk, N), zeros(ComplexF64, Nk),
                    zeros(N), zeros(N), zeros(ComplexF64, Nk), zeros(ComplexF64, Nk), zeros(ComplexF64, Nk), 0,
                    zeros(ComplexF64, N), zeros(ComplexF64, 2nmax + 1), zeros(ComplexF64, 2nmax + 1),
-                   zeros(ComplexF64, 2nmax + 1), 0, :cpu, zeros(ComplexF64, 0, 0), Float64[], ComplexF64[], ComplexF64[],
-                   ComplexF64[])
-    _bind_backend!(R, :cpu)
+                   zeros(ComplexF64, 2nmax + 1), 0, :cpu, :double, zeros(ComplexF64, 0, 0), Float64[], ComplexF64[],
+                   ComplexF64[], ComplexF64[])
+    _bind_backend!(R, :cpu; precision=:double)
     return R
 end
 
-"(Re)create the backend arrays of R from the host state (`backend` = :cpu or :cuda)."
-function _bind_backend!(R::EwaldRecip, backend::Symbol)
-    R.backend = backend
-    if backend === :cpu
+"(Re)create the backend arrays of R from the host state (`backend` = :cpu or :cuda, `precision` = :mixed or :double)."
+function _bind_backend!(R::EwaldRecip, backend::Symbol; precision::Symbol=R.precision)
+    precision in (:mixed, :double) || error("EwaldRecip: precision must be :mixed or :double")
+    R.backend = backend; R.precision = precision
+    if backend === :cpu && precision === :double
         R.Sd = R.S; R.cd = R.c; R.vd = R.work; R.cwd = R.cw; R.tmpNd = R.tmpN
     else
-        R.Sd = backend_array(backend, R.S); R.cd = backend_array(backend, R.c)
-        R.vd = backend_array(backend, R.work); R.cwd = backend_array(backend, R.cw)
-        R.tmpNd = backend_array(backend, R.tmpN)
+        C = precision === :mixed ? ComplexF32 : ComplexF64
+        F = precision === :mixed ? Float32 : Float64
+        R.Sd = backend_array(backend, convert(Matrix{C}, R.S)); R.cd = backend_array(backend, convert(Vector{F}, R.c))
+        R.vd = backend_array(backend, zeros(C, length(R.c))); R.cwd = backend_array(backend, zeros(C, length(R.c)))
+        R.tmpNd = backend_array(backend, zeros(C, length(R.tmpN)))
     end
     return R
 end
 
-"Move the reciprocal-space products of R to `backend` (:cpu or :cuda)."
-set_recip_backend!(R::EwaldRecip, backend::Symbol) = _bind_backend!(R, backend)
+"Set the backend (:cpu or :cuda) and precision (:mixed, the GROMACS convention, or :double) of R's products."
+set_recip_backend!(R::EwaldRecip, backend::Symbol; precision::Symbol=R.precision) = _bind_backend!(R, backend; precision=precision)
 
 n_kvectors(R::EwaldRecip) = length(R.c)
 
@@ -245,7 +267,7 @@ function recip_rebuild!(R::EwaldRecip, sys)
     if sys.L != R.L
         R.L = sys.L
         R.c = _recip_weights(R.L, R.α, R.ke, R.nx, R.ny, R.nz)
-        R.backend === :cpu ? (R.cd = R.c) : copyto!(R.cd, R.c)
+        R.Sd === R.S ? (R.cd = R.c) : _upload!(R.cd, R.c)      # aliased on :cpu/:double, a copy otherwise
     end
     N = sys.n_mol
     size(R.S, 2) == N || error("recip_rebuild!: EwaldRecip built for $(size(R.S, 2)) molecules, system has $N")
@@ -257,7 +279,7 @@ function recip_rebuild!(R::EwaldRecip, sys)
         R.corr[i] = recip_corr(R, sys, i)
         R.eimg[i] = recip_half_norm(R, col) - R.corr[i]
     end
-    R.Sd === R.S || copyto!(R.Sd, R.S)
+    R.Sd === R.S || _upload!(R.Sd, R.S)
     R.last = 0
     return nothing
 end
@@ -281,7 +303,7 @@ function recip_commit!(sys, i::Int)
     end
     R.corr[i] = recip_corr(R, sys, i)
     R.eimg[i] = recip_half_norm(R, col) - R.corr[i]
-    R.Sd === R.S || copyto!(view(R.Sd, :, i), R.work)   # R.work == the new column (a host Array)
+    R.Sd === R.S || _upload!(view(R.Sd, :, i), R.work)   # R.work == the new column (a host Array)
     R.last = i
     R.n_commit += 1
     return nothing
@@ -301,7 +323,7 @@ molecules committed). row[k] is meaningless (callers reset it).
 """
 function recip_row_add!(row::AbstractVector{Float64}, R::EwaldRecip, sys, k::Int)
     recip_sf!(R.work, R, sys, k)
-    R.vd === R.work || copyto!(R.vd, R.work)
+    R.vd === R.work || _upload!(R.vd, R.work)
     R.cwd .= R.cd .* R.vd
     mul!(R.tmpNd, R.Sd', R.cwd)                     # Σ_k conj(S_jk) c_k S_k
     to_host!(R.tmpN, R.tmpNd)
@@ -331,14 +353,16 @@ recip_energy_total(R::EwaldRecip) = recip_half_norm(R, R.Stot) - sum(R.corr)
     attach_ewald!(sys, ff; rtol=1e-5, n2max=0)
 
 Give `sys` reciprocal-space Ewald state for a force field with `coulomb = :ewald` (α = ff.wolf.α, ke = ff.wolf.ke).
-`n2max = 0` chooses the reciprocal cut-off from `rtol` (`ewald_n2max_for`). Returns the EwaldRecip.
+`n2max = 0` chooses the reciprocal cut-off from `rtol` (`ewald_n2max_for`). `precision = :mixed` (default, the GROMACS
+convention) or `:double`; `backend = :cpu` or `:cuda`. Returns the EwaldRecip.
 """
-function attach_ewald!(sys, ff; rtol::Float64=1e-5, n2max::Int=0)
+function attach_ewald!(sys, ff; rtol::Float64=1e-5, n2max::Int=0, backend::Symbol=:cpu, precision::Symbol=:mixed)
     ff.coulomb === :ewald || error("attach_ewald!: force field coulomb = $(ff.coulomb), need :ewald")
     α = ff.wolf.α
     n2 = n2max > 0 ? n2max : ewald_n2max_for(sys.L, α, rtol)
     R = EwaldRecip(sys; α=α, ke=ff.wolf.ke, n2max=n2)
     sys.recip = R
     recip_rebuild!(R, sys)
+    set_recip_backend!(R, backend; precision=precision)
     return R
 end

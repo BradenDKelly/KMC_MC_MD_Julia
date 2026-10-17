@@ -11,7 +11,7 @@ const MCs = MolSim.MC
     L = cbrt(N / ρ) / m.σ_angstrom
     sys = MCs.RigidSystem([m.template], fill(1, N), L, m.ϵ_kelvin / 300.0, Xoshiro(21))
     MCs.random_rigid_system!(sys, m.ff)
-    MCs.attach_ewald!(sys, m.ff; rtol=1e-5)
+    MCs.attach_ewald!(sys, m.ff; rtol=1e-5)                  # default precision :mixed (GROMACS convention), as in production
     st = MCs.RigidMCStats()
     for _ in 1:300, _ in 1:N
         MCs.mc_translate!(sys, m.ff, rand(sys.rng, 1:N), 0.1, st); MCs.mc_rotate!(sys, m.ff, rand(sys.rng, 1:N), 0.3, st)
