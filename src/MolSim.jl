@@ -15,6 +15,8 @@ module MolSim
         include("MC/Widom.jl")
         include("MC/Molecules.jl")
         include("MC/Electrostatics.jl")
+        include("MC/EwaldRecip.jl")
+        include("MC/PME.jl")
         include("MC/Fluctuations.jl")
     include("MC/eKMC.jl")
         include("MC/Intramolecular.jl")

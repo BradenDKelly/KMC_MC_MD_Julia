@@ -18,6 +18,10 @@ for every mover whose stored values are non-zero or whose COM lies within reach 
 position — K pair energies per such mover — and m's own K rows are rebuilt. Rates are recomputed from cu, cs and φ at every
 event (O(MK) exponentials). Rigid molecules only. Purpose: let the solvent relax by small moves between relocations — the
 liquid's hydrogen-bond network (JOURNAL 50) and the quenched start that stock eKMC does not melt (JOURNAL 65).
+With reciprocal-space Ewald (EwaldRecip.jl) cp/cu/cs hold the real-space + LJ part (local, updated as above); the Fourier
+and image part of every candidate is kept separately — cr_u[j, ii] = Σ_k c_k Re[S_cand^*(Stot − S_i − S_frac)] + e(S_cand),
+cr_s[j, ii] = Σ_k c_k Re[S_cand^* S_frac] — with the candidate structure factors crS (N_k × K·M). After a move of m every
+candidate of every other mover changes by Σ_k c_k Re[S_cand^* ΔS_m]: one complex matrix–vector product crSᴴ(c ∘ ΔS_m).
 """
 mutable struct SolventLocalMoves
     mols::Vector{Int}                   # molecules with local moves
@@ -44,6 +48,12 @@ mutable struct SolventLocalMoves
     row_w::Vector{Float64}
     com0::Vector{Float64}
     q0::Vector{Float64}
+    crS::Matrix{ComplexF64}             # reciprocal-space Ewald: N_k × (K·M) candidate structure factors (N_k × 0 otherwise)
+    cr_u::Matrix{Float64}               # K × M Fourier + image energy of each candidate with all but i and frac
+    cr_s::Matrix{Float64}               # K × M Fourier energy of each candidate with the fractional molecule
+    cr_tmp::Vector{ComplexF64}          # K·M scratch
+    crSd::AbstractMatrix{ComplexF64}    # crS on the reciprocal-space backend (=== crS on the CPU)
+    cr_tmpd::AbstractVector{ComplexF64}
 end
 
 function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Float64, θmax::Float64, ν::Float64,
@@ -60,7 +70,8 @@ function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Fl
     for (ii, i) in enumerate(mols); pos[i] = ii; end
     S = SolventLocalMoves(copy(mols), pos, copy(kinds), a, θmax, ν, νD, frac, zeros(3, K, M), zeros(4, K, M),
                           zeros(K, N, M), zeros(K, M), zeros(K, M), zeros(K, M), zeros(M), 0.0, zeros(Int, 3), 0, 0, 0,
-                          zeros(N), zeros(N), zeros(3), zeros(4))
+                          zeros(N), zeros(N), zeros(3), zeros(4), zeros(ComplexF64, 0, K * M), zeros(K, M), zeros(K, M),
+                          zeros(ComplexF64, K * M), zeros(ComplexF64, 0, K * M), zeros(ComplexF64, K * M))
     for ii in 1:M
         _slm_draw!(S, sys, ii)
     end
@@ -100,9 +111,12 @@ end
 function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
     i = S.mols[ii]; N = sys.n_mol
     _slm_save!(S, sys, i)
+    R = _has_recip(sys, ff) ? sys.recip : nothing
+    K = length(S.kinds)
+    R === nothing || _slm_bind_recip!(S, R)
     for j in eachindex(S.kinds)
         _slm_place!(S, sys, i, ii, j)
-        eval_row!(S.row_u, S.row_w, sys, ff, i)
+        eval_row!(S.row_u, S.row_w, sys, ff, i; recip=false)
         u = 0.0
         @inbounds for m in 1:N
             S.cp[j, m, ii] = S.row_u[m]
@@ -110,6 +124,22 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
         end
         S.cu[j, ii] = u
         S.cs[j, ii] = S.frac > 0 ? S.row_u[S.frac] : 0.0
+        if R !== nothing
+            Sc = view(S.crS, :, (ii - 1) * K + j)
+            recip_sf!(Sc, R, sys, i)
+            ru = recip_half_norm(R, Sc) - recip_corr(R, sys, i); rs = 0.0
+            @inbounds for kk in eachindex(R.c)
+                sf = S.frac > 0 ? R.S[kk, S.frac] : zero(ComplexF64)
+                a = R.Stot[kk] - R.S[kk, i] - sf
+                ru += R.c[kk] * (real(Sc[kk]) * real(a) + imag(Sc[kk]) * imag(a))
+                rs += R.c[kk] * (real(Sc[kk]) * real(sf) + imag(Sc[kk]) * imag(sf))
+            end
+            S.cr_u[j, ii] = ru; S.cr_s[j, ii] = rs
+        end
+    end
+    if R !== nothing && S.crSd !== S.crS                # upload this mover's K candidate columns
+        cols = (ii - 1) * K + 1:ii * K
+        copyto!(view(S.crSd, :, cols), S.crS[:, cols])
     end
     _slm_restore!(S, sys, i)
     S.n_rebuild += 1
@@ -154,6 +184,37 @@ function slm_moved!(S::SolventLocalMoves, sys, ff, m::Int)
         _slm_restore!(S, sys, i)
         S.n_colupd += 1
     end
+    R = _has_recip(sys, ff) ? sys.recip : nothing
+    if R !== nothing                                    # Fourier part of every candidate: crSᴴ (c ∘ ΔS_m)
+        R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")
+        R.vd === R.work ? copyto!(R.work, R.dS) : copyto!(R.vd, R.dS)
+        R.cwd .= R.cd .* R.vd
+        mul!(S.cr_tmpd, S.crSd', R.cwd)
+        to_host!(S.cr_tmp, S.cr_tmpd)
+        own = S.pos[m]
+        target = m == S.frac ? S.cr_s : S.cr_u
+        @inbounds for ii in eachindex(S.mols)
+            ii == own && continue                       # m's own candidates were rebuilt above
+            for j in 1:K
+                target[j, ii] += real(S.cr_tmp[(ii - 1) * K + j])
+            end
+        end
+    end
+    return nothing
+end
+
+"Candidate structure-factor storage for R (sizes and backend follow R; contents rebuilt by the callers)."
+function _slm_bind_recip!(S::SolventLocalMoves, R)
+    KM = length(S.kinds) * length(S.mols)
+    if size(S.crS, 1) != n_kvectors(R)
+        S.crS = zeros(ComplexF64, n_kvectors(R), KM)
+        S.crSd = S.crS; S.cr_tmpd = S.cr_tmp
+    end
+    if R.backend === :cpu
+        S.crSd = S.crS; S.cr_tmpd = S.cr_tmp
+    elseif S.crSd === S.crS || size(S.crSd) != size(S.crS)
+        S.crSd = backend_array(R.backend, S.crS); S.cr_tmpd = backend_array(R.backend, S.cr_tmp)
+    end
     return nothing
 end
 
@@ -164,7 +225,7 @@ function slm_total_rate!(S::SolventLocalMoves, ek, β::Float64)
     @inbounds for ii in eachindex(S.mols)
         φ = ek.phi[S.mols[ii]]; w = 0.0
         for j in eachindex(S.kinds)
-            r = S.ν * exp(min(-0.5 * β * (S.cu[j, ii] + λ * S.cs[j, ii] - φ), MOBILITY_LOG_MAX))
+            r = S.ν * exp(min(-0.5 * β * (S.cu[j, ii] + S.cr_u[j, ii] + λ * (S.cs[j, ii] + S.cr_s[j, ii]) - φ), MOBILITY_LOG_MAX))
             S.rates[j, ii] = r; w += r
         end
         S.Wm[ii] = w; W += w
@@ -211,7 +272,7 @@ end
 
 "Largest |cu − rebuilt cu| and |cs − rebuilt cs| (debug check; rebuilds S)."
 function slm_check!(S::SolventLocalMoves, sys, ff)
-    cu = copy(S.cu); cs = copy(S.cs)
+    cu = S.cu .+ S.cr_u; cs = S.cs .+ S.cr_s
     slm_rebuild_all!(S, sys, ff)
-    return max(maximum(abs.(cu .- S.cu)), maximum(abs.(cs .- S.cs)))
+    return max(maximum(abs.(cu .- (S.cu .+ S.cr_u))), maximum(abs.(cs .- (S.cs .+ S.cr_s))))
 end

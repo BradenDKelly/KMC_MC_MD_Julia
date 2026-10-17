@@ -34,6 +34,9 @@ Slot kinds:
 L-moves are active at rungs with λ_k > 0 (at λ = 0 the pose is integrated out). The candidate energies are kept as bare
 pair rows cand_pair[j, i]: after a move of another molecule i only column i is re-evaluated (K pair energies); after a
 move of s, an MC-kernel sweep or a refresh they are rebuilt (K rows) lazily, at the next event that needs them.
+With reciprocal-space Ewald (EwaldRecip.jl) cand_pair holds the real-space + LJ part; the Fourier and image part of each
+candidate, cand_rec[j] = Σ_k c_k Re[S_j^*(Stot − S_s)] + e(S_j), is kept with the candidate's structure factor cand_S[:, j]
+and changes by Σ_k c_k Re[S_j^* ΔS_i] when molecule i moves (K·N_k work, no pair re-evaluation).
 The construction is a multi-candidate form of continuous-time samplers with a flip involution and a refreshed
 auxiliary variable (closest published: Jansson et al., arXiv 2504.12190 (2025); literature/NOVELTY_SEARCH_2026-10-14.md).
 The functions take the RigidSystem / SiteForceField / RigidEKMCState of RigidMolecules.jl (included after this file).
@@ -73,6 +76,8 @@ mutable struct LocalMoves
     com0::Vector{Float64}               # scratch: saved pose of s
     q0::Vector{Float64}
     B0::Matrix{Float64}
+    cand_rec::Vector{Float64}           # reciprocal-space Ewald: Fourier + image energy of each candidate (0 otherwise)
+    cand_S::Matrix{ComplexF64}          # N_k × K candidate structure factors (N_k × 0 without reciprocal space)
 end
 
 """
@@ -102,7 +107,7 @@ function LocalMoves(sys, s::Int, nrungs::Int; kinds::Vector{Int}, a::Float64, θ
     lm = LocalMoves(s, copy(kinds), a, θmax, site_a, φmax, zeros(Int, K), tors, zeros(K), 0.0,
                     ν, νD, zeros(3, K), zeros(4, K), [zeros(3, 0) for _ in 1:K],
                     zeros(K, N), zeros(K), zeros(K), true, zeros(Int, max(3, maximum(kinds))), zeros(Int, nrungs), 0, 0,
-                    zeros(N), zeros(N), zeros(3), zeros(4), zeros(3, nB))
+                    zeros(N), zeros(N), zeros(3), zeros(4), zeros(3, nB), zeros(K), zeros(ComplexF64, 0, K))
     lm_refresh!(lm, sys, reservoir)
     lm.n_refresh = 0
     return lm
@@ -200,10 +205,22 @@ function lm_rebuild!(lm::LocalMoves, sys, ff)
     for j in eachindex(lm.kinds)
         _lm_place!(lm, sys, j)
         (lm.kinds[j] == LM_S || lm.kinds[j] == LM_D) && (lm.cand_intra[j] = flex_intra_energy(t, ff, sys.body[lm.mol]))
-        eval_row!(lm.row_u, lm.row_w, sys, ff, lm.mol)
+        eval_row!(lm.row_u, lm.row_w, sys, ff, lm.mol; recip=false)
         u = 0.0
         @inbounds for i in 1:N
             lm.cand_pair[j, i] = lm.row_u[i]; u += lm.row_u[i]
+        end
+        if _has_recip(sys, ff)
+            R = sys.recip
+            size(lm.cand_S, 1) == n_kvectors(R) || (lm.cand_S = zeros(ComplexF64, n_kvectors(R), length(lm.kinds)))
+            Sj = view(lm.cand_S, :, j)
+            recip_sf!(Sj, R, sys, lm.mol)
+            r = recip_half_norm(R, Sj) - recip_corr(R, sys, lm.mol)
+            @inbounds for kk in eachindex(R.c)
+                a = R.Stot[kk] - R.S[kk, lm.mol]
+                r += R.c[kk] * (real(Sj[kk]) * real(a) + imag(Sj[kk]) * imag(a))
+            end
+            lm.cand_rec[j] = r; u += r
         end
         lm.cand_u[j] = u
     end
@@ -224,6 +241,14 @@ function lm_molecule_moved!(lm::LocalMoves, sys, ff, i::Int)
         lm.cand_pair[j, i] = u
     end
     _lm_restore!(lm, sys)
+    if _has_recip(sys, ff)                            # Fourier part: cross term of each candidate with ΔS_i
+        R = sys.recip
+        R.last == i || error("lm_molecule_moved!: reciprocal space last committed molecule $(R.last), not $i")
+        @inbounds for j in eachindex(lm.kinds)
+            d = recip_cross(R, view(lm.cand_S, :, j), R.dS)
+            lm.cand_rec[j] += d; lm.cand_u[j] += d
+        end
+    end
     return nothing
 end
 

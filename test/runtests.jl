@@ -281,10 +281,14 @@ include("test_random_packing.jl")
 include("test_local_moves.jl")
 include("test_solvent_local_moves.jl")
 
+# Reciprocal-space Ewald inside MC and eKMC (DESIGN §13): NIST energies, incremental = rebuild
+include("test_ewald_ekmc.jl")
+
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
     include("test_pressure_identities_slow.jl")
     include("test_fluctuations_slow.jl")
+    include("test_ewald_ekmc_slow.jl")
 else
     @info "Slow tests skipped. To enable, set environment variable: MOLSIM_SLOW_TESTS=1" *
           "\n  Windows PowerShell: `\$env:MOLSIM_SLOW_TESTS=\"1\"; julia --project -e \"using Pkg; Pkg.test()\"`" *

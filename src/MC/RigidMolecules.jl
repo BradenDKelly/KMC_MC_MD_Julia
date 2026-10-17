@@ -124,8 +124,9 @@ function SiteForceField(σ_types::Vector{Float64}, ϵ_types::Vector{Float64}; rc
                         use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
                         cutoff::Symbol=:site, cap_factor::Float64=Float64(OVERLAP_U_REDUCED),
                         mixing::Symbol=:lorentz_berthelot, epsilon_rf::Float64=Inf, epsilon_r::Float64=1.0)
-    coulomb in (:none, :wolf, :rf) || error("SiteForceField: coulomb must be :none, :wolf or :rf")
+    coulomb in (:none, :wolf, :rf, :ewald) || error("SiteForceField: coulomb must be :none, :wolf, :rf or :ewald")
     cutoff in (:site, :molecule) || error("SiteForceField: cutoff must be :site or :molecule")
+    coulomb === :ewald && cutoff !== :site && error("SiteForceField: :ewald needs the site cut-off (real-space erfc sum)")
     mixing in (:lorentz_berthelot, :geometric) ||
         error("SiteForceField: mixing must be :lorentz_berthelot or :geometric")
     σ_mix, ϵ_mix = _compute_mixing_tables(σ_types, ϵ_types)
@@ -208,6 +209,7 @@ mutable struct RigidSystem
     rng::Xoshiro
     body::Vector{Matrix{Float64}}   # flexible molecules: current COM-centred conformation in the body frame (3 × n); rigid: 3 × 0
     ext::Vector{Float64}            # per-molecule extent (template extent for rigid molecules, current conformation for flexible)
+    recip::Union{Nothing,EwaldRecip}   # reciprocal-space Ewald state (coulomb = :ewald, `attach_ewald!`); nothing otherwise
 end
 
 function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Float64, β::Float64,
@@ -222,7 +224,7 @@ function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Flo
     body = [isflexible(templates[tmpl[i]]) ? copy(templates[tmpl[i]].sites_body) : zeros(3, 0) for i in 1:n_mol]
     ext = [templates[tmpl[i]].extent for i in 1:n_mol]
     sys = RigidSystem(n_mol, L, β, templates, copy(tmpl), zeros(3, n_mol), zeros(4, n_mol),
-                      zeros(3, n), site_start, n, rng, body, ext)
+                      zeros(3, n), site_start, n, rng, body, ext, nothing)
     for i in 1:n_mol
         sys.quat[1, i] = 1.0
         update_site_offsets!(sys, i)
@@ -761,6 +763,9 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
                 u += molcut ? wolf_pair_u_nocut(sqrt(r2), qn, qm, ff.wolf) : wolf_pair_u(sqrt(r2), qn, qm, ff.wolf)
             elseif ff.coulomb === :rf && qn != 0.0 && qm != 0.0
                 u += rf_pair_u(sqrt(r2), qn, qm, ff.rf)
+            elseif ff.coulomb === :ewald && qn != 0.0 && qm != 0.0
+                r = sqrt(r2)
+                u += ff.wolf.ke * qn * qm * erfc(ff.wolf.α * r) / r      # Ewald real space (reciprocal part: sys.recip)
             end
         end
     end
@@ -825,6 +830,10 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
                 r = sqrt(r2)
                 u += rf_pair_u(r, qn, qm, ff.rf)
                 fr += rf_pair_fr(r, qn, qm, ff.rf)
+            elseif ff.coulomb === :ewald && qn != 0.0 && qm != 0.0
+                r = sqrt(r2)
+                u += ke * qn * qm * erfc(α * r) / r                      # Ewald real space (reciprocal part: sys.recip)
+                fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
             end
             # R_ij · r̂^{nm} (−du/dr) = (R·r)/r² · (−r du/dr)
             w += (Rx * dx + Ry * dy + Rz * dz) / r2 * fr
@@ -857,9 +866,14 @@ const PARALLEL_MIN_MOL = 96
 
 @inline _use_threads(N::Int) = Threads.nthreads() > 1 && N >= PARALLEL_MIN_MOL
 
-"Fill row_u[j], row_w[j] = pair energy/virial of molecule k with every j ≠ k."
+"""
+Fill row_u[j], row_w[j] = pair energy/virial of molecule k with every j ≠ k. With reciprocal-space Ewald (`sys.recip`)
+and `recip = true` the Fourier pair term ψ_kj (k at its current pose, the others committed) is added to row_u (row_w
+carries the real-space virial only); `recip = false` gives the real-space + LJ row (candidate rows keep the reciprocal
+part separately, EwaldRecip.jl).
+"""
 function eval_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, sys::RigidSystem,
-                   ff::SiteForceField, k::Int)
+                   ff::SiteForceField, k::Int; recip::Bool=true)
     N = sys.n_mol
     if _use_threads(N)
         Threads.@threads :static for j in 1:N
@@ -875,6 +889,7 @@ function eval_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, sys::RigidSys
             row_u[j] = u; row_w[j] = w
         end
     end
+    recip && _has_recip(sys, ff) && recip_row_add!(row_u, sys.recip, sys, k)
     @inbounds row_u[k] = 0.0; @inbounds row_w[k] = 0.0
     return nothing
 end
@@ -906,14 +921,24 @@ function _row_energy_sum(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64
 end
 
 "Removal energy u_k = Σ_{j≠k} u_kj (the eKMC molecular energy, Tan 2017 Eq. 1a)."
-removal_energy(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64 = _row_energy_sum(sys, ff, k)
+removal_energy(sys::RigidSystem, ff::SiteForceField, k::Int)::Float64 =
+    _row_energy_sum(sys, ff, k) + (!_has_recip(sys, ff) ? 0.0 : recip_removal(sys.recip, sys, k))
 
 # Per-task partial sums are indexed by the task number t (rows i ≡ t mod nt, which also balances the
 # triangular loop), never by Threads.threadid(): with Julia ≥ 1.12 the default pool's thread ids start
 # at 2 when an interactive thread exists, so threadid()-indexed arrays overflow.
 
-"Total intermolecular pair energy (no tail, no Wolf constants)."
+"""
+Total intermolecular pair energy (no tail, no Wolf constants). With reciprocal-space Ewald the structure factors are
+rebuilt from the current positions and the Fourier and image terms added (Σ = `ewald_energy(...).total` + LJ).
+"""
 function total_pair_energy(sys::RigidSystem, ff::SiteForceField)::Float64
+    !_has_recip(sys, ff) && return _total_pair_energy_real(sys, ff)
+    recip_rebuild!(sys.recip, sys)
+    return _total_pair_energy_real(sys, ff) + recip_energy_total(sys.recip)
+end
+
+function _total_pair_energy_real(sys::RigidSystem, ff::SiteForceField)::Float64
     N = sys.n_mol
     if _use_threads(N)
         nt = Threads.nthreads()
@@ -934,8 +959,20 @@ function total_pair_energy(sys::RigidSystem, ff::SiteForceField)::Float64
     return U
 end
 
-"Total intermolecular pair energy and molecular virial."
+"""
+    total_pair_energy_virial(sys, ff) -> (U, W)
+
+Total pair energy (as `total_pair_energy`, Fourier and image terms included with reciprocal-space Ewald) and the
+real-space molecular virial (the reciprocal virial is not implemented: `pressure` returns NaN with Ewald).
+"""
 function total_pair_energy_virial(sys::RigidSystem, ff::SiteForceField)
+    U, W = _total_pair_energy_virial_real(sys, ff)
+    !_has_recip(sys, ff) && return U, W
+    recip_rebuild!(sys.recip, sys)
+    return U + recip_energy_total(sys.recip), W
+end
+
+function _total_pair_energy_virial_real(sys::RigidSystem, ff::SiteForceField)
     N = sys.n_mol
     if _use_threads(N)
         nt = Threads.nthreads()
@@ -1062,6 +1099,7 @@ U_tail(V) entering an NPT Metropolis acceptance (the two differ by ≈ (8π/3)ρ
 for water at r_c = 10 Å). Use `:thermodynamic` when comparing with `run_rigid_mc!` NPT densities.
 """
 function pressure(sys::RigidSystem, ff::SiteForceField, W::Float64; tail::Symbol=:virial)::Float64
+    !_has_recip(sys, ff) || return NaN      # reciprocal-space virial not implemented yet (DESIGN §13): no pressure
     V = sys.L^3
     tail in (:virial, :thermodynamic) || error("pressure: tail must be :virial or :thermodynamic")
     P_tail = tail === :virial ? lrc_pressure(sys, ff) : lrc_energy(sys, ff) / V
@@ -1439,6 +1477,7 @@ function mc_translate!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.trans_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     set_molecule!(sys, i, com_old, q)
@@ -1456,6 +1495,7 @@ function mc_rotate!(sys::RigidSystem, ff::SiteForceField, i::Int, δθ::Float64,
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.rot_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     set_molecule!(sys, i, com, q_old)
@@ -1472,6 +1512,7 @@ function mc_reorient!(sys::RigidSystem, ff::SiteForceField, i::Int, st::RigidMCS
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.reor_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     set_molecule!(sys, i, com, q_old)
@@ -1503,6 +1544,7 @@ function mc_site_move!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64
     ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.site_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1538,6 +1580,7 @@ function mc_torsion_move!(sys::RigidSystem, ff::SiteForceField, i::Int, φmax::F
     ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.tors_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1565,6 +1608,7 @@ function mc_conformer_swap!(sys::RigidSystem, ff::SiteForceField, i::Int, res::C
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.swap_acc += 1
+        recip_commit!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1598,6 +1642,7 @@ function mc_volume_trial!(sys::RigidSystem, ff::SiteForceField, Pext::Float64, m
     end
     sys.L = L_old
     sys.com .= com_old
+    !_has_recip(sys, ff) || recip_rebuild!(sys.recip, sys)      # total_energy rebuilt it at the trial volume
     return false, U_current
 end
 
@@ -1610,6 +1655,7 @@ tail contribution of the inserted molecule, if any, is added by `widom_lrc_shift
 """
 function widom_rigid(sys::RigidSystem, ff::SiteForceField, template_idx::Int; ninsert::Int=1000,
                      reservoir::Union{Nothing,ConformerReservoir}=nothing)
+    !_has_recip(sys, ff) || error("widom_rigid: not implemented for reciprocal-space Ewald (use the eKMC/ladder estimators)")
     # temporarily append a ghost molecule
     ghost = RigidSystem(sys.templates, vcat(sys.tmpl, template_idx), sys.L, sys.β, sys.rng)
     ghost.com[:, 1:sys.n_mol] .= sys.com
@@ -1833,13 +1879,19 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
         j == i && continue
         ΔU += ek.row_u[j] - ek.pair_u[i, j]
     end
+    e_new = 0.0
+    if _has_recip(sys, ff)                            # image energy of i at the trial pose (λ-scaled for the fractional molecule)
+        e_new = recip_image_now(sys.recip, sys, i)
+        ΔU += (i == ek.frac ? ek.lam[i] : 1.0) * (e_new - sys.recip.eimg[i])
+    end
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         β = sys.β
+        recip_commit!(sys, i)
         if ek.frac > 0
             s = ek.frac
             if i == s
                 ek.bare_u .= bare_row[1]; ek.bare_w .= bare_row[2]
-                ek.frac_u = sum(ek.bare_u); ek.frac_w = sum(ek.bare_w)
+                ek.frac_u = sum(ek.bare_u) + e_new; ek.frac_w = sum(ek.bare_w)
             else
                 ek.frac_u += bare_s - ek.bare_u[i]; ek.frac_w += bare_sw - ek.bare_w[i]
                 ek.bare_u[i] = bare_s; ek.bare_w[i] = bare_sw
@@ -1858,6 +1910,7 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
             ek.wsum[j] += dw
             phii += ek.row_u[j]; wi += ek.row_w[j]
         end
+        !_has_recip(sys, ff) || (phii += (i == ek.frac ? ek.lam[i] : 1.0) * e_new)
         ek.phi[i] = phii; ek.wsum[i] = wi
         ek.m[i] = _mob(ek, β, i)
         ek.R = sum(ek.m)                      # never incremental (see update_rigid_ekmc_after_move!)
@@ -1936,6 +1989,7 @@ ekmc_virial(ek::RigidEKMCState) = 0.5 * sum(ek.wsum)
 "Recompute all pair energies and virials, φ, mobilities and R from scratch."
 function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
     N = sys.n_mol
+    !_has_recip(sys, ff) || recip_rebuild!(sys.recip, sys)
     fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0); fill!(ek.pair_w, 0.0); fill!(ek.wsum, 0.0)
     if _use_threads(N)
         nt = Threads.nthreads()
@@ -1960,6 +2014,16 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
             ek.wsum[i] += w; ek.wsum[j] += w
         end
     end
+    if _has_recip(sys, ff)                           # Fourier pair terms ψ_ij = Σ_k c_k Re[S_i^* S_j]: one product Sᴴ diag(c) S
+        Rr = sys.recip
+        Ψ = real.(Array(Rr.Sd' * (Rr.cd .* Rr.Sd)))      # on the reciprocal-space backend
+        @inbounds for j in 1:N, i in 1:N
+            i == j || (ek.pair_u[i, j] += Ψ[i, j])
+        end
+        @inbounds for i in 1:N
+            ek.phi[i] = sum(view(ek.pair_u, :, i))
+        end
+    end
     if ek.frac > 0                                     # fractional molecule: store the bare row, scale the matrix
         s = ek.frac; λ = ek.lam[s]
         ek.frac_u = 0.0; ek.frac_w = 0.0
@@ -1973,6 +2037,16 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
             ek.phi[i] = sum(view(ek.pair_u, :, i)); ek.wsum[i] = sum(view(ek.pair_w, :, i))
         end
     end
+    if _has_recip(sys, ff)                           # image energies e_i (EwaldRecip.jl): per-molecule part of φ_i
+        @inbounds for i in 1:N
+            e = sys.recip.eimg[i]
+            if i == ek.frac
+                ek.frac_u += e; ek.phi[i] += ek.lam[i] * e
+            else
+                ek.phi[i] += e
+            end
+        end
+    end
     R = 0.0
     for i in 1:N
         ek.m[i] = _mob(ek, sys.β, i); R += ek.m[i]
@@ -1982,10 +2056,20 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     return nothing
 end
 
+"Σ_i λ_i e_i: the image energies inside φ (λ-scaled for the fractional molecule)."
+function _image_energy_sum(ek::RigidEKMCState, sys::RigidSystem)::Float64
+    E = 0.0
+    @inbounds for i in 1:sys.n_mol
+        E += (i == ek.frac ? ek.lam[i] : 1.0) * sys.recip.eimg[i]
+    end
+    return E
+end
+
 "Appendix-1 update after molecule k has been moved: row/column k of energies and virials, all φ_j, Σ_j w_ij, mobilities, R."
 function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, k::Int)
     N = sys.n_mol
     β = sys.β
+    recip_commit!(sys, k)                               # reciprocal space: S_k, ΔS_k, Stot, e_k (no-op otherwise)
     eval_row!(ek.row_u, ek.row_w, sys, ff, k)          # threaded when N ≥ PARALLEL_MIN_MOL
     if ek.frac > 0                                      # fractional molecule: bare row kept, matrix entries scaled by λ
         s = ek.frac; λ = ek.lam[s]
@@ -2017,6 +2101,10 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
             ek.wsum[j] += w_new - w_old
         end
         phik += u_new; wk += w_new
+    end
+    if _has_recip(sys, ff)
+        e = sys.recip.eimg[k]
+        k == ek.frac ? (ek.frac_u += e; phik += ek.lam[k] * e) : (phik += e)
     end
     ek.phi[k] = phik; ek.wsum[k] = wk
     ek.m[k] = _mob(ek, β, k)
@@ -2639,6 +2727,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             end
             if n_full % sample_every == 0
                 Up = 0.5 * sum(ek.phi)
+                !_has_recip(sys, ff) || (Up += 0.5 * _image_energy_sum(ek, sys))   # e_i counted once, not halved
                 push!(ba_U, (Up + lrc_energy(sys, ff)) / N, dt)
                 push!(ba_P, pressure(sys, ff, ekmc_virial(ek); tail=tail_route), dt)
                 push!(ba_rho, N / V, dt)

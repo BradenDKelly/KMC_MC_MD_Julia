@@ -1,0 +1,9 @@
+# GROMACS 2024.3 (mixed precision) gmx mdrun -rerun energies, kJ/mol, for rf_reference_spce_methanol.gro
+# (500 SPC/E + 1 OPLS-AA rigid methanol, L = 2.463884 nm); rvdw = rcoulomb = 1.0 nm, vdw-modifier None, DispCorr EnerPres,
+# coulomb-modifier None, ewald-rtol 1e-5, ewald-geometry 3d (tin-foil). Generated 2026-10-17 in gromacs_fe/ewald_ref
+# (topology gromacs_fe/methanol_aa.top). pme: fourierspacing 0.12 nm, pme-order 4 (24^3); pmefine: 0.04 nm, order 8 (64^3);
+# ewald: coulombtype Ewald, fourier-nx = 24.
+# setting  LJ_SR  Disper_corr  Coulomb_SR  Coul_recip
+pme 3370.078369 -92.536018 -24161.361328 173.950653
+pmefine 3370.078369 -92.536018 -24161.353516 174.304398
+ewald 3370.078613 -92.536018 -24161.357422 174.303513
