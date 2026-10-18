@@ -1,0 +1,4 @@
+# GROMACS 2024.3 (mixed precision) rerun of test/data/gromacs_<solute>_spce500.gro (MolSim coordinates, 6 decimals), topology
+# gromacs_fe/ff/opls_spce_new.itp (dev/gromacs_solute_itp.jl), RF eps_rf = 0 (inf), rc 1.0 nm, plain LJ: Potential - Disper. corr. (kJ/mol)
+butanol_flex -26709.9112
+caffeine_lpg -26697.3887

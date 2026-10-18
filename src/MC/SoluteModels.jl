@@ -92,9 +92,12 @@ function trappe_ua_solute(solute::Symbol)
 end
 
 "Flexible OPLS-AA solutes built from the GROMACS topologies shipped in oplsaa.ff (OPLSTopology.jl)."
-const OPLS_FLEX_ITP = Dict(:methanol_itp => "methanol.itp", :ethanol_flex => "ethanol.itp", :propanol_flex => "1propanol.itp")
+# file names inside oplsaa.ff, or absolute paths (data/opls: same convention, not shipped with GROMACS)
+const OPLS_DATA_DIR = normpath(joinpath(@__DIR__, "..", "..", "data", "opls"))
+const OPLS_FLEX_ITP = Dict(:methanol_itp => "methanol.itp", :ethanol_flex => "ethanol.itp", :propanol_flex => "1propanol.itp",
+                           :butanol_flex => joinpath(OPLS_DATA_DIR, "1butanol.itp"))
 "Flexible drug-like molecules from LigParGen topologies in data/ligpargen/ (DESIGN §14 V4)."
-const LIGPARGEN_ITP = Dict(:ibuprofen_lpg => "ibuprofen")
+const LIGPARGEN_ITP = Dict(:ibuprofen_lpg => "ibuprofen", :caffeine_lpg => "caffeine")
 const LIGPARGEN_DIR = normpath(joinpath(@__DIR__, "..", "..", "data", "ligpargen"))
 
 """

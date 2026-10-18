@@ -298,6 +298,7 @@ include("test_flexible_solvent.jl")
 include("test_ligpargen.jl")
 include("test_device_pairs.jl")
 include("test_box_images.jl")
+include("test_solutes_gromacs.jl")
 
 # Conditional include for slow tests (long-run ensemble convergence)
 if RUN_SLOW_TESTS
