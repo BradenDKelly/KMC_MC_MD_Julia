@@ -223,6 +223,10 @@ end
             ni = Int(@inbounds mn[i]); nj = Int(@inbounds mn[j])
             po = (p - 1) * Int(maxs)
             Rxt = T(Rx); Ryt = T(Ry); Rzt = T(Rz)
+            # site cut-off, large molecules in a small box: wrap each site separation (as pair_energy_virial)
+            e = @inbounds(ext[j]) + @inbounds(pext[p]); hL = 0.5 * prm.L
+            wrap = !prm.molcut && prm.rc < hL && (abs(Rx) + e > hL || abs(Ry) + e > hL || abs(Rz) + e > hL)
+            LT = T(prm.L)
             nt = Int(prm.nt)
             q = l - 1
             while q < ni * nj
@@ -231,6 +235,11 @@ end
                     dx = Rxt + off[1, sj0 + m + 1] - poff[1, po + n + 1]
                     dy = Ryt + off[2, sj0 + m + 1] - poff[2, po + n + 1]
                     dz = Rzt + off[3, sj0 + m + 1] - poff[3, po + n + 1]
+                end
+                Rwx = Rxt; Rwy = Ryt; Rwz = Rzt
+                if wrap
+                    kx = LT * round(dx / LT); ky = LT * round(dy / LT); kz = LT * round(dz / LT)
+                    dx -= kx; dy -= ky; dz -= kz; Rwx -= kx; Rwy -= ky; Rwz -= kz
                 end
                 r2 = dx * dx + dy * dy + dz * dz
                 if prm.molcut || r2 < prm.rc2T
@@ -264,7 +273,7 @@ end
                             fr += prm.wke * qq * (e / r + (2 * prm.α / T(SQRT_PI)) * exp(-prm.α * prm.α * r2))
                         end
                     end
-                    aw += (Rxt * dx + Ryt * dy + Rzt * dz) / r2 * fr
+                    aw += (Rwx * dx + Rwy * dy + Rwz * dz) / r2 * fr
                 end
                 q += DP_GROUP
             end

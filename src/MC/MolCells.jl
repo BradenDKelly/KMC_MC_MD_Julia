@@ -275,6 +275,7 @@ function site_cells_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, c::Site
     tk = sys.templates[sys.tmpl[k]]; sk = sys.site_start[k]
     c.nstamp += 1; st = c.nstamp; nt = 0
     capping = ff.cap_overlaps
+    siteimg = _site_images(ff, L)
     @inbounds for a in 1:tk.n_sites
         _site_active(tk, a) || continue
         ox, oy, oz = sys.site_off[1, sk + a], sys.site_off[2, sk + a], sys.site_off[3, sk + a]
@@ -296,6 +297,10 @@ function site_cells_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, c::Site
                     ddx = Rx + sys.site_off[1, s] - ox
                     ddy = Ry + sys.site_off[2, s] - oy
                     ddz = Rz + sys.site_off[3, s] - oz
+                    if siteimg && _pair_wraps(Rx, Ry, Rz, sys.ext[k] + sys.ext[j], L)   # as pair_energy_virial
+                        kx = L * round(ddx / L); ky = L * round(ddy / L); kz = L * round(ddz / L)
+                        ddx -= kx; ddy -= ky; ddz -= kz; Rx -= kx; Ry -= ky; Rz -= kz
+                    end
                     r2 = ddx * ddx + ddy * ddy + ddz * ddz
                     if r2 < rc2
                         tj = sys.templates[sys.tmpl[j]]; m = s - sys.site_start[j]

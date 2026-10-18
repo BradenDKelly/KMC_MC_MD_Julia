@@ -715,6 +715,16 @@ end
     return d - L * round(d / L)
 end
 
+# Site cut-off with large molecules in a small box (L/2 < rc + ext_i + ext_j): a site pair's nearest image need not be the
+# image of the nearest COM, so each site separation is then wrapped on its own (GROMACS's convention; one image per site
+# pair because rc < L/2). Molecule pairs with |R_k| + ext_i + ext_j ≤ L/2 on every axis keep the COM image — the same site
+# separations, bitwise. The molecule cut-off defines the image by the COM and is never wrapped. Per-site images need
+# rc < L/2 (each site pair then has one image within rc; GROMACS refuses smaller boxes); with rc ≥ L/2 (tests that sample
+# isolated pair geometries in a tiny box) the COM image is kept: the energy of the two molecules as one isolated pair.
+@inline _pair_wraps(Rx::Float64, Ry::Float64, Rz::Float64, e::Float64, L::Float64) =
+    abs(Rx) + e > 0.5 * L || abs(Ry) + e > 0.5 * L || abs(Rz) + e > 0.5 * L
+@inline _site_images(ff, L::Float64) = ff.cutoff !== :molecule && ff.rc < 0.5 * L
+
 """
     pair_energy(sys, ff, i, j) -> u_ij
 
@@ -739,6 +749,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
     end
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
+    wrap = _site_images(ff, L) && _pair_wraps(Rx, Ry, Rz, sys.ext[i] + sys.ext[j], L)
     u = 0.0
     @inbounds for n in 1:ti.n_sites
         ox, oy, oz = sys.site_off[1, si + n], sys.site_off[2, si + n], sys.site_off[3, si + n]
@@ -747,6 +758,9 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             dx = Rx + sys.site_off[1, sj + m] - ox
             dy = Ry + sys.site_off[2, sj + m] - oy
             dz = Rz + sys.site_off[3, sj + m] - oz
+            if wrap
+                dx = _min_image(dx, L); dy = _min_image(dy, L); dz = _min_image(dz, L)
+            end
             r2 = dx * dx + dy * dy + dz * dz
             (molcut || r2 < rc2) || continue
             tym = tj.site_type[m]
@@ -832,6 +846,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
     end
     si = sys.site_start[i]; sj = sys.site_start[j]
     rc2 = ff.rc2
+    wrap = _site_images(ff, L) && _pair_wraps(Rx, Ry, Rz, sys.ext[i] + sys.ext[j], L)
     u = 0.0; w = 0.0
     α = ff.wolf.α; ke = ff.wolf.ke
     @inbounds for n in 1:ti.n_sites
@@ -841,6 +856,11 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
             dx = Rx + sys.site_off[1, sj + m] - ox
             dy = Ry + sys.site_off[2, sj + m] - oy
             dz = Rz + sys.site_off[3, sj + m] - oz
+            Rwx = Rx; Rwy = Ry; Rwz = Rz                     # COM separation of the image this site pair uses (virial)
+            if wrap                                          # dx − L·round(dx/L) = _min_image(dx, L), bitwise
+                kx = L * round(dx / L); ky = L * round(dy / L); kz = L * round(dz / L)
+                dx -= kx; dy -= ky; dz -= kz; Rwx -= kx; Rwy -= ky; Rwz -= kz
+            end
             r2 = dx * dx + dy * dy + dz * dz
             (molcut || r2 < rc2) || continue
             tym = tj.site_type[m]
@@ -872,7 +892,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
                 fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
             end
             # R_ij · r̂^{nm} (−du/dr) = (R·r)/r² · (−r du/dr)
-            w += (Rx * dx + Ry * dy + Rz * dz) / r2 * fr
+            w += (Rwx * dx + Rwy * dy + Rwz * dz) / r2 * fr
         end
     end
     ff.cap_overlaps && u > ff.cap_min_u && return ff.cap_min_u, 0.0   # kT cap: capped pairs carry no virial
@@ -1355,6 +1375,7 @@ function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::Rig
         end
         ti = sys.templates[sys.tmpl[i]]; tj = sys.templates[sys.tmpl[j]]
         si = sys.site_start[i]; sj = sys.site_start[j]
+        wrap = _site_images(ff, L) && _pair_wraps(Rx, Ry, Rz, sys.ext[i] + sys.ext[j], L)
         # capped pair (geometric trigger, or bare energy above the kT cap)? then its cap energy and no
         # force — exactly as pair_energy
         capped = false
@@ -1365,6 +1386,9 @@ function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::Rig
                 dx = Rx + sys.site_off[1, sj + m] - sys.site_off[1, si + n]
                 dy = Ry + sys.site_off[2, sj + m] - sys.site_off[2, si + n]
                 dz = Rz + sys.site_off[3, sj + m] - sys.site_off[3, si + n]
+                if wrap
+                    dx = _min_image(dx, L); dy = _min_image(dy, L); dz = _min_image(dz, L)
+                end
                 r2 = dx * dx + dy * dy + dz * dz
                 (molcut || r2 < ff.rc2) || continue
                 if r2 < ff.rcap2_mix[tyn, tym]
@@ -1382,6 +1406,9 @@ function rigid_forces_torques!(F::Matrix{Float64}, τ::Matrix{Float64}, sys::Rig
             for m in 1:tj.n_sites
                 px, py, pz = sys.site_off[1, sj + m], sys.site_off[2, sj + m], sys.site_off[3, sj + m]
                 dx = Rx + px - ox; dy = Ry + py - oy; dz = Rz + pz - oz
+                if wrap
+                    dx = _min_image(dx, L); dy = _min_image(dy, L); dz = _min_image(dz, L)
+                end
                 r2 = dx * dx + dy * dy + dz * dz
                 (molcut || r2 < ff.rc2) || continue
                 tym = tj.site_type[m]; qm = tj.site_q[m]
@@ -2242,6 +2269,7 @@ function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
         dmax = sys.ext[k] + sys.ext[j] + rcap
         Rx * Rx + Ry * Ry + Rz * Rz > dmax * dmax && continue
         sj = sys.site_start[j]
+        wrapk = _site_images(ff, L) && _pair_wraps(Rx, Ry, Rz, sys.ext[k] + sys.ext[j], L)
         found = false; ucap = 0.0
         for a in 1:tk.n_sites
             ta = tk.site_type[a]
@@ -2253,6 +2281,9 @@ function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
                 dx = Rx + sys.site_off[1, sj + b] - ox
                 dy = Ry + sys.site_off[2, sj + b] - oy
                 dz = Rz + sys.site_off[3, sj + b] - oz
+                if wrapk
+                    dx = _min_image(dx, L); dy = _min_image(dy, L); dz = _min_image(dz, L)
+                end
                 if dx * dx + dy * dy + dz * dz < ff.rcap2_mix[ta, tb]
                     found = true; ucap = ff.ucap_mix[ta, tb]
                     break
@@ -2919,6 +2950,8 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         elseif slmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc + w_ref + w_sl
             # solvent L-move (DESIGN §11.2 stage 2)
             i_mv = slm_fire!(slmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub + w_loc + w_ref))
+            # a site or torsion slot changed the mover's conformation: keep the U_intra observable current
+            isflexible(sys.templates[sys.tmpl[i_mv]]) && (Uin[i_mv] = flex_intra_energy(sys.templates[sys.tmpl[i_mv]], ff, sys.body[i_mv]))
             if lmoves !== nothing
                 ek.lam[lmoves.mol] > 0.0 ? lm_molecule_moved!(lmoves, sys, ff, i_mv) : (lmoves.stale = true)
             end

@@ -63,6 +63,21 @@ end
     end
 end
 
+@testset "Flexible solvent L-moves in the eKMC loop: the U_intra observable follows site and torsion events (regression)" begin
+    # Before the fix the per-molecule U_intra (r.Uin) was refreshed at relocations but not after a solvent S/D event, so
+    # ⟨U_intra⟩ of eKMC with solvent_flexible = true read stale conformations (slow test V3: 31.61 vs MC 30.39 kJ/mol).
+    m, sys = ethanol_liquid(20, 9)
+    ff = m.ff; t = m.templates[2]
+    res = MCf.build_reservoir([t], 1, ff, sys.β, Xoshiro(2); M=200, burnin_sweeps=50, stride_sweeps=5, δ=0.02)
+    r = MCf.init_rigid_ekmc_run(sys, ff; events=20_000, sample_every=20, block_events=2_000, reservoirs=[res],
+                                local_solvent=true, solvent_flexible=true, solvent_nu=1e-3, mc_δ=0.05, mc_δθ=0.15,
+                                solvent_site_a=0.01, solvent_φ=0.5)
+    MCf.advance_rigid_ekmc!(r, sys, ff)
+    @test r.slmoves.n_move[MCf.LM_S] > 0 && r.slmoves.n_move[MCf.LM_D] > 0
+    fresh = [MCf.flex_intra_energy(t, ff, sys.body[i]) for i in 1:sys.n_mol]
+    @test maximum(abs.(r.Uin .- fresh)) <= 1e-12 * maximum(abs.(fresh))
+end
+
 @testset "Flexible LJ-dimer liquid: eKMC + flexible solvent L-moves vs Metropolis MC (U, P, ⟨U_intra⟩)" begin
     N = 32; ρ = 0.3; T = 2.0; β = 1 / T
     sites = zeros(3, 2); sites[1, 1] = -0.3; sites[1, 2] = 0.3

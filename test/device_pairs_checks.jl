@@ -58,11 +58,19 @@ function pair_bounds(sys, ff, i, j, precision)
     molcut = ff.cutoff === :molecule
     molcut && sum(abs2, R) >= ff.rc2 && return 0.0, 0.0, false
     ΣMu = 0.0; ΣMw = 0.0; prop = 0.0; amb = false; np = 0
+    wrap = MCd._site_images(ff, L) && MCd._pair_wraps(R[1], R[2], R[3], sys.ext[i] + sys.ext[j], L)
     for a in 1:ti.n_sites, b in 1:tj.n_sites
-        dv = R .+ sys.site_off[:, sj + b] .- sys.site_off[:, si + a]; r2 = sum(abs2, dv)
+        dv = R .+ sys.site_off[:, sj + b] .- sys.site_off[:, si + a]
+        Rw = copy(R)
+        if wrap                                    # per-site image (pair_energy_virial, site cut-off, small box)
+            kk = L .* round.(dv ./ L); dv = dv .- kk; Rw = Rw .- kk
+        end
+        r2 = sum(abs2, dv)
         δr2 = 0.0
         if precision === :mixed
-            δd = [γd(3, U32) * (abs(R[k]) + abs(sys.site_off[k, sj + b]) + abs(sys.site_off[k, si + a])) for k in 1:3]
+            # Float32 R, o_j, o_i, two additions; with the wrap also L·round(d/L) (one product, one subtraction)
+            δd = [wrap ? γd(5, U32) * (abs(R[k]) + abs(sys.site_off[k, sj + b]) + abs(sys.site_off[k, si + a]) + L) :
+                         γd(3, U32) * (abs(R[k]) + abs(sys.site_off[k, sj + b]) + abs(sys.site_off[k, si + a])) for k in 1:3]
             δr2 = sum(2 .* abs.(dv) .* δd) + γd(3, U32) * r2
             (!molcut && abs(r2 - ff.rc2) <= δr2 + U32 * ff.rc2) && (amb = true)
             tyn = ti.site_type[a]; tym = tj.site_type[b]
@@ -71,7 +79,7 @@ function pair_bounds(sys, ff, i, j, precision)
         (molcut || r2 < ff.rc2) || continue
         np += 1
         Mu, Mf = _site_pair_mag(ff, ti.site_type[a], ti.site_q[a], tj.site_type[b], tj.site_q[b], r2)
-        ΣMu += Mu; ΣMw += sum(abs.(R .* dv)) / r2 * Mf
+        ΣMu += Mu; ΣMw += sum(abs.(Rw .* dv)) / r2 * Mf
         prop += Mf / (2r2) * δr2
     end
     ndev = 3 * cld(ti.n_sites * tj.n_sites, 32) + 5; ncpu = 3np
