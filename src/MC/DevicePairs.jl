@@ -1,0 +1,327 @@
+# ============================================================================
+# Device pair kernel (DESIGN §15): batches of (pose, molecule) pair energies and virials
+# ============================================================================
+# One task = (pose p, molecule j). A pose is a molecule i at its committed pose or at a candidate pose (COM, site offsets,
+# extent); the task result is exactly the term of `pair_energy_virial(sys, ff, i, j)` with i at pose p: minimum image on
+# the COM, then the offsets; site or molecule cut-off; LJ (+ shift); RF, Wolf/DSF or Ewald real space; the overlap cap is
+# the FIRST overlapping site pair in the (n, m) loop order of pair_energy_virial (minimum linear index n·n_j + m over the
+# work-group), capped pairs carry no virial; then min(u, cap_min_u). A work-group of DP_GROUP work-items per task strides over
+# the n_i·n_j site pairs and reduces in local memory in a fixed order (same result on every call). KernelAbstractions: the
+# same kernel runs on the CPU (test oracle against pair_energy_virial) and on CUDA (MolSimCUDAExt: `device_backend`).
+#
+# Precision: :double — Float64 throughout; :mixed (GROMACS convention, DESIGN §15.3) — the COM minimum image in Float64,
+# then Float32 relative coordinates, site-pair terms and per-work-item partial sums, Float64 work-group reduction.
+
+using KernelAbstractions
+const KA = KernelAbstractions
+
+"KernelAbstractions backend for a device symbol (:cpu here; :cuda from MolSimCUDAExt)."
+device_backend(::Val{:cpu}) = KA.CPU()
+device_backend(::Val{B}) where {B} = error("device backend :$B is not loaded (for :cuda: `using CUDA`)")
+device_backend(b::Symbol) = device_backend(Val(b))
+
+const DP_GROUP = 32
+
+# isbits scalars of the force field for the kernel
+struct DPParams{T}
+    L::Float64
+    rc::Float64
+    rc2::Float64        # molecule cut-off test on the Float64 COM distance
+    rc2T::T             # site cut-off test on the site distance
+    molcut::Bool
+    coul::Int32         # 0 none, 1 RF, 2 Wolf/DSF, 3 Ewald real space
+    ke_rf::T            # ke/ε_r
+    k_rf::T
+    c_rf::T
+    wke::T              # Wolf/Ewald ke
+    α::T
+    wshift::T           # erfc(α rc)/rc
+    dsf::Bool
+    dsf_slope::T
+    rcT::T
+    cap::Bool
+    cap_min_u::Float64
+    shift::Bool
+    nt::Int32
+end
+
+mutable struct DevicePairs{T}
+    backend::Symbol
+    kab::Any
+    precision::Symbol
+    N::Int
+    maxs::Int
+    prm::DPParams{T}
+    # committed state
+    com::Any; off::Any; sty::Any; sq::Any; mstart::Any; mn::Any; ext::Any
+    # force-field tables (n_types², column-major (a, b) ↦ (a − 1)·n_t + b)
+    σ2::Any; e4::Any; e24::Any; urc::Any; rcap2::Any; ucap::Any
+    # pose bank (P poses, maxs site slots each) and its host staging
+    P::Int
+    pcom::Any; poff::Any; pmol::Any; pext::Any
+    hcom::Matrix{Float64}; hoff::Matrix{T}; hmol::Vector{Int32}; hext::Vector{Float64}
+    # explicit task lists and outputs
+    tp::Any; tj::Any; U::Any; W::Any
+    htp::Vector{Int32}; htj::Vector{Int32}; hU::Vector{Float64}; hW::Vector{Float64}
+    # staging for one molecule's offsets
+    hstage::Matrix{T}
+end
+
+_dp_array(b::Symbol, A::AbstractArray) = b === :cpu ? copy(A) : backend_array(b, A)
+
+"""
+    DevicePairs(sys, ff; backend=:cpu, precision=:mixed, max_poses=64, max_tasks=max_poses·N)
+
+Device copy of the committed pair-energy inputs of `sys` (offsets, COMs, site types and charges, extents) and the
+force-field tables, with a bank of `max_poses` poses and room for `max_tasks` explicit tasks (DESIGN §15.3).
+"""
+function DevicePairs(sys::RigidSystem, ff::SiteForceField; backend::Symbol=:cpu, precision::Symbol=:mixed,
+                     max_poses::Int=64, max_tasks::Int=max_poses * sys.n_mol)
+    precision in (:double, :mixed) || error("DevicePairs: precision must be :double or :mixed")
+    ff.coulomb in (:none, :rf, :wolf, :ewald) || error("DevicePairs: coulomb $(ff.coulomb) not supported")
+    T = precision === :double ? Float64 : Float32
+    N = sys.n_mol; Ns = sys.n_sites_total
+    maxs = maximum(sys.templates[sys.tmpl[i]].n_sites for i in 1:N)
+    sty = zeros(Int32, Ns); sq = zeros(T, Ns); mstart = zeros(Int32, N); mn = zeros(Int32, N)
+    for i in 1:N
+        t = sys.templates[sys.tmpl[i]]; s0 = sys.site_start[i]
+        mstart[i] = s0; mn[i] = t.n_sites
+        for n in 1:t.n_sites
+            sty[s0 + n] = t.site_type[n]; sq[s0 + n] = t.site_q[n]
+        end
+    end
+    nt = ff.n_types
+    flat(M) = [M[a, b] for a in 1:nt for b in 1:nt]        # index (a − 1)·nt + b
+    σ2 = T.(flat(ff.σ_mix .^ 2)); e4 = T.(4 .* flat(ff.ϵ_mix)); e24 = T.(24 .* flat(ff.ϵ_mix)); urc = T.(flat(ff.u_rc_mix))
+    rcap2 = T.(flat(ff.rcap2_mix)); ucap = Float64.(flat(ff.ucap_mix))
+    rf = ff.rf; wp = ff.wolf
+    coul = ff.coulomb === :none ? Int32(0) : ff.coulomb === :rf ? Int32(1) : ff.coulomb === :wolf ? Int32(2) : Int32(3)
+    erfc_rc = erfc(wp.α * wp.rc)
+    slope = erfc_rc / (wp.rc^2) + (2.0 * wp.α / SQRT_PI) * exp(-wp.α^2 * wp.rc^2) / wp.rc
+    prm = DPParams{T}(sys.L, ff.rc, ff.rc2, T(ff.rc2), ff.cutoff === :molecule, coul, T(rf.ke / rf.ε_r), T(rf.k_rf), T(rf.c_rf),
+                      T(wp.ke), T(wp.α), T(erfc_rc / wp.rc), wp.model === :dsf, T(slope), T(wp.rc),
+                      ff.cap_overlaps, ff.cap_min_u, ff.shift_lj, Int32(nt))
+    b = backend; d(A) = _dp_array(b, A)
+    D = DevicePairs{T}(b, device_backend(b), precision, N, maxs, prm,
+                       d(copy(sys.com)), d(T.(sys.site_off)), d(sty), d(sq), d(mstart), d(mn), d(copy(sys.ext)),
+                       d(σ2), d(e4), d(e24), d(urc), d(rcap2), d(ucap),
+                       max_poses, d(zeros(3, max_poses)), d(zeros(T, 3, max_poses * maxs)), d(zeros(Int32, max_poses)),
+                       d(zeros(max_poses)),
+                       zeros(3, max_poses), zeros(T, 3, max_poses * maxs), zeros(Int32, max_poses), zeros(max_poses),
+                       d(zeros(Int32, max_tasks)), d(zeros(Int32, max_tasks)), d(zeros(max_tasks)), d(zeros(max_tasks)),
+                       zeros(Int32, max_tasks), zeros(Int32, max_tasks), zeros(max_tasks), zeros(max_tasks),
+                       zeros(T, 3, maxs))
+    return D
+end
+
+"Re-upload the whole committed state (after a rebuild, a volume change or a box rescale)."
+function dp_sync!(D::DevicePairs{T}, sys::RigidSystem) where {T}
+    sys.L == D.prm.L || (D.prm = _dp_with_L(D.prm, sys.L))
+    copyto!(D.com, sys.com); copyto!(D.off, T.(sys.site_off)); copyto!(D.ext, sys.ext)
+    return D
+end
+_dp_with_L(p::DPParams{T}, L) where {T} = DPParams{T}(L, (getfield(p, f) for f in fieldnames(DPParams)[2:end])...)
+
+"Upload molecule i's committed pose (COM, offsets, extent) after a committed move."
+function dp_sync_molecule!(D::DevicePairs{T}, sys::RigidSystem, i::Int) where {T}
+    n = sys.templates[sys.tmpl[i]].n_sites; s0 = sys.site_start[i]
+    st = D.hstage
+    @inbounds for a in 1:n, d in 1:3
+        st[d, a] = T(sys.site_off[d, s0 + a])
+    end
+    copyto!(D.off, 3 * s0 + 1, st, 1, 3 * n)
+    copyto!(D.com, 3 * (i - 1) + 1, sys.com, 3 * (i - 1) + 1, 3)
+    copyto!(D.ext, i, sys.ext, i, 1)
+    return D
+end
+
+"Stage molecule i's CURRENT pose in sys (committed or a candidate placed by the caller) as pose `slot` of the bank."
+function dp_stage_pose!(D::DevicePairs{T}, slot::Int, sys::RigidSystem, i::Int) where {T}
+    1 <= slot <= D.P || error("dp_stage_pose!: slot $slot outside the bank (P = $(D.P))")
+    n = sys.templates[sys.tmpl[i]].n_sites; s0 = sys.site_start[i]; o = (slot - 1) * D.maxs
+    @inbounds begin
+        for d in 1:3
+            D.hcom[d, slot] = sys.com[d, i]
+        end
+        for a in 1:n, d in 1:3
+            D.hoff[d, o + a] = T(sys.site_off[d, s0 + a])
+        end
+        D.hmol[slot] = i; D.hext[slot] = sys.ext[i]
+    end
+    return D
+end
+"Upload poses 1…np of the host staging to the device bank."
+function dp_upload_poses!(D::DevicePairs, np::Int)
+    np == 0 && return D
+    copyto!(D.pcom, 1, D.hcom, 1, 3 * np); copyto!(D.poff, 1, D.hoff, 1, 3 * np * D.maxs)
+    copyto!(D.pmol, 1, D.hmol, 1, np); copyto!(D.pext, 1, D.hext, 1, np)
+    return D
+end
+
+@kernel function _dp_kernel!(U, W, @Const(tp), @Const(tj), implicit::Int32, Nm::Int32,
+                             @Const(com), @Const(off), @Const(sty), @Const(sq), @Const(mstart), @Const(mn), @Const(ext),
+                             @Const(pcom), @Const(poff), @Const(pmol), @Const(pext), maxs::Int32,
+                             @Const(σ2), @Const(e4), @Const(e24), @Const(urc), @Const(rcap2), @Const(ucap), prm)
+    g = @index(Group, Linear)
+    l = @index(Local, Linear)
+    su = @localmem Float64 (DP_GROUP,)
+    sw = @localmem Float64 (DP_GROUP,)
+    smi = @localmem Int32 (DP_GROUP,)
+    au, aw, mi = _dp_partial(g, l, tp, tj, implicit, Nm, com, off, sty, sq, mstart, mn, ext, pcom, poff, pmol, pext, maxs,
+                             σ2, e4, e24, urc, rcap2, prm)
+    @inbounds su[l] = au; @inbounds sw[l] = aw; @inbounds smi[l] = mi
+    @synchronize
+    _dp_reduce_step!(su, sw, smi, @index(Local, Linear), 16)
+    @synchronize
+    _dp_reduce_step!(su, sw, smi, @index(Local, Linear), 8)
+    @synchronize
+    _dp_reduce_step!(su, sw, smi, @index(Local, Linear), 4)
+    @synchronize
+    _dp_reduce_step!(su, sw, smi, @index(Local, Linear), 2)
+    @synchronize
+    _dp_reduce_step!(su, sw, smi, @index(Local, Linear), 1)
+    @synchronize
+    if @index(Local, Linear) == 1
+        gg = @index(Group, Linear)
+        u, w = @inbounds _dp_final(gg, su[1], sw[1], smi[1], tp, tj, implicit, Nm, sty, mstart, mn, pmol, ucap, prm)
+        @inbounds U[gg] = u; @inbounds W[gg] = w
+    end
+end
+# one step of the fixed-order tree reduction (work-items 1…s add work-item l + s)
+@inline function _dp_reduce_step!(su, sw, smi, l, s)
+    @inbounds if l <= s
+        su[l] += su[l + s]; sw[l] += sw[l + s]; smi[l] = min(smi[l], smi[l + s])
+    end
+    return nothing
+end
+
+@inline function _dp_task(g, tp, tj, implicit, Nm)
+    if implicit != 0
+        return (g - 1) ÷ Nm + 1, (g - 1) % Nm + 1          # rows: task g = (pose p, molecule j), j fastest
+    else
+        return Int(@inbounds tp[g]), Int(@inbounds tj[g])
+    end
+end
+@inline _dp_mi(d::Float64, L::Float64) = d - L * round(d / L)
+
+@inline function _dp_partial(g, l, tp, tj, implicit, Nm, com, off, sty, sq, mstart, mn, ext, pcom, poff, pmol, pext, maxs,
+                             σ2, e4, e24, urc, rcap2, prm::DPParams{T}) where {T}
+    au = zero(T); aw = zero(T); mi = typemax(Int32)
+    p, j = _dp_task(g, tp, tj, implicit, Nm)
+    @inbounds i = Int(pmol[p])
+    if j != i
+        @inbounds begin
+            Rx = _dp_mi(com[1, j] - pcom[1, p], prm.L)
+            Ry = _dp_mi(com[2, j] - pcom[2, p], prm.L)
+            Rz = _dp_mi(com[3, j] - pcom[3, p], prm.L)
+        end
+        R2 = Rx * Rx + Ry * Ry + Rz * Rz
+        rmax = prm.rc + @inbounds(ext[j]) + @inbounds(pext[p])
+        inr = prm.molcut ? R2 < prm.rc2 : R2 < rmax * rmax
+        if inr
+            si0 = Int(@inbounds mstart[i]); sj0 = Int(@inbounds mstart[j])
+            ni = Int(@inbounds mn[i]); nj = Int(@inbounds mn[j])
+            po = (p - 1) * Int(maxs)
+            Rxt = T(Rx); Ryt = T(Ry); Rzt = T(Rz)
+            nt = Int(prm.nt)
+            q = l - 1
+            while q < ni * nj
+                n = q ÷ nj; m = q - n * nj
+                @inbounds begin
+                    dx = Rxt + off[1, sj0 + m + 1] - poff[1, po + n + 1]
+                    dy = Ryt + off[2, sj0 + m + 1] - poff[2, po + n + 1]
+                    dz = Rzt + off[3, sj0 + m + 1] - poff[3, po + n + 1]
+                end
+                r2 = dx * dx + dy * dy + dz * dz
+                if prm.molcut || r2 < prm.rc2T
+                    tyn = Int(@inbounds sty[si0 + n + 1]); tym = Int(@inbounds sty[sj0 + m + 1])
+                    fr = zero(T)
+                    if tyn > 0 && tym > 0
+                        k = (tyn - 1) * nt + tym
+                        if prm.cap && r2 < @inbounds(rcap2[k])
+                            mi = min(mi, Int32(q))
+                        end
+                        s6 = (@inbounds(σ2[k]) / r2)^3
+                        au += @inbounds(e4[k]) * (s6 * s6 - s6)
+                        prm.shift && (au -= @inbounds(urc[k]))
+                        fr += @inbounds(e24[k]) * (2 * s6 * s6 - s6)
+                    end
+                    qn = @inbounds sq[si0 + n + 1]; qm = @inbounds sq[sj0 + m + 1]
+                    if prm.coul != 0 && qn != 0 && qm != 0
+                        r = sqrt(r2); qq = qn * qm
+                        if prm.coul == 1
+                            au += prm.ke_rf * qq * (1 / r + prm.k_rf * r2 - prm.c_rf)
+                            fr += prm.ke_rf * qq * (1 / r - 2 * prm.k_rf * r2)
+                        else
+                            e = erfc(prm.α * r)
+                            if prm.coul == 2
+                                uw = e / r - prm.wshift
+                                prm.dsf && (uw += prm.dsf_slope * (r - prm.rcT))
+                                au += prm.wke * qq * uw
+                            else
+                                au += prm.wke * qq * e / r
+                            end
+                            fr += prm.wke * qq * (e / r + (2 * prm.α / T(SQRT_PI)) * exp(-prm.α * prm.α * r2))
+                        end
+                    end
+                    aw += (Rxt * dx + Ryt * dy + Rzt * dz) / r2 * fr
+                end
+                q += DP_GROUP
+            end
+        end
+    end
+    return Float64(au), Float64(aw), mi
+end
+
+@inline function _dp_final(g, u, w, mi, tp, tj, implicit, Nm, sty, mstart, mn, pmol, ucap, prm)
+    p, j = _dp_task(g, tp, tj, implicit, Nm)
+    @inbounds i = Int(pmol[p])
+    j == i && return 0.0, 0.0
+    if mi != typemax(Int32)                        # first overlapping site pair (loop order of pair_energy_virial)
+        nj = Int(@inbounds mn[j]); n = Int(mi) ÷ nj; m = Int(mi) - n * nj
+        tyn = Int(@inbounds sty[Int(@inbounds mstart[i]) + n + 1]); tym = Int(@inbounds sty[Int(@inbounds mstart[j]) + m + 1])
+        return @inbounds(ucap[(tyn - 1) * Int(prm.nt) + tym]), 0.0
+    end
+    prm.cap && u > prm.cap_min_u && return prm.cap_min_u, 0.0
+    return u, w
+end
+
+function _dp_launch!(D::DevicePairs, ntask::Int, implicit::Bool)
+    ntask == 0 && return D
+    k = _dp_kernel!(D.kab, DP_GROUP)
+    k(D.U, D.W, D.tp, D.tj, Int32(implicit), Int32(D.N), D.com, D.off, D.sty, D.sq, D.mstart, D.mn, D.ext,
+      D.pcom, D.poff, D.pmol, D.pext, Int32(D.maxs), D.σ2, D.e4, D.e24, D.urc, D.rcap2, D.ucap, D.prm;
+      ndrange=DP_GROUP * ntask)
+    KA.synchronize(D.kab)
+    copyto!(D.hU, 1, D.U, 1, ntask); copyto!(D.hW, 1, D.W, 1, ntask)
+    return D
+end
+
+"""
+    dp_rows!(D, np) -> (U, W)
+
+Rows of the first `np` staged-and-uploaded poses against every committed molecule: U[(p − 1)·N + j], W[...] = the pair
+energy and virial of pose p with molecule j (0 for j = the pose's own molecule). Views into host buffers (valid until the
+next call).
+"""
+function dp_rows!(D::DevicePairs, np::Int)
+    np * D.N <= length(D.hU) || error("dp_rows!: $np poses × N exceed max_tasks")
+    _dp_launch!(D, np * D.N, true)
+    return view(D.hU, 1:np * D.N), view(D.hW, 1:np * D.N)
+end
+
+"""
+    dp_tasks!(D, ps, js) -> (U, W)
+
+Explicit tasks (pose ps[t], molecule js[t]), t = 1…length(ps), on the uploaded pose bank.
+"""
+function dp_tasks!(D::DevicePairs, ps::AbstractVector{<:Integer}, js::AbstractVector{<:Integer})
+    nt = length(ps); nt == length(js) || error("dp_tasks!: ps and js differ in length")
+    nt <= length(D.htp) || error("dp_tasks!: $nt tasks exceed max_tasks")
+    @inbounds for t in 1:nt
+        D.htp[t] = ps[t]; D.htj[t] = js[t]
+    end
+    copyto!(D.tp, 1, D.htp, 1, nt); copyto!(D.tj, 1, D.htj, 1, nt)
+    _dp_launch!(D, nt, false)
+    return view(D.hU, 1:nt), view(D.hW, 1:nt)
+end

@@ -27,6 +27,7 @@ module MolSim
         include("MC/LocalMoves.jl")
         include("MC/SolventLocalMoves.jl")
         include("MC/RigidMolecules.jl")
+        include("MC/DevicePairs.jl")
         include("MC/SoluteModels.jl")
         include("MC/MD.jl")
         include("MC/validation/CompareNVT.jl")
