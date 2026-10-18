@@ -124,6 +124,70 @@ function opls_itp_molecule(itp::AbstractString; ffdir::AbstractString=OPLS_FFDIR
     return (bt=bt, types=types, q=q, mass=mass, lj=lj, X0=X0, opls=opls)
 end
 
+"""
+    ligpargen_itp_molecule(itp, gro) -> NamedTuple (as `opls_itp_molecule`)
+
+Parse a self-contained GROMACS topology as LigParGen writes it (Dodda et al., Nucleic Acids Res. 45 (2017) W331): every
+parameter inline — [ atomtypes ] σ/ϵ (comb-rule 3, geometric), [ atoms ] charges and masses, harmonic bonds and angles
+(type 1), Ryckaert–Bellemans propers (type 3), periodic dihedrals (types 1/4/9: the impropers), the explicit [ pairs ]
+list (fudgeLJ/fudgeQQ from [ defaults ]) and nrexcl. Nothing is looked up or typed in by hand. The geometry is the .gro's
+(nm, centred). LJ types: one per distinct (σ, ϵ) with ϵ > 0, in order of first appearance.
+"""
+function ligpargen_itp_molecule(itp::AbstractString, gro::AbstractString)
+    S = _itp_sections(itp)
+    d = S["defaults"][1]
+    parse(Int, d[2]) == 3 || error("ligpargen_itp_molecule: comb-rule $(d[2]) (only 3, geometric, as OPLS-AA)")
+    fudge_lj, fudge_qq = parse(Float64, d[4]), parse(Float64, d[5])
+    at = Dict(String(a[1]) => (σ=parse(Float64, a[end-1]), ϵ=parse(Float64, a[end])) for a in S["atomtypes"])
+    atoms = S["atoms"]; n = length(atoms)
+    all(parse(Int, atoms[s][1]) == s for s in 1:n) || error("ligpargen_itp_molecule: atoms not numbered 1…n")
+    opls = [String(a[2]) for a in atoms]
+    q = [parse(Float64, a[7]) for a in atoms]
+    mass = [parse(Float64, a[8]) for a in atoms]
+    nrexcl = parse(Int, S["moleculetype"][1][2])
+    bonds = HarmonicBond[]
+    for b in S["bonds"]
+        b[3] == "1" || error("ligpargen_itp_molecule: bond type $(b[3])")
+        push!(bonds, HarmonicBond(parse(Int, b[1]), parse(Int, b[2]), parse(Float64, b[4]), parse(Float64, b[5])))
+    end
+    angles = HarmonicAngle[]
+    for a in S["angles"]
+        a[4] == "1" || error("ligpargen_itp_molecule: angle type $(a[4])")
+        push!(angles, HarmonicAngle(parse.(Int, a[1:3])..., parse(Float64, a[5]) * π / 180, parse(Float64, a[6])))
+    end
+    dihs = RBDihedral[]; per = PeriodicDihedral[]
+    for x in get(S, "dihedrals", Vector{String}[])
+        i, j, k, l = parse.(Int, x[1:4])
+        if x[5] == "3"
+            push!(dihs, RBDihedral(i, j, k, l, ntuple(m -> parse(Float64, x[5+m]), 6)))
+        elseif x[5] in ("1", "4", "9")
+            push!(per, PeriodicDihedral(i, j, k, l, parse(Float64, x[6]) * π / 180, parse(Float64, x[7]), parse(Int, x[8])))
+        else
+            error("ligpargen_itp_molecule: dihedral type $(x[5])")
+        end
+    end
+    pairs = [(parse(Int, p[1]), parse(Int, p[2])) for p in get(S, "pairs", Vector{String}[])]
+    bt = BondedTerms(n; bonds=bonds, angles=angles, dihedrals=dihs, periodic=per, fudge_lj=fudge_lj, fudge_qq=fudge_qq,
+                     nrexcl=nrexcl, pairs14=pairs)
+    ljkeys = Tuple{Float64,Float64}[]; types = zeros(Int, n)
+    for (s, t) in enumerate(opls)
+        p = (at[t].σ, at[t].ϵ)
+        p[2] > 0 || continue
+        idx = findfirst(==(p), ljkeys)
+        idx === nothing && (push!(ljkeys, p); idx = length(ljkeys))
+        types[s] = idx
+    end
+    gl = readlines(gro)
+    parse(Int, strip(gl[2])) == n || error("ligpargen_itp_molecule: $gro has $(strip(gl[2])) atoms, topology $n")
+    X0 = zeros(3, n)
+    for s in 1:n
+        f = split(gl[2+s])
+        X0[:, s] .= parse.(Float64, f[end-2:end])
+    end
+    X0 .-= (X0 * mass) ./ sum(mass)
+    return (bt=bt, types=types, q=q, mass=mass, lj=ljkeys, X0=X0, opls=opls)
+end
+
 # place atoms along the bond tree with equilibrium lengths/angles; dihedral 180° for the first substituent, ±120° offsets
 function _opls_build_geometry(bt::BondedTerms, n::Int)
     adj = [Int[] for _ in 1:n]
@@ -186,4 +250,49 @@ function _opls_relax(bt::BondedTerms, X::Matrix{Float64}, types, q, lj; steps::I
     end
     c = sum(X; dims=2) ./ size(X, 2)
     return X .- c
+end
+
+"""
+    load_gro!(sys, gro; σ_angstrom) -> sys
+
+Set the box, COMs and conformations of the flexible molecules of `sys` from a GROMACS .gro file (nm; cubic box; atoms in
+molecule order, the site order of each template). Each molecule is made whole along its bonds (minimum image of every bond,
+breadth-first from site 1), its COM wrapped into the box and its conformation stored as the body (orientation = identity).
+`σ_angstrom` converts nm to the reduced length.
+"""
+function load_gro!(sys, gro::AbstractString; σ_angstrom::Float64)
+    lines = readlines(gro)
+    nat = parse(Int, strip(lines[2]))
+    nat == sys.n_sites_total || error("load_gro!: $gro has $nat atoms, system $(sys.n_sites_total)")
+    lu = 10.0 / σ_angstrom
+    box = parse.(Float64, split(lines[end])[1:3])
+    (box[1] ≈ box[2] ≈ box[3]) || error("load_gro!: cubic boxes only")
+    sys.L = box[1] * lu
+    X = zeros(3, nat)
+    for s in 1:nat
+        l = lines[2 + s]
+        X[:, s] .= parse.(Float64, (l[21:28], l[29:36], l[37:44])) .* lu
+    end
+    for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]
+        isflexible(t) || error("load_gro!: molecule $i is rigid (flexible molecules only)")
+        s0 = sys.site_start[i]; n = t.n_sites
+        Y = X[:, s0+1:s0+n]
+        adj = [Int[] for _ in 1:n]
+        for b in t.bonded.bonds; push!(adj[b.i], b.j); push!(adj[b.j], b.i); end
+        done = falses(n); done[1] = true; queue = [1]
+        while !isempty(queue)
+            a = popfirst!(queue)
+            for b in adj[a]
+                done[b] && continue
+                for d in 1:3; Y[d, b] = Y[d, a] + _min_image(Y[d, b] - Y[d, a], sys.L); end
+                done[b] = true; push!(queue, b)
+            end
+        end
+        all(done) || error("load_gro!: molecule $i is not connected")
+        c = (Y * t.site_mass) ./ sum(t.site_mass)
+        set_conformation!(sys, i, Y)
+        set_molecule!(sys, i, c, sys.quat[:, i])
+    end
+    return sys
 end

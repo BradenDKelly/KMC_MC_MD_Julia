@@ -213,7 +213,8 @@ end
 
 # Higham, Accuracy and Stability of Numerical Algorithms (2nd ed., 2002), Lemma 3.1/§3.1: a computed sum of n products in
 # floating point with unit roundoff u differs from the exact one by at most γ_n Σ|terms|, γ_n = n u/(1 − n u); the inputs
-# rounded to Float32 (S, c: three factors) add three more roundings per term.
+# rounded to Float32 (S, c: three factors) add three more roundings per term. The products are real dot products of
+# length 2N_k over the interleaved (Re, Im) storage (Σ_k |Re a Re b| + |Im a Im b| ≤ Σ_k |a_k||b_k|): γ_{2N_k+4}.
 γ32(n) = (u = eps(Float32) / 2; n * u / (1 - n * u))
 
 @testset "Mixed precision (GROMACS convention): Float32 products within the rounding bound; Float64 accumulation" begin
@@ -225,12 +226,12 @@ end
     rd = zeros(N); rm = zeros(N); w = zeros(N)
     MCe.eval_row!(rd, w, sys, ff, k); MCe.eval_row!(rm, w, sysm, ff, k)
     Sk = R.S[:, k]
-    bound = [γ32(Nk + 4) * sum(R.c .* abs.(Sk) .* abs.(R.S[:, j])) for j in 1:N]
+    bound = [γ32(2Nk + 4) * sum(R.c .* abs.(Sk) .* abs.(R.S[:, j])) for j in 1:N]
     @test all(abs.(rm .- rd) .<= bound)
     @test maximum(abs.(rm .- rd)) > 0.0                      # the products really ran in single precision
     # eKMC with mixed precision: φ drift after n events is within n × 2 × (per-row bound); the rebuild is exact Float64
     ek = MCe.init_rigid_ekmc(sysm, ff)
-    Smax = maximum(abs.(R.S)); Bφ = γ32(Nk + 4) * sum(R.c) * Smax^2
+    Smax = maximum(abs.(R.S)); Bφ = γ32(2Nk + 4) * sum(R.c) * Smax^2
     n = 200
     for _ in 1:n
         kk = MCe.select_by_mobility(ek, sysm.rng)
@@ -254,11 +255,68 @@ end
     Δm = S.cr_u .- cr0
     dS = sysm.recip.dS
     exact = [real(sum(sysm.recip.c .* conj.(S.crS[:, c]) .* dS)) for c in 1:size(S.crS, 2)]
-    bnd = [γ32(Nk + 4) * sum(sysm.recip.c .* abs.(S.crS[:, c]) .* abs.(dS)) for c in 1:size(S.crS, 2)]
+    bnd = [γ32(2Nk + 4) * sum(sysm.recip.c .* abs.(S.crS[:, c]) .* abs.(dS)) for c in 1:size(S.crS, 2)]
     K = length(S.kinds)
     for ii in eachindex(S.mols), j in 1:K
         S.mols[ii] == kk && continue
         c = (ii - 1) * K + j
         @test abs(Δm[j, ii] - exact[c]) <= bnd[c] + 4eps(Float64) * abs(cr0[j, ii])
     end
+end
+
+# Higham (2002): complex multiplication has relative error ≤ √2 γ_2 (Lemma 3.5); z^n by repeated multiplication ≤ n √2 γ_2.
+γ64(n) = (u = eps(Float64) / 2; n * u / (1 - n * u))
+"Bound on |computed − exact| of one molecule's structure factor (power tables, `recip_sf!`) or of the direct cis sum:
+per site (|nx|+|ny|+|nz| ≤ 3 nmax powers + 3 products) √2 γ_2, the argument rounding γ_6 |θ| (θ ≤ 2π·3 nmax·r/L) and the
+sin/cos rounding, plus the site summation γ_{n_sites}."
+function sf_bound(R, sys, i)
+    t = sys.templates[sys.tmpl[i]]; s0 = sys.site_start[i]
+    rmax = maximum(abs(sys.com[d, i] + sys.site_off[d, s0 + a]) for d in 1:3, a in 1:t.n_sites)
+    θmax = 2π * 3R.nmax * rmax / R.L
+    sum(abs, t.site_q) * ((3R.nmax + 3) * sqrt(2) * γ64(2) + 2γ64(6) * θmax + 4eps() + γ64(t.n_sites))
+end
+
+@testset "Ewald kernels: grouped structure factor, rigid-translation phase, real-view products, allocations" begin
+    m, sys, _ = ewald_water(40, 21; precision=:double)
+    ff = m.ff; R = sys.recip; Nk = MCe.n_kvectors(R); N = sys.n_mol
+    # k-vector runs reproduce the wave-vector list
+    nx = Int[]; ny = Int[]; nz = Int[]
+    for g in eachindex(R.gnx), t in R.gstart[g]:R.gstart[g+1]-1
+        push!(nx, R.gnx[g]); push!(ny, R.gny[g]); push!(nz, R.gnz0[g] + t - R.gstart[g])
+    end
+    @test nx == R.nx && ny == R.ny && nz == R.nz && R.gstart[end] == Nk + 1
+    # grouped recip_sf! = direct Σ_a q_a cis(2π n·r_a/L)
+    t = sys.templates[sys.tmpl[5]]; s0 = sys.site_start[5]
+    direct = zeros(ComplexF64, Nk)
+    for a in 1:t.n_sites
+        r = [sys.com[d, 5] + sys.site_off[d, s0 + a] for d in 1:3]
+        direct .+= t.site_q[a] .* cis.(2π .* (R.nx .* r[1] .+ R.ny .* r[2] .+ R.nz .* r[3]) ./ R.L)
+    end
+    sf = MCe.recip_sf!(zeros(ComplexF64, Nk), R, sys, 5)
+    @test maximum(abs.(sf .- direct)) <= 2sf_bound(R, sys, 5)
+    # e^{ik·d} S_i = S of the rigidly translated molecule (set_molecule! wraps the COM: e^{ik·nL} = 1)
+    d = (0.37, -0.81, 1.9) .* R.L
+    b1 = sf_bound(R, sys, 5)
+    tr = MCe.recip_sf_translate!(zeros(ComplexF64, Nk), R, sf, d)
+    MCe.set_molecule!(sys, 5, sys.com[:, 5] .+ collect(d), sys.quat[:, 5])
+    sf2 = MCe.recip_sf!(zeros(ComplexF64, Nk), R, sys, 5)
+    θd = 2π * 3R.nmax * maximum(abs.(d)) / R.L
+    # errors of S_i (b1) and of the direct S at the new pose, plus the phase (powers of e^{ik·d}) times |S_i|
+    @test maximum(abs.(tr .- sf2)) <= b1 + sf_bound(R, sys, 5) +
+                                      maximum(abs.(sf)) * ((3R.nmax + 4) * sqrt(2) * γ64(2) + 2γ64(6) * θd + 4eps())
+    MCe.recip_rebuild!(R, sys)
+    # real view: Re[Aᴴ v] = (real A)ᵀ (real v), each within γ_{2N_k} Σ|a||v| of the exact value
+    v = R.S[:, 3] .* R.c
+    p1 = real.(R.S' * v); p2 = transpose(MCe._realview(R.S)) * MCe._realview(v)
+    @test all(abs.(p1 .- p2) .<= [2γ64(2Nk + 2) * sum(abs.(R.S[:, j]) .* abs.(v)) for j in 1:N])
+    # per-event allocations do not grow with the number of molecules or candidates (no per-candidate heap work)
+    allocs = map((40, 80)) do Nm
+        mm, s, _ = ewald_water(Nm, 22; precision=:mixed); f = mm.ff
+        ek = MCe.init_rigid_ekmc(s, f)
+        S = MCe.SolventLocalMoves(s, f, collect(1:Nm); kinds=[MCe.LM_T, MCe.LM_R], a=0.1, θmax=0.3, ν=1.0, νD=1.0)
+        step!(k) = (MCe.update_rigid_ekmc_after_move!(ek, s, f, k); MCe.slm_moved!(S, s, f, k))
+        for k in 1:4; step!(k); end
+        (@allocated MCe.update_rigid_ekmc_after_move!(ek, s, f, 5)) + (@allocated MCe.slm_moved!(S, s, f, 5))
+    end
+    @test allocs[1] == allocs[2]
 end

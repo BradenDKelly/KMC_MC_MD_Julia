@@ -79,13 +79,23 @@ function trappe_ua_solute(solute::Symbol)
         m = opls_itp_molecule(joinpath(OPLS_FFDIR, OPLS_FLEX_ITP[solute]))
         return (lj=[(σ * 10.0, ϵ / 0.0083144626) for (σ, ϵ) in m.lj], sites=m.X0 .* 10.0, types=m.types, q=m.q, mass=m.mass,
                 name="$(OPLS_FLEX_ITP[solute]) (OPLS-AA, flexible)", mixing=:geometric, flexible=true, bonded=m.bt)
+    elseif solute in keys(LIGPARGEN_ITP)
+        # flexible OPLS-AA/CM1A-LBCC molecule from a LigParGen topology (data/ligpargen/<name>/, PROVENANCE.md there)
+        dir = joinpath(LIGPARGEN_DIR, LIGPARGEN_ITP[solute])
+        m = ligpargen_itp_molecule(joinpath(dir, "LIG.gmx.itp"), joinpath(dir, "LIG.gmx.gro"))
+        return (lj=[(σ * 10.0, ϵ / 0.0083144626) for (σ, ϵ) in m.lj], sites=m.X0 .* 10.0, types=m.types, q=m.q, mass=m.mass,
+                name="$(LIGPARGEN_ITP[solute]) (OPLS-AA/CM1A-LBCC, LigParGen, flexible)", mixing=:geometric, flexible=true,
+                bonded=m.bt)
     else
-        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methanol_flex, :methane_ua, :methanol_ua, $(join(keys(OPLS_FLEX_ITP), ", ")))")
+        error("trappe_ua_solute: unknown solute $solute (use :methane, :methanol, :methanol_flex, :methane_ua, :methanol_ua, $(join(keys(OPLS_FLEX_ITP), ", ")), $(join(keys(LIGPARGEN_ITP), ", ")))")
     end
 end
 
 "Flexible OPLS-AA solutes built from the GROMACS topologies shipped in oplsaa.ff (OPLSTopology.jl)."
 const OPLS_FLEX_ITP = Dict(:methanol_itp => "methanol.itp", :ethanol_flex => "ethanol.itp", :propanol_flex => "1propanol.itp")
+"Flexible drug-like molecules from LigParGen topologies in data/ligpargen/ (DESIGN §14 V4)."
+const LIGPARGEN_ITP = Dict(:ibuprofen_lpg => "ibuprofen")
+const LIGPARGEN_DIR = normpath(joinpath(@__DIR__, "..", "..", "data", "ligpargen"))
 
 """
     spce_solute_model(solute; α_per_angstrom=0.20, rc_angstrom=10.0, cutoff=:molecule,

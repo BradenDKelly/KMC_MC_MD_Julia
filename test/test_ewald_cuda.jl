@@ -56,7 +56,7 @@ end
     @test sysg.recip.Sd isa CuArray{ComplexF32}
     rd = zeros(N); rg = zeros(N); w = zeros(N)
     MCg.eval_row!(rd, w, sys, ff, 7); MCg.eval_row!(rg, w, sysg, ff, 7)
-    bound = [γ32(Nk + 4) * sum(R.c .* abs.(R.S[:, 7]) .* abs.(R.S[:, j])) for j in 1:N]
+    bound = [γ32(2Nk + 4) * sum(R.c .* abs.(R.S[:, 7]) .* abs.(R.S[:, j])) for j in 1:N]
     @test all(abs.(rg .- rd) .<= bound)
     ek = MCg.init_rigid_ekmc(sysg, ff)
     S = MCg.SolventLocalMoves(sysg, ff, collect(1:N-1); kinds=[MCg.LM_T, MCg.LM_R], a=0.1, θmax=0.3, ν=1.0, νD=1.0)
@@ -69,5 +69,5 @@ end
     end
     # worst-case drift of 50 single-precision increments: each ≤ γ Σ_k c_k |S_cand||ΔS|, |ΔS| ≤ 2 max|S|
     Smax = max(maximum(abs.(sysg.recip.S)), maximum(abs.(S.crS)))
-    @test MCg.slm_check!(S, sysg, ff) <= 50 * γ32(Nk + 4) * sum(sysg.recip.c) * 2Smax * Smax
+    @test MCg.slm_check!(S, sysg, ff) <= 50 * γ32(2Nk + 4) * sum(sysg.recip.c) * 2Smax * Smax
 end

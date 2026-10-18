@@ -48,6 +48,25 @@ end
     end
 end
 
+@testset "L-moves: T/R candidates after a C candidate keep the saved body (regression)" begin
+    # set_molecule! keeps the current body: before the fix a T or R slot evaluated after a C slot in lm_rebuild! used the
+    # C candidate's conformation, so its stored energy was not the energy of the move that fires.
+    S = lm_dimer_system(1.0, 32, 1.5, 0.4, 11)
+    sys = deepcopy(S.sys); ff = S.ff; s = S.Nt
+    lm = MCm.LocalMoves(sys, s, 10; kinds=[MCm.LM_C, MCm.LM_T, MCm.LM_R], a=0.2, θmax=0.4, ν=1.0, νD=1.0, reservoir=S.res)
+    MCm.lm_rebuild!(lm, sys, ff)
+    @test !(lm.dB[1] ≈ sys.body[s])                     # the C slot really changes the conformation
+    B0 = copy(sys.body[s]); com0 = copy(sys.com[:, s]); q0 = copy(sys.quat[:, s])
+    for j in 2:3
+        MCm._lm_save!(lm, sys); MCm._lm_place!(lm, sys, j)
+        @test sys.body[s] == B0
+        MCm.eval_row!(lm.row_u, lm.row_w, sys, ff, s; recip=false)
+        @test lm.cand_u[j] ≈ sum(lm.row_u) rtol = 1e-12
+        MCm._lm_restore!(lm, sys)
+    end
+    @test sys.com[:, s] == com0 && sys.quat[:, s] == q0 && sys.body[s] == B0
+end
+
 lm_mean(x) = sum(x) / length(x)
 function blockse(x; nb=20)
     n = length(x) ÷ nb; bm = [sum(x[(b-1)*n+1:b*n]) / n for b in 1:nb]; m = lm_mean(bm)

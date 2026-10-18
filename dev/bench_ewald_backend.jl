@@ -9,8 +9,9 @@ has_cuda = try
 catch
     false
 end
+using LinearAlgebra; BLAS.set_num_threads(Threads.nthreads())   # products thread through BLAS
 cases = [(64, 4.5), (256, 4.5), (500, 10.0)]
-println("# threads=$(Threads.nthreads()) cuda=$has_cuda host=$(gethostname())")
+println("# threads=$(Threads.nthreads()) blas=$(BLAS.get_num_threads()) cuda=$has_cuda host=$(gethostname())")
 for (N, rc) in cases, (coul, be, prec) in ((:rf, :cpu, :double), (:ewald, :cpu, :double), (:ewald, :cpu, :mixed),
                                          (:ewald, :cuda, :double), (:ewald, :cuda, :mixed))
     be === :cuda && !has_cuda && continue

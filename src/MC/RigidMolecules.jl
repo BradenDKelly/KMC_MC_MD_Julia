@@ -210,6 +210,7 @@ mutable struct RigidSystem
     body::Vector{Matrix{Float64}}   # flexible molecules: current COM-centred conformation in the body frame (3 × n); rigid: 3 × 0
     ext::Vector{Float64}            # per-molecule extent (template extent for rigid molecules, current conformation for flexible)
     recip::Union{Nothing,EwaldRecip}   # reciprocal-space Ewald state (coulomb = :ewald, `attach_ewald!`); nothing otherwise
+    cells::Union{Nothing,MolCells,SiteCells}   # cell list for the real-space rows (`attach_cells!`); nothing = all pairs
 end
 
 function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Float64, β::Float64,
@@ -224,7 +225,7 @@ function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Flo
     body = [isflexible(templates[tmpl[i]]) ? copy(templates[tmpl[i]].sites_body) : zeros(3, 0) for i in 1:n_mol]
     ext = [templates[tmpl[i]].extent for i in 1:n_mol]
     sys = RigidSystem(n_mol, L, β, templates, copy(tmpl), zeros(3, n_mol), zeros(4, n_mol),
-                      zeros(3, n), site_start, n, rng, body, ext, nothing)
+                      zeros(3, n), site_start, n, rng, body, ext, nothing, nothing)
     for i in 1:n_mol
         sys.quat[1, i] = 1.0
         update_site_offsets!(sys, i)
@@ -774,6 +775,41 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
 end
 
 """
+    _site_pair_uf(ff, tyn, qn, tym, qm, r2) -> (u, −r du/dr)
+
+One site pair at r² < rc² without the overlap cap — the terms of `pair_energy_virial` (kept identical; used by the site
+cell list, MolCells.jl).
+"""
+@inline function _site_pair_uf(ff::SiteForceField, tyn::Int, qn::Float64, tym::Int, qm::Float64, r2::Float64)
+    u = 0.0; fr = 0.0
+    @inbounds if tyn > 0 && tym > 0
+        σ2 = ff.σ_mix[tyn, tym]^2
+        s6 = (σ2 / r2)^3
+        ϵ = ff.ϵ_mix[tyn, tym]
+        u += 4.0 * ϵ * (s6 * s6 - s6)
+        ff.shift_lj && (u -= ff.u_rc_mix[tyn, tym])
+        fr += 24.0 * ϵ * (2.0 * s6 * s6 - s6)
+    end
+    if qn != 0.0 && qm != 0.0
+        α = ff.wolf.α; ke = ff.wolf.ke
+        if ff.coulomb === :wolf
+            r = sqrt(r2)
+            u += wolf_pair_u(r, qn, qm, ff.wolf)
+            fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
+        elseif ff.coulomb === :rf
+            r = sqrt(r2)
+            u += rf_pair_u(r, qn, qm, ff.rf)
+            fr += rf_pair_fr(r, qn, qm, ff.rf)
+        elseif ff.coulomb === :ewald
+            r = sqrt(r2)
+            u += ke * qn * qm * erfc(α * r) / r
+            fr += ke * qn * qm * (erfc(α * r) / r + (2.0 * α / SQRT_PI) * exp(-α * α * r2))
+        end
+    end
+    return u, fr
+end
+
+"""
     pair_energy_virial(sys, ff, i, j) -> (u_ij, w_ij)
 
 As `pair_energy`, also returning the molecular virial contribution R_ij·F_ij (zero for capped pairs).
@@ -875,7 +911,30 @@ part separately, EwaldRecip.jl).
 function eval_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, sys::RigidSystem,
                    ff::SiteForceField, k::Int; recip::Bool=true)
     N = sys.n_mol
-    if _use_threads(N)
+    c = sys.cells
+    if c isa SiteCells && _cells_for(c, ff) && site_cells_row!(row_u, row_w, c, sys, ff, k)
+        n = -2                                         # row done by the site cell list
+    else
+        n = (c isa MolCells && _cells_for(c, ff)) ? cells_gather!(c, sys, k) : -1
+    end
+    if n == -2
+    elseif n >= 0                                          # cell list: every molecule not gathered is beyond the pair range
+        fill!(row_u, 0.0); fill!(row_w, 0.0)
+        nbr = c.nbr
+        if _use_threads(n)
+            Threads.@threads :static for t in 1:n
+                @inbounds j = nbr[t]
+                u, w = pair_energy_virial(sys, ff, k, j)
+                @inbounds row_u[j] = u; @inbounds row_w[j] = w
+            end
+        else
+            @inbounds for t in 1:n
+                j = nbr[t]
+                u, w = pair_energy_virial(sys, ff, k, j)
+                row_u[j] = u; row_w[j] = w
+            end
+        end
+    elseif _use_threads(N)
         Threads.@threads :static for j in 1:N
             if j != k
                 u, w = pair_energy_virial(sys, ff, k, j)
@@ -1404,7 +1463,7 @@ function minimize_rigid!(sys::RigidSystem, ff::SiteForceField; nsteps::Int=1000,
             if e > 0.0 && tn > 0.0
                 θ = h * tn / (e * e * gmax)
                 q = quat_mul(_axis_angle_quaternion(τ[1, i] / tn, τ[2, i] / tn, τ[3, i] / tn, θ), q)
-                q ./= sqrt(sum(abs2, q))
+                q = q ./ sqrt(sum(abs2, q))
             end
             set_molecule!(sys, i, com, q)
         end
@@ -1435,7 +1494,7 @@ end
 @inline function quat_mul(q1::AbstractVector{Float64}, q2::AbstractVector{Float64})
     w1, x1, y1, z1 = q1[1], q1[2], q1[3], q1[4]
     w2, x2, y2, z2 = q2[1], q2[2], q2[3], q2[4]
-    return MVector{4,Float64}(w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    return SVector{4,Float64}(w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
                               w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
                               w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
                               w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
@@ -1477,7 +1536,7 @@ function mc_translate!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.trans_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     set_molecule!(sys, i, com_old, q)
@@ -1495,7 +1554,7 @@ function mc_rotate!(sys::RigidSystem, ff::SiteForceField, i::Int, δθ::Float64,
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.rot_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     set_molecule!(sys, i, com, q_old)
@@ -1512,7 +1571,7 @@ function mc_reorient!(sys::RigidSystem, ff::SiteForceField, i::Int, st::RigidMCS
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.reor_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     set_molecule!(sys, i, com, q_old)
@@ -1544,7 +1603,7 @@ function mc_site_move!(sys::RigidSystem, ff::SiteForceField, i::Int, δ::Float64
     ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.site_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1580,7 +1639,7 @@ function mc_torsion_move!(sys::RigidSystem, ff::SiteForceField, i::Int, φmax::F
     ΔU = removal_energy(sys, ff, i) + flex_intra_energy(t, ff, sys.body[i]) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.tors_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1608,7 +1667,7 @@ function mc_conformer_swap!(sys::RigidSystem, ff::SiteForceField, i::Int, res::C
     ΔU = removal_energy(sys, ff, i) - u_old
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         st.swap_acc += 1
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         return true
     end
     _set_body!(sys, i, body_old); sys.ext[i] = ext_old
@@ -1643,6 +1702,7 @@ function mc_volume_trial!(sys::RigidSystem, ff::SiteForceField, Pext::Float64, m
     sys.L = L_old
     sys.com .= com_old
     !_has_recip(sys, ff) || recip_rebuild!(sys.recip, sys)      # total_energy rebuilt it at the trial volume
+    sys.cells === nothing || cells_rebuild!(sys.cells, sys)
     return false, U_current
 end
 
@@ -1886,7 +1946,7 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
     end
     if ΔU <= 0.0 || rand(sys.rng) < exp(-sys.β * ΔU)
         β = sys.β
-        recip_commit!(sys, i)
+        molecule_committed!(sys, i)
         if ek.frac > 0
             s = ek.frac
             if i == s
@@ -1990,6 +2050,7 @@ ekmc_virial(ek::RigidEKMCState) = 0.5 * sum(ek.wsum)
 function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField)
     N = sys.n_mol
     !_has_recip(sys, ff) || recip_rebuild!(sys.recip, sys)
+    sys.cells === nothing || cells_rebuild!(sys.cells, sys)
     fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0); fill!(ek.pair_w, 0.0); fill!(ek.wsum, 0.0)
     if _use_threads(N)
         nt = Threads.nthreads()
@@ -2017,7 +2078,12 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     if _has_recip(sys, ff)                           # Fourier pair terms ψ_ij = Σ_k c_k Re[S_i^* S_j]: one product Sᴴ diag(c) S
         Rr = sys.recip
         # on the backend with :double; with :mixed the rebuild is the exact Float64 resynchronisation (host)
-        Ψ = Rr.precision === :double ? real.(Array(Rr.Sd' * (Rr.cd .* Rr.Sd))) : real.(Rr.S' * (Rr.c .* Rr.S))
+        # Re[Sᴴ diag(c) S] = Srᵀ diag(c ⊗ (1,1)) Sr with Sr the real (interleaved Re, Im) view: one real product
+        Ψ = if Rr.precision === :double
+            Array(transpose(Rr.Sdr) * (repeat(Rr.cd; inner=2) .* Rr.Sdr))
+        else
+            Sr = _realview(Rr.S); transpose(Sr) * (repeat(Rr.c; inner=2) .* Sr)
+        end
         @inbounds for j in 1:N, i in 1:N
             i == j || (ek.pair_u[i, j] += Ψ[i, j])
         end
@@ -2070,8 +2136,12 @@ end
 function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, k::Int)
     N = sys.n_mol
     β = sys.β
-    recip_commit!(sys, k)                               # reciprocal space: S_k, ΔS_k, Stot, e_k (no-op otherwise)
-    eval_row!(ek.row_u, ek.row_w, sys, ff, k)          # threaded when N ≥ PARALLEL_MIN_MOL
+    molecule_committed!(sys, k)                         # reciprocal space S_k, ΔS_k, Stot, e_k; cell list (no-ops otherwise)
+    eval_row!(ek.row_u, ek.row_w, sys, ff, k; recip=false)   # threaded when N ≥ PARALLEL_MIN_MOL
+    if _has_recip(sys, ff)                              # Fourier row from the committed column S_k (no recomputation)
+        recip_row_add_committed!(ek.row_u, sys.recip, k)
+        @inbounds ek.row_u[k] = 0.0
+    end
     if ek.frac > 0                                      # fractional molecule: bare row kept, matrix entries scaled by λ
         s = ek.frac; λ = ek.lam[s]
         if k == s
@@ -2232,6 +2302,7 @@ function rigid_ekmc_step!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceFie
     update_rigid_ekmc_after_move!(ek, sys, ff, k)
     ek.events += 1
     if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
+        sys.cells === nothing || (nb = cells_check(sys.cells, sys)) == 0 || @warn "cell list not current" nb
         phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
         rebuild_rigid_ekmc!(ek, sys, ff)
         err = maximum(abs.(phi_saved .- ek.phi))
@@ -2491,7 +2562,9 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
                          local_internal::Bool=false, local_site_a::Float64=0.03, local_φ::Float64=NaN,
                          local_solvent::Bool=false, solvent_kinds::Vector{Int}=Int[], solvent_a::Float64=NaN,
-                         solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN)
+                         solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN,
+                         neighbor_cells::Bool=false, solvent_flexible::Bool=false, solvent_site_a::Float64=NaN,
+                         solvent_φ::Float64=NaN)
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2514,6 +2587,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     reg_n = 0; reg_V = 0.0; reg_P = 0.0; reg_VV = 0.0; reg_VP = 0.0
     p_part_sum = 0.0; p_part_t = 0.0
     rate_scale = species_rate_scale === nothing ? nothing : [species_rate_scale[sys.tmpl[i]] for i in 1:N]
+    neighbor_cells && attach_cells!(sys, ff)          # molecular cell list for the real-space rows (MolCells.jl)
     ek = init_rigid_ekmc(sys, ff; debug_check_every=debug_check_every, rate_scale=rate_scale)
     # with a coupling ladder the standard observables are read at the coupled rung only: ≈ 1/K of the kMC TIME when η is
     # flat, but far fewer EVENTS (events crowd into the burst states of the soft rungs; dimer test: 0.6 % of the events at
@@ -2591,10 +2665,26 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         overlap_fast_path && error("run_rigid_ekmc!: solvent L-moves are not implemented with the overlap fast path")
         νs = isnan(solvent_nu) ? ladder_nu : solvent_nu
         isfinite(νs) || error("run_rigid_ekmc!: local_solvent needs solvent_nu (or a ladder's ladder_nu)")
-        smols = [i for i in 1:N if i != ladder_solute && !isflexible(sys.templates[sys.tmpl[i]])]
-        slmoves = SolventLocalMoves(sys, ff, smols; kinds=isempty(solvent_kinds) ? vcat(fill(LM_T, 3), fill(LM_R, 3)) : solvent_kinds,
+        if solvent_flexible
+            # DESIGN §14: every molecule but the fractional one, flexible ones with single-site and torsion slots
+            smols = [i for i in 1:N if i != ladder_solute]
+            all(i -> isflexible(sys.templates[sys.tmpl[i]]), smols) ||
+                error("run_rigid_ekmc!: solvent_flexible needs every mover flexible (rigid and flexible movers are not mixed)")
+            skinds = if isempty(solvent_kinds)
+                tors = all(i -> !isempty(rotatable_bonds(sys.templates[sys.tmpl[i]])), smols)
+                vcat(fill(LM_T, 3), fill(LM_R, 3), fill(LM_S, 4), tors ? fill(LM_D, 2) : Int[])
+            else
+                solvent_kinds
+            end
+        else
+            smols = [i for i in 1:N if i != ladder_solute && !isflexible(sys.templates[sys.tmpl[i]])]
+            skinds = isempty(solvent_kinds) ? vcat(fill(LM_T, 3), fill(LM_R, 3)) : solvent_kinds
+        end
+        slmoves = SolventLocalMoves(sys, ff, smols; kinds=skinds,
                                     a=isnan(solvent_a) ? mc_δ : solvent_a, θmax=isnan(solvent_θ) ? mc_δθ : solvent_θ,
-                                    ν=νs, νD=isnan(solvent_nuD) ? νs : solvent_nuD, frac=ladder_solute)
+                                    ν=νs, νD=isnan(solvent_nuD) ? νs : solvent_nuD, frac=ladder_solute,
+                                    site_a=isnan(solvent_site_a) ? local_site_a : solvent_site_a,
+                                    φmax=isnan(solvent_φ) ? mc_δθ : solvent_φ)
     end
     t_total = 0.0
     # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`
@@ -2901,6 +2991,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             slmoves === nothing || slm_rebuild_all!(slmoves, sys, ff)
         end
         if ek.debug_check_every > 0 && ek.events % ek.debug_check_every == 0
+            sys.cells === nothing || (nb = cells_check(sys.cells, sys)) == 0 || @warn "cell list not current" nb
             phi_saved = copy(ek.phi); R_saved = ek.R; W_saved = ekmc_virial(ek)
             rebuild_rigid_ekmc!(ek, sys, ff)
             # with :mixed reciprocal-space precision the single-precision increments drift by design (removed by the
@@ -3085,6 +3176,11 @@ residence diagnostics (`res_frac`, `pose_frac`) in `ladder_summary`. `local_solv
 the fractional one rejection-free local moves (`SolventLocalMoves`, DESIGN §11.2 stage 2): slots `solvent_kinds` (default 3
 translations + 3 rotations), half-widths `solvent_a`/`solvent_θ` (default `mc_δ`/`mc_δθ`), per-candidate prefactor `solvent_nu`
 (default `ladder_nu`; required without a ladder) and per-molecule refresh rate `solvent_nuD` (default `solvent_nu`); NVT only.
+`solvent_flexible=true` (with `local_solvent`) makes every molecule but the fractional one a mover, flexible molecules with
+single-site and torsion slots (DESIGN §14; default 3 T + 3 R + 4 S + 2 D, half-widths `solvent_site_a` (default
+`local_site_a`) and `solvent_φ` (default `mc_δθ`)); every mover must then be flexible.
+`neighbor_cells=true` evaluates the real-space rows (events, candidates) with a molecular cell list (`MolCells`); the rows are
+identical to the all-pairs ones, the rebuilds stay all-pairs.
 """
 function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
@@ -3105,7 +3201,9 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
                          local_internal::Bool=false, local_site_a::Float64=0.03, local_φ::Float64=NaN,
                          local_solvent::Bool=false, solvent_kinds::Vector{Int}=Int[], solvent_a::Float64=NaN,
-                         solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN)
+                         solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN,
+                         neighbor_cells::Bool=false, solvent_flexible::Bool=false, solvent_site_a::Float64=NaN,
+                         solvent_φ::Float64=NaN)
     r = init_rigid_ekmc_run(sys, ff; events=events, Pext=Pext, max_dV=max_dV, vol_every_sweeps=vol_every_sweeps,
                             sample_every=sample_every, block_events=block_events, debug_check_every=debug_check_every,
                             adapt_dV_moves=adapt_dV_moves, adapt_dV_window=adapt_dV_window, vol_pressure=vol_pressure,
@@ -3121,7 +3219,9 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             ladder_local=ladder_local, local_kinds=local_kinds, local_a=local_a, local_θ=local_θ,
                             local_nu=local_nu, local_nuD=local_nuD, local_internal=local_internal, local_site_a=local_site_a,
                             local_φ=local_φ, local_solvent=local_solvent, solvent_kinds=solvent_kinds,
-                            solvent_a=solvent_a, solvent_θ=solvent_θ, solvent_nu=solvent_nu, solvent_nuD=solvent_nuD)
+                            solvent_a=solvent_a, solvent_θ=solvent_θ, solvent_nu=solvent_nu, solvent_nuD=solvent_nuD,
+                            neighbor_cells=neighbor_cells, solvent_flexible=solvent_flexible,
+                            solvent_site_a=solvent_site_a, solvent_φ=solvent_φ)
     advance_rigid_ekmc!(r, sys, ff)
     return rigid_ekmc_results(r)
 end

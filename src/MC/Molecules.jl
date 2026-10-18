@@ -95,17 +95,10 @@ function quaternion_to_rotation_matrix(q::AbstractVector{Float64})
     y *= invn
     z *= invn
     
-    R = Matrix{Float64}(undef, 3, 3)
-    R[1,1] = 1 - 2*(y*y + z*z)
-    R[1,2] = 2*(x*y - w*z)
-    R[1,3] = 2*(x*z + w*y)
-    R[2,1] = 2*(x*y + w*z)
-    R[2,2] = 1 - 2*(x*x + z*z)
-    R[2,3] = 2*(y*z - w*x)
-    R[3,1] = 2*(x*z - w*y)
-    R[3,2] = 2*(y*z + w*x)
-    R[3,3] = 1 - 2*(x*x + y*y)
-    return R
+    # static 3×3 (no heap allocation: this runs for every site-offset update, i.e. every candidate of every event)
+    return @SMatrix [1 - 2*(y*y + z*z)   2*(x*y - w*z)       2*(x*z + w*y);
+                     2*(x*y + w*z)       1 - 2*(x*x + z*z)   2*(y*z - w*x);
+                     2*(x*z - w*y)       2*(y*z + w*x)       1 - 2*(x*x + y*y)]
 end
 
 """

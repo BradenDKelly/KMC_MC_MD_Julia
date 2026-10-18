@@ -27,7 +27,8 @@ the host keeps the committed S, Stot, image energies in Float64 and every result
 rates, totals) is accumulated in Float64. The single-precision increments drift by O(u_Float32) per event; the eKMC loop
 removes it with an exact Float64 rebuild every `RECIP_RESYNC_EVENTS` events. `:double` keeps everything in Float64.
 The per-molecule work (structure factor of the moved molecule, image energy) stays on the host; per event one column
-(N_k complex) goes up and one row (N complex) or one candidate vector (K·M complex) comes back.
+(N_k complex) goes up and one row (N real) or one candidate vector (K·M real) comes back; the products are real
+matrix–vector products over the interleaved (Re, Im) storage (`_realview`), since only Re[Sᴴ v] is needed.
 e_m depends on the pose of m only (orientation; conformation if flexible), so it is part of m's removal energy and of
 every candidate energy of m.
 
@@ -60,7 +61,11 @@ mutable struct EwaldRecip
     cw::Vector{ComplexF64}        # c ∘ (a structure factor)
     dS::Vector{ComplexF64}        # ΔS of the last commit
     last::Int                     # molecule of the last commit (0 after a rebuild)
-    tmpN::Vector{ComplexF64}
+    gstart::Vector{Int}           # k-vector groups of equal (nx, ny): k = gstart[g] … gstart[g+1]−1 have nz = gnz0[g], gnz0[g]+1, …
+    gnx::Vector{Int}
+    gny::Vector{Int}
+    gnz0::Vector{Int}
+    rowh::Vector{Float64}         # N: host copy of a product row
     ex::Vector{ComplexF64}        # power tables e^{i 2π n x/L}, n = −nmax…nmax (one site)
     ey::Vector{ComplexF64}
     ez::Vector{ComplexF64}
@@ -71,7 +76,11 @@ mutable struct EwaldRecip
     cd::AbstractVector            # c on the backend
     vd::AbstractVector            # an N_k vector on the backend (S_k or ΔS_k)
     cwd::AbstractVector           # c ∘ vd on the backend
-    tmpNd::AbstractVector
+    Sdr::AbstractMatrix           # Sd as a real 2N_k × N matrix (interleaved Re, Im; same memory)
+    cwdr::AbstractVector          # cwd as a real 2N_k vector (same memory)
+    rowd::AbstractVector          # N real: Re[Sdᴴ cwd] = Sdrᵀ cwdr
+    stage::Vector                 # N_k host staging vector in the backend element type (allocation-free uploads)
+    stage_row::Vector             # N host staging vector in the backend real type (allocation-free downloads)
 end
 
 "Events between exact Float64 rebuilds of the eKMC bookkeeping with `:mixed` precision (a frequency choice: the
@@ -92,6 +101,36 @@ end
 "Copy a host array into a backend array (or a contiguous view of one), converting the element type if needed."
 _upload!(dst::AbstractArray, src::AbstractArray) =
     eltype(dst) == eltype(src) ? copyto!(dst, src) : copyto!(dst, convert(Array{eltype(dst)}, src))
+"As `_upload!` without allocating: host destinations convert in place, others go through the host buffer `stage`
+(eltype(dst), same length as src)."
+function _upload!(dst::AbstractArray, src::AbstractArray, stage::Array)
+    if dst isa Array || (dst isa SubArray && parent(dst) isa Array)
+        dst .= src
+    else
+        eltype(dst) == eltype(src) ? copyto!(dst, src) : (stage .= src; copyto!(dst, stage))
+    end
+    return dst
+end
+"As `to_host!` without allocating on the host side (`stage`: host array of eltype(src), same length)."
+function to_host!(dst::Array, src::AbstractArray, stage::Array)
+    dst === src && return dst
+    if src isa Array || eltype(dst) == eltype(src)
+        src isa Array ? (dst .= src) : copyto!(dst, src)
+    else
+        copyto!(stage, src); dst .= stage
+    end
+    return dst
+end
+
+"""
+    _realview(A)
+
+A complex array seen as a real one over the same memory: a vector of length n → 2n, a matrix n × m → 2n × m, with
+(Re, Im) interleaved. Re[aᴴ b] = Σ (Re a Re b + Im a Im b) = (real a)ᵀ (real b), so Re[Aᴴ v] is one real matrix–vector
+product (half the arithmetic of the complex one, which also computes the unused imaginary part).
+"""
+_realview(A::AbstractVector{<:Complex}) = reinterpret(real(eltype(A)), A)
+_realview(A::AbstractMatrix{<:Complex}) = reshape(reinterpret(real(eltype(A)), A), 2 * size(A, 1), size(A, 2))
 
 """
     ewald_alpha_for(rc, rtol) -> α
@@ -143,13 +182,32 @@ function EwaldRecip(sys; α::Float64, ke::Float64, n2max::Int)
     nmax = floor(Int, sqrt(n2max - 1))
     Nk = length(ks); N = sys.n_mol
     c = _recip_weights(sys.L, α, ke, nx, ny, nz)
+    gstart, gnx, gny, gnz0 = _kvector_groups(nx, ny, nz)
     R = EwaldRecip(sys.L, α, ke, n2max, nmax, nx, ny, nz, c, zeros(ComplexF64, Nk, N), zeros(ComplexF64, Nk),
                    zeros(N), zeros(N), zeros(ComplexF64, Nk), zeros(ComplexF64, Nk), zeros(ComplexF64, Nk), 0,
-                   zeros(ComplexF64, N), zeros(ComplexF64, 2nmax + 1), zeros(ComplexF64, 2nmax + 1),
+                   gstart, gnx, gny, gnz0, zeros(N), zeros(ComplexF64, 2nmax + 1), zeros(ComplexF64, 2nmax + 1),
                    zeros(ComplexF64, 2nmax + 1), 0, :cpu, :double, zeros(ComplexF64, 0, 0), Float64[], ComplexF64[],
-                   ComplexF64[], ComplexF64[])
+                   ComplexF64[], zeros(0, 0), Float64[], Float64[], ComplexF64[], Float64[])
     _bind_backend!(R, :cpu; precision=:double)
     return R
+end
+
+"""
+    _kvector_groups(nx, ny, nz) -> (gstart, gnx, gny, gnz0)
+
+Runs of consecutive wave vectors with equal (nx, ny) and nz increasing by one (`ewald_kvectors` loops nz innermost, and
+the kept nz of a given (nx, ny) form one interval: a sphere intersected with the half space). Lets the structure factor
+form e^{i2π(nx x + ny y)/L} once per run.
+"""
+function _kvector_groups(nx::Vector{Int}, ny::Vector{Int}, nz::Vector{Int})
+    gstart = Int[]; gnx = Int[]; gny = Int[]; gnz0 = Int[]
+    for t in eachindex(nx)
+        if t == 1 || nx[t] != nx[t-1] || ny[t] != ny[t-1] || nz[t] != nz[t-1] + 1
+            push!(gstart, t); push!(gnx, nx[t]); push!(gny, ny[t]); push!(gnz0, nz[t])
+        end
+    end
+    push!(gstart, length(nx) + 1)
+    return gstart, gnx, gny, gnz0
 end
 
 "(Re)create the backend arrays of R from the host state (`backend` = :cpu or :cuda, `precision` = :mixed or :double)."
@@ -157,14 +215,17 @@ function _bind_backend!(R::EwaldRecip, backend::Symbol; precision::Symbol=R.prec
     precision in (:mixed, :double) || error("EwaldRecip: precision must be :mixed or :double")
     R.backend = backend; R.precision = precision
     if backend === :cpu && precision === :double
-        R.Sd = R.S; R.cd = R.c; R.vd = R.work; R.cwd = R.cw; R.tmpNd = R.tmpN
+        R.Sd = R.S; R.cd = R.c; R.vd = R.work; R.cwd = R.cw; R.rowd = R.rowh
+        R.stage = ComplexF64[]; R.stage_row = Float64[]
     else
         C = precision === :mixed ? ComplexF32 : ComplexF64
         F = precision === :mixed ? Float32 : Float64
         R.Sd = backend_array(backend, convert(Matrix{C}, R.S)); R.cd = backend_array(backend, convert(Vector{F}, R.c))
         R.vd = backend_array(backend, zeros(C, length(R.c))); R.cwd = backend_array(backend, zeros(C, length(R.c)))
-        R.tmpNd = backend_array(backend, zeros(C, length(R.tmpN)))
+        R.rowd = backend_array(backend, zeros(F, length(R.rowh)))
+        R.stage = zeros(C, length(R.c)); R.stage_row = zeros(F, length(R.rowh))
     end
+    R.Sdr = _realview(R.Sd); R.cwdr = _realview(R.cwd)
     return R
 end
 
@@ -210,8 +271,33 @@ function recip_sf!(out::AbstractVector{ComplexF64}, R::EwaldRecip, sys, i::Int)
         y = sys.com[2, i] + sys.site_off[2, s0 + a]
         z = sys.com[3, i] + sys.site_off[3, s0 + a]
         _powers!(R.ex, tp * x, R.nmax); _powers!(R.ey, tp * y, R.nmax); _powers!(R.ez, tp * z, R.nmax)
-        for kk in eachindex(out)
-            out[kk] += q * (R.ex[o + R.nx[kk]] * R.ey[o + R.ny[kk]] * R.ez[o + R.nz[kk]])
+        for g in eachindex(R.gnx)                    # one run of equal (nx, ny): e^{i(kx x + ky y)} formed once
+            qxy = q * (R.ex[o + R.gnx[g]] * R.ey[o + R.gny[g]])
+            z0 = o + R.gnz0[g] - R.gstart[g]
+            @simd for kk in R.gstart[g]:R.gstart[g+1]-1
+                out[kk] += qxy * R.ez[z0 + kk]
+            end
+        end
+    end
+    return out
+end
+
+"""
+    recip_sf_translate!(out, R, src, d)
+
+out = e^{i k·d} ∘ src: the structure factor of a molecule with structure factor `src` translated rigidly by d
+(S(k) = Σ_a q_a e^{i k·(r_a + d)} = e^{i k·d} Σ_a q_a e^{i k·r_a}); cost independent of the number of sites.
+"""
+function recip_sf_translate!(out::AbstractVector{ComplexF64}, R::EwaldRecip, src::AbstractVector{ComplexF64},
+                             d::NTuple{3,Float64})
+    tp = 2π / R.L
+    o = R.nmax + 1
+    _powers!(R.ex, tp * d[1], R.nmax); _powers!(R.ey, tp * d[2], R.nmax); _powers!(R.ez, tp * d[3], R.nmax)
+    @inbounds for g in eachindex(R.gnx)
+        pxy = R.ex[o + R.gnx[g]] * R.ey[o + R.gny[g]]
+        z0 = o + R.gnz0[g] - R.gstart[g]
+        @simd for kk in R.gstart[g]:R.gstart[g+1]-1
+            out[kk] = (pxy * R.ez[z0 + kk]) * src[kk]
         end
     end
     return out
@@ -303,7 +389,7 @@ function recip_commit!(sys, i::Int)
     end
     R.corr[i] = recip_corr(R, sys, i)
     R.eimg[i] = recip_half_norm(R, col) - R.corr[i]
-    R.Sd === R.S || _upload!(view(R.Sd, :, i), R.work)   # R.work == the new column (a host Array)
+    R.Sd === R.S || _upload!(view(R.Sd, :, i), R.work, R.stage)   # R.work == the new column (a host Array)
     R.last = i
     R.n_commit += 1
     return nothing
@@ -323,12 +409,28 @@ molecules committed). row[k] is meaningless (callers reset it).
 """
 function recip_row_add!(row::AbstractVector{Float64}, R::EwaldRecip, sys, k::Int)
     recip_sf!(R.work, R, sys, k)
-    R.vd === R.work || _upload!(R.vd, R.work)
+    R.vd === R.work || _upload!(R.vd, R.work, R.stage)
     R.cwd .= R.cd .* R.vd
-    mul!(R.tmpNd, R.Sd', R.cwd)                     # Σ_k conj(S_jk) c_k S_k
-    to_host!(R.tmpN, R.tmpNd)
-    @inbounds for j in eachindex(row); row[j] += real(R.tmpN[j]); end
+    _recip_row_product!(row, R)
+end
+
+"Row from the backend vector R.cwd: row[j] += Re[Σ_k conj(S_jk) cwd_k], one real matrix–vector product (`_realview`)."
+function _recip_row_product!(row::AbstractVector{Float64}, R::EwaldRecip)
+    mul!(R.rowd, transpose(R.Sdr), R.cwdr)
+    to_host!(R.rowh, R.rowd, R.stage_row)
+    @inbounds for j in eachindex(row); row[j] += R.rowh[j]; end
     return nothing
+end
+
+"""
+    recip_row_add_committed!(row, R, k)
+
+As `recip_row_add!` for molecule k at its committed pose (right after `recip_commit!`): the committed backend column
+S_k is used directly (no structure factor, no upload).
+"""
+function recip_row_add_committed!(row::AbstractVector{Float64}, R::EwaldRecip, k::Int)
+    R.cwd .= R.cd .* view(R.Sd, :, k)
+    _recip_row_product!(row, R)
 end
 
 """

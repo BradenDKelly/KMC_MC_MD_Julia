@@ -23,13 +23,20 @@ struct RBDihedral
     i::Int; j::Int; k::Int; l::Int; C::NTuple{6,Float64}
 end
 
+"Periodic dihedral, GROMACS types 1/4/9 (type 4: periodic improper): V = k (1 + cos(n φ − φs)), φ IUPAC (0 = cis)."
+struct PeriodicDihedral
+    i::Int; j::Int; k::Int; l::Int; φs::Float64; kφ::Float64; n::Int
+end
+
 """
-    BondedTerms(n_sites; bonds, angles, dihedrals, fudge_lj=0.5, fudge_qq=0.5, nrexcl=3)
+    BondedTerms(n_sites; bonds, angles, dihedrals, periodic=[], fudge_lj=0.5, fudge_qq=0.5, nrexcl=3, pairs14=nothing)
 
 Bonded terms of one molecule plus the intramolecular nonbonded pair lists derived from the bond graph as
 GROMACS does with `nrexcl` and `gen-pairs`: pairs separated by fewer than `nrexcl` bonds are excluded, pairs at
 exactly `nrexcl` bonds (1-4 for nrexcl = 3) are `pairs14` scaled by `fudge_lj`/`fudge_qq`, pairs further apart
-are `nonbonded` at full strength (plain LJ and plain Coulomb, no cutoff).
+are `nonbonded` at full strength (plain LJ and plain Coulomb, no cutoff). An explicit `pairs14` list (a topology's
+`[ pairs ]` section, as LigParGen writes it) replaces the graph-derived 1-4 list; `periodic` holds periodic
+(e.g. improper) dihedrals.
 """
 struct BondedTerms
     n_sites::Int
@@ -40,11 +47,14 @@ struct BondedTerms
     nonbonded::Vector{Tuple{Int,Int}}
     fudge_lj::Float64
     fudge_qq::Float64
+    periodic::Vector{PeriodicDihedral}
 end
 
 function BondedTerms(n_sites::Int; bonds::Vector{HarmonicBond}=HarmonicBond[],
                      angles::Vector{HarmonicAngle}=HarmonicAngle[], dihedrals::Vector{RBDihedral}=RBDihedral[],
-                     fudge_lj::Float64=0.5, fudge_qq::Float64=0.5, nrexcl::Int=3)
+                     fudge_lj::Float64=0.5, fudge_qq::Float64=0.5, nrexcl::Int=3,
+                     periodic::Vector{PeriodicDihedral}=PeriodicDihedral[],
+                     pairs14::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
     # bond-graph distances by breadth-first search
     adj = [Int[] for _ in 1:n_sites]
     for b in bonds
@@ -73,7 +83,11 @@ function BondedTerms(n_sites::Int; bonds::Vector{HarmonicBond}=HarmonicBond[],
             push!(nb, (a, b))
         end
     end
-    return BondedTerms(n_sites, bonds, angles, dihedrals, p14, nb, fudge_lj, fudge_qq)
+    if pairs14 !== nothing                  # explicit [ pairs ]: GROMACS uses exactly the listed pairs
+        p14 = sort([(min(a, b), max(a, b)) for (a, b) in pairs14])
+        allunique(p14) || error("BondedTerms: duplicate 1-4 pairs")
+    end
+    return BondedTerms(n_sites, bonds, angles, dihedrals, p14, nb, fudge_lj, fudge_qq, periodic)
 end
 
 @inline _dist(X, a, b) = sqrt((X[1, a] - X[1, b])^2 + (X[2, a] - X[2, b])^2 + (X[3, a] - X[3, b])^2)
@@ -123,7 +137,17 @@ function bonded_energy(bt::BondedTerms, X::AbstractMatrix{Float64})
             p *= cψ
         end
     end
+    ed += periodic_dihedral_energy(bt, X)
     return eb, ea, ed
+end
+
+"Σ k (1 + cos(n φ − φs)) over the periodic dihedrals (part of `bonded_energy`'s dihedral term)."
+function periodic_dihedral_energy(bt::BondedTerms, X::AbstractMatrix{Float64})::Float64
+    e = 0.0
+    for d in bt.periodic
+        e += d.kφ * (1 + cos(d.n * dihedral_angle(X, d.i, d.j, d.k, d.l) - d.φs))
+    end
+    return e
 end
 
 """
@@ -135,14 +159,15 @@ over the pairs beyond (full strength). `types[s] = 0` means no LJ on site s. No 
 function intra_nonbonded_energy(bt::BondedTerms, X::AbstractMatrix{Float64}, types::AbstractVector{Int},
                                 q::AbstractVector{Float64}, σ_mix::AbstractMatrix{Float64},
                                 ϵ_mix::AbstractMatrix{Float64}, ke::Float64)
+    # (the local is not called `lj`: an assignment inside a closure would capture the accumulator `lj` below)
     function pair(a, b)
         r = _dist(X, a, b)
-        lj = 0.0
+        ulj = 0.0
         if types[a] > 0 && types[b] > 0
             s6 = (σ_mix[types[a], types[b]] / r)^6
-            lj = 4.0 * ϵ_mix[types[a], types[b]] * (s6 * s6 - s6)
+            ulj = 4.0 * ϵ_mix[types[a], types[b]] * (s6 * s6 - s6)
         end
-        return lj, ke * q[a] * q[b] / r
+        return ulj, ke * q[a] * q[b] / r
     end
     lj14 = 0.0; qq14 = 0.0
     for (a, b) in bt.pairs14
@@ -204,5 +229,7 @@ function bonded_to_reduced(bt::BondedTerms, σ_angstrom::Float64, ϵ_kJmol::Floa
     bonds = [HarmonicBond(b.i, b.j, b.b0 * lu, b.kb / lu^2 / ϵ_kJmol) for b in bt.bonds]
     angles = [HarmonicAngle(a.i, a.j, a.k, a.θ0, a.kθ / ϵ_kJmol) for a in bt.angles]
     dihedrals = [RBDihedral(d.i, d.j, d.k, d.l, ntuple(n -> d.C[n] / ϵ_kJmol, 6)) for d in bt.dihedrals]
-    return BondedTerms(bt.n_sites, bonds, angles, dihedrals, copy(bt.pairs14), copy(bt.nonbonded), bt.fudge_lj, bt.fudge_qq)
+    periodic = [PeriodicDihedral(d.i, d.j, d.k, d.l, d.φs, d.kφ / ϵ_kJmol, d.n) for d in bt.periodic]
+    return BondedTerms(bt.n_sites, bonds, angles, dihedrals, copy(bt.pairs14), copy(bt.nonbonded), bt.fudge_lj, bt.fudge_qq,
+                       periodic)
 end

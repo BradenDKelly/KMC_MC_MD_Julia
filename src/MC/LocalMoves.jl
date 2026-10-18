@@ -160,8 +160,10 @@ end
 # put s at candidate j (pose saved in com0/q0/B0)
 function _lm_place!(lm::LocalMoves, sys, j::Int)
     s = lm.mol; kd = lm.kinds[j]
+    # T and R keep the saved body B0 (set_molecule! keeps the current one, which a preceding C/S/D candidate changed)
+    (kd == LM_T || kd == LM_R) && isflexible(sys.templates[sys.tmpl[s]]) && _set_body!(sys, s, lm.B0)
     if kd == LM_T
-        set_molecule!(sys, s, MVector{3,Float64}(lm.com0[1] + lm.dT[1, j], lm.com0[2] + lm.dT[2, j], lm.com0[3] + lm.dT[3, j]), lm.q0)
+        set_molecule!(sys, s, SVector{3,Float64}(lm.com0[1] + lm.dT[1, j], lm.com0[2] + lm.dT[2, j], lm.com0[3] + lm.dT[3, j]), lm.q0)
     elseif kd == LM_R
         set_molecule!(sys, s, lm.com0, quat_mul(view(lm.dQ, :, j), lm.q0))
     elseif kd == LM_C
@@ -175,22 +177,36 @@ function _lm_place!(lm::LocalMoves, sys, j::Int)
 end
 # LM_S / LM_D: change the body-frame sites, re-centre, shift the COM by the rotated centre shift (orientation kept)
 function _lm_place_internal!(lm::LocalMoves, sys, j::Int)
-    s = lm.mol; t = sys.templates[sys.tmpl[s]]
-    Y = copy(lm.B0)
-    if lm.kinds[j] == LM_S
-        n = lm.slot_idx[j]
-        @inbounds for d in 1:3; Y[d, n] += lm.dT[d, j]; end
+    kd = lm.kinds[j]
+    _place_internal!(sys, lm.mol, lm.B0, lm.com0, lm.q0, kd, lm.slot_idx[j], lm.dT[1, j], lm.dT[2, j], lm.dT[3, j],
+                     kd == LM_D ? lm.tors[lm.slot_idx[j]] : nothing)
+end
+
+"""
+    _place_internal!(sys, s, B0, com0, q0, kind, idx, d1, d2, d3, tor)
+
+Put molecule s at the internal candidate of saved pose (com0, q0, B0): LM_S moves body site `idx` by (d1, d2, d3), LM_D
+rotates the moving fragment of rotatable bond `tor` = (a, b, mov) by d1; then the body is re-centred and the COM shifted by
+the rotated centre shift at fixed orientation (in the lab frame: site idx alone displaced by R δ, or the fragment rotated
+rigidly about the bond). Shared by `LocalMoves` and `SolventLocalMoves`.
+"""
+function _place_internal!(sys, s::Int, B0::AbstractMatrix{Float64}, com0::AbstractVector{Float64},
+                          q0::AbstractVector{Float64}, kind::Int, idx::Int, d1::Float64, d2::Float64, d3::Float64, tor)
+    t = sys.templates[sys.tmpl[s]]
+    Y = copy(B0)
+    if kind == LM_S
+        @inbounds Y[1, idx] += d1; @inbounds Y[2, idx] += d2; @inbounds Y[3, idx] += d3
     else
-        (a, b, mov) = lm.tors[lm.slot_idx[j]]
-        rotate_fragment!(Y, a, b, mov, lm.dT[1, j])
+        (a, b, mov) = tor
+        rotate_fragment!(Y, a, b, mov, d1)
     end
     m = t.site_mass; mt = sum(m)
     c = (Y * m) ./ mt
     Y .-= c
-    R = quaternion_to_rotation_matrix(lm.q0)
+    R = quaternion_to_rotation_matrix(q0)
     sh = R * c
     _set_body!(sys, s, Y)
-    set_molecule!(sys, s, MVector{3,Float64}(lm.com0[1] + sh[1], lm.com0[2] + sh[2], lm.com0[3] + sh[3]), lm.q0)
+    set_molecule!(sys, s, MVector{3,Float64}(com0[1] + sh[1], com0[2] + sh[2], com0[3] + sh[3]), q0)
     return nothing
 end
 _lm_internal(lm::LocalMoves) = any(k -> k == LM_S || k == LM_D, lm.kinds)
@@ -202,6 +218,10 @@ function lm_rebuild!(lm::LocalMoves, sys, ff)
     t = sys.templates[sys.tmpl[lm.mol]]
     internal = _lm_internal(lm)
     internal && (lm.uin0 = flex_intra_energy(t, ff, lm.B0))
+    if _has_recip(sys, ff)                             # S at the saved pose: translated candidates are e^{ik·d} S
+        R = sys.recip
+        recip_sf!(R.work, R, sys, lm.mol); corr0 = recip_corr(R, sys, lm.mol)
+    end
     for j in eachindex(lm.kinds)
         _lm_place!(lm, sys, j)
         (lm.kinds[j] == LM_S || lm.kinds[j] == LM_D) && (lm.cand_intra[j] = flex_intra_energy(t, ff, sys.body[lm.mol]))
@@ -214,8 +234,13 @@ function lm_rebuild!(lm::LocalMoves, sys, ff)
             R = sys.recip
             size(lm.cand_S, 1) == n_kvectors(R) || (lm.cand_S = zeros(ComplexF64, n_kvectors(R), length(lm.kinds)))
             Sj = view(lm.cand_S, :, j)
-            recip_sf!(Sj, R, sys, lm.mol)
-            r = recip_half_norm(R, Sj) - recip_corr(R, sys, lm.mol)
+            if lm.kinds[j] == LM_T
+                recip_sf_translate!(Sj, R, R.work, (lm.dT[1, j], lm.dT[2, j], lm.dT[3, j]))
+                r = recip_half_norm(R, Sj) - corr0
+            else
+                recip_sf!(Sj, R, sys, lm.mol)
+                r = recip_half_norm(R, Sj) - recip_corr(R, sys, lm.mol)
+            end
             @inbounds for kk in eachindex(R.c)
                 a = R.Stot[kk] - R.S[kk, lm.mol]
                 r += R.c[kk] * (real(Sj[kk]) * real(a) + imag(Sj[kk]) * imag(a))
