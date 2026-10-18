@@ -320,3 +320,27 @@ end
     end
     @test allocs[1] == allocs[2]
 end
+
+# Device-array stand-in: scalar setindex! errors (as on CUDA), block copies from a dense host Array are allowed.
+struct NoScalarArray{T,N} <: AbstractArray{T,N}
+    a::Array{T,N}
+end
+Base.size(x::NoScalarArray) = size(x.a)
+Base.getindex(x::NoScalarArray, i::Int...) = x.a[i...]
+Base.setindex!(::NoScalarArray, v, i::Int...) = error("scalar indexing of a device array")
+Base.IndexStyle(::Type{<:NoScalarArray}) = IndexLinear()
+Base.copyto!(d::NoScalarArray, doff::Integer, s::Array, soff::Integer, n::Integer) = (copyto!(d.a, doff, s, soff, n); d)
+
+@testset "staged uploads into device arrays use block copies (CUDA scalar-indexing regression)" begin
+    rng = MersenneTwister(5)
+    H = rand(rng, ComplexF64, 7, 6)
+    for (T, stage) in ((ComplexF64, zeros(ComplexF64, 7, 2)), (ComplexF32, zeros(ComplexF32, 7, 2)))
+        D = NoScalarArray(zeros(T, 7, 6))
+        MCe._upload!(view(D, :, 3:4), view(H, :, 3:4), stage)        # host view → device column range
+        @test D.a[:, 3:4] == T.(H[:, 3:4])
+        @test all(iszero, D.a[:, [1, 2, 5, 6]])
+        v = NoScalarArray(zeros(T, 7))
+        MCe._upload!(v, H[:, 1], zeros(T, 7))                         # dense host vector → device vector
+        @test v.a == T.(H[:, 1])
+    end
+end

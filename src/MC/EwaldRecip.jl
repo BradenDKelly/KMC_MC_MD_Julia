@@ -107,8 +107,22 @@ function _upload!(dst::AbstractArray, src::AbstractArray, stage::Array)
     if dst isa Array || (dst isa SubArray && parent(dst) isa Array)
         dst .= src
     else
-        eltype(dst) == eltype(src) ? copyto!(dst, src) : (stage .= src; copyto!(dst, stage))
+        # a device destination takes one block copy from a dense host array: a host view (e.g. a column range) or
+        # another element type is gathered into `stage` first (copying a view straight into a device array falls back
+        # to element-wise setindex!, which CUDA forbids)
+        s = src isa Array && eltype(src) == eltype(dst) ? src : copyto!(stage, src)
+        _device_copy!(dst, s, length(src))
     end
+    return dst
+end
+# n elements of the dense host array s into a device array or a contiguous view of one (offset copy into the parent)
+_device_copy!(dst::AbstractArray, s::Array, n::Int) = copyto!(dst, 1, s, 1, n)
+function _device_copy!(dst::SubArray, s::Array, n::Int)
+    n == 0 && return dst
+    p = parent(dst); li = LinearIndices(p)
+    off = li[first.(parentindices(dst))...]
+    li[last.(parentindices(dst))...] - off + 1 == n || error("_upload!: device view is not contiguous")
+    copyto!(p, off, s, 1, n)
     return dst
 end
 "As `to_host!` without allocating on the host side (`stage`: host array of eltype(src), same length)."
