@@ -102,6 +102,7 @@ end
 function molecule_committed!(sys, i::Int)
     recip_commit!(sys, i)
     sys.cells === nothing || cells_moved!(sys.cells, sys, i)
+    sys.dev === nothing || dp_sync_molecule!(sys.dev.D, sys, i)
     return nothing
 end
 

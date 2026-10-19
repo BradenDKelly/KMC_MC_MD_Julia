@@ -78,6 +78,7 @@ mutable struct LocalMoves
     B0::Matrix{Float64}
     cand_rec::Vector{Float64}           # reciprocal-space Ewald: Fourier + image energy of each candidate (0 otherwise)
     cand_S::Matrix{ComplexF64}          # N_k × K candidate structure factors (N_k × 0 without reciprocal space)
+    cand_P::Any                         # SPME mesh path (PMERecip): PMEStencils of the K candidate poses; nothing otherwise
 end
 
 """
@@ -107,7 +108,7 @@ function LocalMoves(sys, s::Int, nrungs::Int; kinds::Vector{Int}, a::Float64, θ
     lm = LocalMoves(s, copy(kinds), a, θmax, site_a, φmax, zeros(Int, K), tors, zeros(K), 0.0,
                     ν, νD, zeros(3, K), zeros(4, K), [zeros(3, 0) for _ in 1:K],
                     zeros(K, N), zeros(K), zeros(K), true, zeros(Int, max(3, maximum(kinds))), zeros(Int, nrungs), 0, 0,
-                    zeros(N), zeros(N), zeros(3), zeros(4), zeros(3, nB), zeros(K), zeros(ComplexF64, 0, K))
+                    zeros(N), zeros(N), zeros(3), zeros(4), zeros(3, nB), zeros(K), zeros(ComplexF64, 0, K), nothing)
     lm_refresh!(lm, sys, reservoir)
     lm.n_refresh = 0
     return lm
@@ -218,7 +219,13 @@ function lm_rebuild!(lm::LocalMoves, sys, ff)
     t = sys.templates[sys.tmpl[lm.mol]]
     internal = _lm_internal(lm)
     internal && (lm.uin0 = flex_intra_energy(t, ff, lm.B0))
-    if _has_recip(sys, ff)                             # S at the saved pose: translated candidates are e^{ik·d} S
+    if _has_recip(sys, ff) && sys.recip isa PMERecip   # mesh path: Q_c·(Φ − Φ_s) + e_c (PMERecip.jl)
+        R = sys.recip
+        P = lm.cand_P
+        (P === nothing || size(P.q, 2) != length(lm.kinds)) && (lm.cand_P = P = PMEStencils(R.p, t.n_sites, length(lm.kinds)))
+        Φs = pme_pin!(R, sys, lm.mol)                  # the fractional molecule's own potential, kept current
+        e0 = R.eimg[lm.mol]                            # exact image term: invariant under rigid translation
+    elseif _has_recip(sys, ff)                         # S at the saved pose: translated candidates are e^{ik·d} S
         R = sys.recip
         recip_sf!(R.work, R, sys, lm.mol); corr0 = recip_corr(R, sys, lm.mol)
     end
@@ -230,7 +237,13 @@ function lm_rebuild!(lm::LocalMoves, sys, ff)
         @inbounds for i in 1:N
             lm.cand_pair[j, i] = lm.row_u[i]; u += lm.row_u[i]
         end
-        if _has_recip(sys, ff)
+        if _has_recip(sys, ff) && sys.recip isa PMERecip
+            R = sys.recip
+            pme_cand_store!(P, j, R, sys, lm.mol)
+            r = pme_cand_gather(P, j, R.Φ, R) - pme_cand_gather(P, j, Φs, R)
+            r += lm.kinds[j] == LM_T ? e0 : recip_image_now(R, sys, lm.mol)
+            lm.cand_rec[j] = r; u += r
+        elseif _has_recip(sys, ff)
             R = sys.recip
             size(lm.cand_S, 1) == n_kvectors(R) || (lm.cand_S = zeros(ComplexF64, n_kvectors(R), length(lm.kinds)))
             Sj = view(lm.cand_S, :, j)
@@ -270,7 +283,7 @@ function lm_molecule_moved!(lm::LocalMoves, sys, ff, i::Int)
         R = sys.recip
         R.last == i || error("lm_molecule_moved!: reciprocal space last committed molecule $(R.last), not $i")
         @inbounds for j in eachindex(lm.kinds)
-            d = recip_cross(R, view(lm.cand_S, :, j), R.dS)
+            d = R isa PMERecip ? pme_cand_gather(lm.cand_P, j, R.dΦ, R) : recip_cross(R, view(lm.cand_S, :, j), R.dS)
             lm.cand_rec[j] += d; lm.cand_u[j] += d
         end
     end

@@ -7,7 +7,7 @@ and the eKMC per-species μ vs Widom insertion of ideal-gas conformers into the 
 exact identities at round-off; statistical comparisons within 3 combined standard errors (fixed seeds).
 """
 
-using Test
+using Test, Random
 using MolSim
 using StaticArrays
 using Random
@@ -37,7 +37,17 @@ vstd(x) = sqrt(sum(abs2, x .- vmean(x)) / (length(x) - 1))
     μvec = X0 * mr.solute.site_q
     @test isapprox(MCm.flex_intra_energy(mr.solute, mr.ff, X0) - MCm.flex_intra_energy(t, m.ff, X0),
                    -mr.ff.rf.k_rf * sum(abs2, μvec); rtol=1e-10)
-    @test_throws ErrorException MCm.flex_intra_energy(mr.solute, MCm.spce_solute_model(:methanol_flex; coulomb=:wolf).ff, X0)
+    # Wolf (JOURNAL 121): the conformation-dependent self + exclusion term equals the flat routines of Electrostatics.jl
+    mw = MCm.spce_solute_model(:methanol_flex; coulomb=:wolf, cutoff=:site)
+    mn = MCm.spce_solute_model(:methanol_flex; coulomb=:none, cutoff=:site)
+    wp = mw.ff.wolf; q = mw.solute.site_q; n = length(q)
+    X1 = X0 .+ 0.03 .* randn(Xoshiro(5), 3, n)                        # a distorted conformation
+    for X in (X0, X1)
+        @test isapprox(MCm.flex_intra_energy(mw.solute, mw.ff, X) - MCm.flex_intra_energy(mn.solute, mn.ff, X),
+                       MCm.wolf_self_energy(q, wp) + MCm.wolf_intra_energy(X, q, ones(Int, n), 1e6, wp); rtol=1e-12)
+    end
+    @test MCm.wolf_molecule_energy(q, X0, wp) ≈ MCm.coulomb_molecule_constant(mw.solute, mw.ff) rtol = 1e-14
+    @test MCm.flex_intra_energy(mw.solute, mw.ff, X1) != MCm.flex_intra_energy(mw.solute, mw.ff, X0)
 end
 
 @testset "Flexible methanol reservoir: ⟨U_intra⟩ and its terms against a 0.2 fs GROMACS vacuum run" begin

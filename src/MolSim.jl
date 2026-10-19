@@ -17,6 +17,7 @@ module MolSim
         include("MC/Electrostatics.jl")
         include("MC/EwaldRecip.jl")
         include("MC/PME.jl")
+        include("MC/PMERecip.jl")
         include("MC/MolCells.jl")
         include("MC/Fluctuations.jl")
     include("MC/eKMC.jl")

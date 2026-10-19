@@ -344,3 +344,19 @@ Base.copyto!(d::NoScalarArray, doff::Integer, s::Array, soff::Integer, n::Intege
         @test v.a == T.(H[:, 1])
     end
 end
+
+@testset "coulomb = :ewald guards: no reciprocal state, eKMC NPT without a reciprocal virial (regression, JOURNAL 121)" begin
+    # without attach_ewald! only the real-space erfc terms would be evaluated, silently; eKMC NPT needs the pressure,
+    # which has no reciprocal virial (pressure returns NaN): both must be errors
+    α = MCe.ewald_alpha_for(4.5, 1e-5)
+    m = MCe.spce_model(; α_per_angstrom=α, rc_angstrom=4.5, coulomb=:ewald)
+    L = cbrt(20 / 0.0334) / m.σ_angstrom
+    sys = MCe.RigidSystem([m.template], fill(1, 20), L, m.ϵ_kelvin / 300.0, Xoshiro(3))
+    MCe.random_rigid_system!(sys, m.ff)
+    @test_throws ErrorException MCe.init_rigid_ekmc_run(sys, m.ff; events=10)
+    @test_throws ErrorException MCe.run_rigid_mc!(sys, m.ff; sweeps=1, δ=0.1, δθ=0.3)
+    MCe.attach_ewald!(sys, m.ff; rtol=1e-5, precision=:double)
+    @test_throws ErrorException MCe.init_rigid_ekmc_run(sys, m.ff; events=10, Pext=1e-3, max_dV=0.01)
+    r = MCe.init_rigid_ekmc_run(sys, m.ff; events=10)                     # NVT with the reciprocal state: allowed
+    @test r.ev == 0
+end

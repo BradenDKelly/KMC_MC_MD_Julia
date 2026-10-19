@@ -22,11 +22,15 @@ ckpt = get(ENV, "SPCE_CHECKPOINT", ""); wall = parse(Float64, get(ENV, "SPCE_WAL
 ckpt_every = parse(Float64, get(ENV, "SPCE_CKPT_EVERY", "1800"))
 gro = get(ENV, "MIX_GRO", "/shared/kmc_polyatomic/gromacs_fe/mixtures/$mix/nvt.gro")
 pool_M = parse(Int, get(ENV, "MIX_POOL_M", "20000"))         # conformers per flexible species (20000 as the dilute runs; smaller only for smoke tests)
-out = joinpath(outdir, "mix_$(mix)_$(mode)_seed$(seed).txt")
+coulomb_req = Symbol(get(ENV, "MIX_COULOMB", "rf"))          # rf (ε_rf = ∞) | ewald (α from ewald-rtol 1e-5 at 10 Å) | pme (SPME mesh path)
+coulomb_req in (:rf, :ewald, :pme) || error("MIX_COULOMB must be rf, ewald or pme")
+coulomb = coulomb_req === :pme ? :ewald : coulomb_req
+out = joinpath(outdir, "mix_$(mix)_$(mode)_seed$(seed)$(coulomb_req === :rf ? "" : "_$(coulomb_req)").txt")
 
 function setup(io)
     solutes = mix == "mixEW" ? [:ethanol_flex] : [:ethanol_flex, :methanol_itp]
-    m = MCm.spce_mixture_model(solutes; rc_angstrom=10.0, cutoff=:site, coulomb=:rf, epsilon_rf=Inf)
+    m = MCm.spce_mixture_model(solutes; rc_angstrom=10.0, cutoff=:site, coulomb=coulomb, epsilon_rf=Inf,
+                               α_per_angstrom=coulomb === :ewald ? MCm.ewald_alpha_for(10.0, 1e-5) : 0.20)
     T = 300.0 / m.ϵ_kelvin; kJ = m.ϵ_kelvin * 1.3806488e-23 * 6.02214129e23 / 1000
     atm = m.ϵ_kelvin * 1.3806488e-23 / (m.σ_angstrom * 1e-10)^3 / 101325.0
     ff = first(MCm.kT_overlap_cap(m.ff, m.templates, T; U_kT=100.0))
@@ -52,9 +56,15 @@ function setup(io)
             MCm.molecule_from_sites!(sys, i, Y)
         end
     end
+    # reciprocal-space state from the loaded configuration; every move after this keeps it current
+    if coulomb_req === :pme                                  # GROMACS defaults: fourier-spacing 0.12 nm, pme-order 4
+        MCm.attach_pme!(sys, ff; rtol=1e-5, spacing=1.2 / m.σ_angstrom, order=4)
+    elseif coulomb === :ewald
+        MCm.attach_ewald!(sys, ff; rtol=1e-5, backend=Symbol(get(ENV, "MIX_EWALD_BACKEND", "cpu")))
+    end
     ncap, _ = MCm.capped_overlaps(sys, ff, 1)
-    @printf(io, "# %s %s seed %d  %s  %d molecules (%s), L = %.4f Å (GROMACS NVT box), T = 300 K, RF ε_rf = ∞, site cut-off 10 Å, cap kT100\n",
-            mix, mode, seed, Dates.now(), length(tmpl), join(["$(count(==(k), tmpl)) $(m.templates[k].name)" for k in unique(tmpl)], " + "), L * m.σ_angstrom)
+    @printf(io, "# %s %s seed %d  %s  %d molecules (%s), L = %.4f Å (GROMACS NVT box), T = 300 K, %s, site cut-off 10 Å, cap kT100\n",
+            mix, mode, seed, Dates.now(), length(tmpl), join(["$(count(==(k), tmpl)) $(m.templates[k].name)" for k in unique(tmpl)], " + "), L * m.σ_angstrom, coulomb === :rf ? "RF ε_rf = ∞" : sys.recip isa MCm.PMERecip ? "SPME mesh $(sys.recip.K)³ order $(sys.recip.p), α = $(round(MCm.ewald_alpha_for(10.0, 1e-5); digits=5)) 1/Å (NVT; no pressure)" : "Ewald α = $(round(MCm.ewald_alpha_for(10.0, 1e-5); digits=5)) 1/Å, $(MCm.n_kvectors(sys.recip)) k-vectors (NVT; no pressure)")
     # ideal-gas conformer pools of the flexible species (vacuum rejection-free eKMC with torsion slots, as the dilute runs)
     reservoirs = Any[nothing for _ in m.templates]
     for k in unique(tmpl)

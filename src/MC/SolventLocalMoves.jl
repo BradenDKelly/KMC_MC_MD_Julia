@@ -65,6 +65,8 @@ mutable struct SolventLocalMoves
     tors::Vector{Vector{Tuple{Int,Int,Vector{Int}}}}   # rotatable bonds per template
     cand_site::Vector{Float64}          # M: largest distance of any interacting site of any candidate pose from the saved COM
     cand_com::Vector{Float64}           # M: largest COM displacement of any candidate (molecule cut-off reach)
+    crP::Any                            # SPME mesh path (PMERecip): PMEStencils of the K·M candidate poses; nothing otherwise
+    dbase::Int                          # device pair rows (DevicePairs bank): candidate (ii, j) in pose slot dbase + (ii−1)K + j − 1; 0 = host
     act::BitMatrix                      # K × M: slot active (mixtures: no LM_S/LM_D on rigid movers, no LM_D without a
                                         # rotatable bond; an inactive slot has rate 0 — the event is absent, balance untouched)
 end
@@ -103,7 +105,7 @@ function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Fl
                           zeros(K, N, M), zeros(K, M), zeros(K, M), zeros(K, M), zeros(M), 0.0, zeros(Int, 5), 0, 0, 0,
                           zeros(N), zeros(N), Any[SLMPose() for _ in 1:Threads.nthreads()], zeros(ComplexF64, 0, K * M), zeros(K, M), zeros(K, M),
                           zeros(K * M), zeros(ComplexF64, 0, K * M), zeros(K * M), zeros(0, K * M), Float64[],
-                          zeros(ComplexF64, 0, K), site_a, φmax, zeros(Int, K, M), zeros(K, M), tors, zeros(M), zeros(M), act)
+                          zeros(ComplexF64, 0, K), site_a, φmax, zeros(Int, K, M), zeros(K, M), tors, zeros(M), zeros(M), nothing, 0, act)
     for ii in 1:M
         _slm_draw!(S, sys, ii)
     end
@@ -171,18 +173,28 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
     t = sys.templates[sys.tmpl[i]]
     internal = isflexible(t) && any(k -> k == LM_S || k == LM_D, S.kinds)
     uin0 = internal ? flex_intra_energy(t, ff, S.pose[1].B0) : 0.0
-    if R !== nothing
+    pme = R isa PMERecip
+    if pme                                              # mesh path: Q_c·(Φ − Φ_i − Φ_frac) + e_c and Q_c·Φ_frac (PMERecip.jl)
+        nmax = maximum(tt.n_sites for tt in sys.templates)
+        (S.crP === nothing || size(S.crP.q, 2) != K * length(S.mols)) && (S.crP = PMEStencils(R.p, nmax, K * length(S.mols)))
+        Φf = S.frac > 0 ? pme_pin!(R, sys, S.frac) : nothing
+        Φi = pme_mol_potential!(R, sys, i)
+        e_i = R.eimg[i]                                 # exact image term: invariant under rigid translation
+    elseif R !== nothing
         _slm_bind_recip!(S, R)
         recip_sf!(R.work, R, sys, i)                    # S_i at the saved pose: translated candidates are e^{ik·d} S_i
         corr_i = recip_corr(R, sys, i)                  # unchanged by a rigid translation
     end
     P = S.pose[1]
+    D = S.dbase > 0 ? _dev_for(sys, ff) : nothing       # device bank: stage the K poses here, one launch after the loop
     rsite = 0.0; rcom = 0.0
     for j in eachindex(S.kinds)
         if !S.act[j, ii]                                 # inactive slot: no candidate, rate 0 (slm_total_rate!)
             @inbounds for m in 1:N; S.cp[j, m, ii] = 0.0; end
             S.cu[j, ii] = 0.0; S.cs[j, ii] = 0.0; S.cin[j, ii] = 0.0
-            if R !== nothing
+            if pme
+                pme_cand_clear!(S.crP, (ii - 1) * K + j); S.cr_u[j, ii] = 0.0; S.cr_s[j, ii] = 0.0
+            elseif R !== nothing
                 fill!(view(S.crS, :, (ii - 1) * K + j), zero(ComplexF64)); S.cr_u[j, ii] = 0.0; S.cr_s[j, ii] = 0.0
             end
             continue
@@ -198,17 +210,27 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
             x = Dx + sys.site_off[1, s0 + n]; y = Dy + sys.site_off[2, s0 + n]; z = Dz + sys.site_off[3, s0 + n]
             rsite = max(rsite, sqrt(x * x + y * y + z * z))
         end
-        eval_row!(S.row_u, S.row_w, sys, ff, i; recip=false)
-        u = 0.0
-        @inbounds for m in 1:N
-            S.cp[j, m, ii] = S.row_u[m]
-            m == S.frac || (u += S.row_u[m])
+        if D !== nothing
+            dp_stage_pose!(D, S.dbase + (ii - 1) * K + j - 1, sys, i)
+        else
+            eval_row!(S.row_u, S.row_w, sys, ff, i; recip=false)
+            u = 0.0
+            @inbounds for m in 1:N
+                S.cp[j, m, ii] = S.row_u[m]
+                m == S.frac || (u += S.row_u[m])
+            end
+            S.cu[j, ii] = u
+            S.cs[j, ii] = S.frac > 0 ? S.row_u[S.frac] : 0.0
         end
-        S.cu[j, ii] = u
-        S.cs[j, ii] = S.frac > 0 ? S.row_u[S.frac] : 0.0
         kd = S.kinds[j]
         S.cin[j, ii] = (kd == LM_S || kd == LM_D) ? flex_intra_energy(t, ff, sys.body[i]) - uin0 : 0.0
-        if R !== nothing
+        if pme
+            col = (ii - 1) * K + j
+            pme_cand_store!(S.crP, col, R, sys, i)
+            g = pme_cand_gather(S.crP, col, R.Φ, R) - pme_cand_gather(S.crP, col, Φi, R)
+            gs = Φf === nothing ? 0.0 : pme_cand_gather(S.crP, col, Φf, R)
+            S.cr_u[j, ii] = g - gs + (S.kinds[j] == LM_T ? e_i : recip_image_now(R, sys, i)); S.cr_s[j, ii] = gs
+        elseif R !== nothing
             Sc = view(S.crS, :, (ii - 1) * K + j)
             if S.kinds[j] == LM_T
                 recip_sf_translate!(Sc, R, R.work, (S.dT[1, j, ii], S.dT[2, j, ii], S.dT[3, j, ii]))
@@ -227,7 +249,8 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
             S.cr_u[j, ii] = ru; S.cr_s[j, ii] = rs
         end
     end
-    if R !== nothing && S.crSd !== S.crS                # upload this mover's K candidate columns
+    D === nothing || _slm_device_rows!(S, D, ii, N)       # the K candidate rows of this mover: one launch of K·N tasks
+    if R !== nothing && !pme && S.crSd !== S.crS        # upload this mover's K candidate columns
         cols = (ii - 1) * K + 1:ii * K
         _upload!(view(S.crSd, :, cols), view(S.crS, :, cols), S.cr_stage_up)
     end
@@ -281,7 +304,10 @@ function slm_moved!(S::SolventLocalMoves, sys, ff, m::Int)
     K = length(S.kinds)
     reach0 = ff.cutoff === :molecule ? ff.rc : ff.rc + sys.ext[m]
     M = length(S.mols)
-    if _use_threads(M)                                  # columns of different movers are independent (bitwise = serial)
+    D = S.dbase > 0 ? _dev_for(sys, ff) : nothing
+    if D !== nothing                                    # device bank: every column in one launch (DevicePairs.jl)
+        S.n_colupd += _slm_device_columns!(S, D, sys, ff, m, reach0)
+    elseif _use_threads(M)                              # columns of different movers are independent (bitwise = serial)
         nt = Threads.nthreads()
         while length(S.pose) < nt; push!(S.pose, SLMPose()); end     # (a checkpoint may come from another thread count)
         cnt = zeros(Int, nt)
@@ -298,7 +324,18 @@ function slm_moved!(S::SolventLocalMoves, sys, ff, m::Int)
         end
     end
     R = _has_recip(sys, ff) ? sys.recip : nothing
-    if R !== nothing                                    # Fourier part of every candidate: crSᴴ (c ∘ ΔS_m)
+    if R isa PMERecip                                   # mesh path: every candidate changes by Q_c·ΔΦ_m
+        R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")
+        own = S.pos[m]
+        target = m == S.frac ? S.cr_s : S.cr_u
+        @inbounds for ii in eachindex(S.mols)
+            ii == own && continue                       # m's own candidates were rebuilt above
+            for j in 1:K
+                S.act[j, ii] || continue
+                target[j, ii] += pme_cand_gather(S.crP, (ii - 1) * K + j, R.dΦ, R)
+            end
+        end
+    elseif R !== nothing                                # Fourier part of every candidate: crSᴴ (c ∘ ΔS_m)
         R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")
         R.vd === R.work ? copyto!(R.work, R.dS) : _upload!(R.vd, R.dS, R.stage)
         R.cwd .= R.cd .* R.vd

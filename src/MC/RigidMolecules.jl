@@ -209,8 +209,9 @@ mutable struct RigidSystem
     rng::Xoshiro
     body::Vector{Matrix{Float64}}   # flexible molecules: current COM-centred conformation in the body frame (3 × n); rigid: 3 × 0
     ext::Vector{Float64}            # per-molecule extent (template extent for rigid molecules, current conformation for flexible)
-    recip::Union{Nothing,EwaldRecip}   # reciprocal-space Ewald state (coulomb = :ewald, `attach_ewald!`); nothing otherwise
+    recip::Union{Nothing,EwaldRecip,PMERecip}   # reciprocal space (coulomb = :ewald): `attach_ewald!` (k-vectors) or `attach_pme!` (SPME mesh); nothing otherwise
     cells::Union{Nothing,MolCells,SiteCells}   # cell list for the real-space rows (`attach_cells!`); nothing = all pairs
+    dev::Any                        # device pair rows (`attach_device_pairs!`, DevicePairs.jl): (D = DevicePairs, ff); nothing = host
 end
 
 function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Float64, β::Float64,
@@ -225,7 +226,7 @@ function RigidSystem(templates::Vector{RigidTemplate}, tmpl::Vector{Int}, L::Flo
     body = [isflexible(templates[tmpl[i]]) ? copy(templates[tmpl[i]].sites_body) : zeros(3, 0) for i in 1:n_mol]
     ext = [templates[tmpl[i]].extent for i in 1:n_mol]
     sys = RigidSystem(n_mol, L, β, templates, copy(tmpl), zeros(3, n_mol), zeros(4, n_mol),
-                      zeros(3, n), site_start, n, rng, body, ext, nothing, nothing)
+                      zeros(3, n), site_start, n, rng, body, ext, nothing, nothing, nothing)
     for i in 1:n_mol
         sys.quat[1, i] = 1.0
         update_site_offsets!(sys, i)
@@ -317,12 +318,16 @@ Intramolecular energy of a flexible molecule with site coordinates X (3 × n, an
 [pairs]), plus, for `coulomb = :rf`, GROMACS's reaction-field correction of every excluded pair
 (`rf_excluded_u`, conformation-dependent; −ke k_rf |μ|² for a neutral molecule) and the reaction-field pair
 term for the non-excluded intramolecular pairs — so the Hamiltonian stays identical to a GROMACS
-reaction-field run of the flexible topology. `:wolf` is not defined for flexible molecules.
+reaction-field run of the flexible topology. For `coulomb = :wolf` (JOURNAL 121) the Wolf self term and the exclusion
+correction −Σ_{all intramolecular pairs}(ke q q/r − u_Wolf(r)) of `wolf_intra_energy` are evaluated at the current
+conformation (`wolf_molecule_energy`): the Wolf self term follows from neutrality over all charges (Wolf et al. 1999,
+Eqs. 5.9–5.13), so every intramolecular pair's smooth remainder is removed, exactly as Ewald's image term e_m runs over all
+pairs (EwaldRecip `recip_corr`); with the bare 1/r of the 1-4 (× fudge_qq) and non-excluded pairs above, an excluded pair
+carries the correction only and a non-excluded pair nets the damped shifted u_Wolf(r) of an intermolecular pair.
 """
 function flex_intra_energy(t::RigidTemplate, ff::SiteForceField, X::AbstractMatrix{Float64})::Float64
     bt = t.bonded
     bt === nothing && return 0.0
-    ff.coulomb === :wolf && error("flex_intra_energy: Wolf electrostatics are not defined for flexible molecules (use :rf or :none)")
     eb, ea, ed = bonded_energy(bt, X)
     E = eb + ea + ed
     @inbounds for (a, b) in bt.pairs14
@@ -353,6 +358,28 @@ function flex_intra_energy(t::RigidTemplate, ff::SiteForceField, X::AbstractMatr
             E += rf_excluded_u(_dist(X, a, b), t.site_q[a], t.site_q[b], ff.rf)
         end
         E += rf_self_energy(t.site_q, ff.rf)
+    elseif ff.coulomb === :wolf
+        E += wolf_molecule_energy(t.site_q, X, ff.wolf)
+    end
+    return E
+end
+
+"""
+    wolf_molecule_energy(q, X, wp) -> E
+
+Wolf self term plus the intramolecular exclusion correction of one molecule with site coordinates X (3 × n):
+−ke [erfc(α rc)/(2 rc) + α/√π] Σ q² − Σ_{a<b} (ke q_a q_b / r_ab − u_Wolf(r_ab)) (`wolf_self_energy`, `wolf_intra_energy`).
+A constant for a rigid molecule (`coulomb_molecule_constant`); part of `flex_intra_energy` for a flexible one.
+"""
+function wolf_molecule_energy(q::AbstractVector{Float64}, X::AbstractMatrix{Float64}, wp::WolfParams)::Float64
+    E = 0.0
+    @inbounds for a in eachindex(q)
+        E -= wp.ke * (erfc(wp.α * wp.rc) / (2 * wp.rc) + wp.α / SQRT_PI) * q[a]^2
+        for b in a+1:length(q)
+            (q[a] == 0.0 || q[b] == 0.0) && continue
+            r = _dist(X, a, b)
+            E -= wp.ke * q[a] * q[b] / r - wolf_pair_u(r, q[a], q[b], wp)
+        end
     end
     return E
 end
@@ -934,7 +961,11 @@ function eval_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, sys::RigidSys
                    ff::SiteForceField, k::Int; recip::Bool=true)
     N = sys.n_mol
     c = sys.cells
-    if c isa SiteCells && _cells_for(c, ff) && site_cells_row!(row_u, row_w, c, sys, ff, k)
+    D = _dev_for(sys, ff)
+    if D !== nothing                                       # device rows (DevicePairs.jl, DESIGN §15 G2): k at its current pose
+        _dp_row!(row_u, row_w, D, sys, k)
+        n = -2
+    elseif c isa SiteCells && _cells_for(c, ff) && site_cells_row!(row_u, row_w, c, sys, ff, k)
         n = -2                                         # row done by the site cell list
     else
         n = (c isa MolCells && _cells_for(c, ff)) ? cells_gather!(c, sys, k) : -1
@@ -1016,7 +1047,7 @@ rebuilt from the current positions and the Fourier and image terms added (Σ = `
 function total_pair_energy(sys::RigidSystem, ff::SiteForceField)::Float64
     !_has_recip(sys, ff) && return _total_pair_energy_real(sys, ff)
     recip_rebuild!(sys.recip, sys)
-    return _total_pair_energy_real(sys, ff) + recip_energy_total(sys.recip)
+    return _total_pair_energy_real(sys, ff) + recip_energy_total(sys.recip, sys)
 end
 
 function _total_pair_energy_real(sys::RigidSystem, ff::SiteForceField)::Float64
@@ -1050,7 +1081,7 @@ function total_pair_energy_virial(sys::RigidSystem, ff::SiteForceField)
     U, W = _total_pair_energy_virial_real(sys, ff)
     !_has_recip(sys, ff) && return U, W
     recip_rebuild!(sys.recip, sys)
-    return U + recip_energy_total(sys.recip), W
+    return U + recip_energy_total(sys.recip, sys), W
 end
 
 function _total_pair_energy_virial_real(sys::RigidSystem, ff::SiteForceField)
@@ -1117,14 +1148,17 @@ end
 """
     wolf_constant_energy(sys, ff)
 
-Configuration-independent Wolf terms (self + intramolecular exclusion) of all molecules; add to the
-pair energy to compare absolute energies with Ewald.
+Configuration-independent Coulomb terms (Wolf: self + intramolecular exclusion; RF: excluded-pair + self) of all rigid
+molecules; add to the pair energy to compare absolute energies with Ewald / GROMACS. Flexible molecules are skipped: their
+terms depend on the conformation and are part of `flex_intra_energy`.
 """
 function wolf_constant_energy(sys::RigidSystem, ff::SiteForceField)::Float64
     ff.coulomb === :none && return 0.0
     E = 0.0
     for i in 1:sys.n_mol
-        E += coulomb_molecule_constant(sys.templates[sys.tmpl[i]], ff)
+        t = sys.templates[sys.tmpl[i]]
+        # a flexible molecule carries these terms, conformation-dependent, in flex_intra_energy (RF and Wolf)
+        isflexible(t) || (E += coulomb_molecule_constant(t, ff))
     end
     return E
 end
@@ -1142,15 +1176,7 @@ for `:rf`, where GROMACS carries them in a decoupling ΔG — the chemical poten
 function coulomb_molecule_constant(t::RigidTemplate, ff::SiteForceField)::Float64
     E = 0.0
     if ff.coulomb === :wolf
-        wp = ff.wolf
-        for n in 1:t.n_sites
-            E -= wp.ke * (erfc(wp.α * wp.rc) / (2 * wp.rc) + wp.α / SQRT_PI) * t.site_q[n]^2
-            for m in n+1:t.n_sites
-                (t.site_q[n] == 0.0 || t.site_q[m] == 0.0) && continue
-                r = norm(t.sites_body[:, n] - t.sites_body[:, m])
-                E -= wp.ke * t.site_q[n] * t.site_q[m] / r - wolf_pair_u(r, t.site_q[n], t.site_q[m], wp)
-            end
-        end
+        E += wolf_molecule_energy(t.site_q, t.sites_body, ff.wolf)
     elseif ff.coulomb === :rf
         p = ff.rf
         E += rf_self_energy(t.site_q, p)
@@ -1775,6 +1801,10 @@ function widom_lrc_shift(sys::RigidSystem, ff::SiteForceField, template_idx::Int
     return lrc_energy(ghost, ff) - lrc_energy(sys, ff)
 end
 
+# coulomb = :ewald without reciprocal-space state would evaluate only the real-space erfc terms, silently (JOURNAL 121)
+_require_recip(sys, ff, who) = ff.coulomb === :ewald && sys.recip === nothing &&
+    error("$who: coulomb = :ewald but sys has no reciprocal-space state; call attach_ewald!(sys, ff) first")
+
 """
     run_rigid_mc!(sys, ff; sweeps, δ, δθ, Pext=nothing, max_dlnV=0.1, vol_every=1,
                   sample_every=1, block_size=10, widom_template=0, widom_per_sample=0)
@@ -1800,6 +1830,7 @@ function run_rigid_mc!(sys::RigidSystem, ff::SiteForceField; sweeps::Int, δ::Fl
                        widom_template::Int=0, widom_per_sample::Int=0, tail_route::Symbol=:virial,
                        inverse_widom_molecule::Int=0, R_every::Int=0,
                        reservoirs::Union{Nothing,Vector}=nothing, δ_site::Float64=0.03, torsion_φ::Float64=0.0)
+    _require_recip(sys, ff, "run_rigid_mc!")
     st = RigidMCStats()
     N = sys.n_mol
     U = total_energy(sys, ff)
@@ -2080,6 +2111,7 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
     N = sys.n_mol
     !_has_recip(sys, ff) || recip_rebuild!(sys.recip, sys)
     sys.cells === nothing || cells_rebuild!(sys.cells, sys)
+    sys.dev === nothing || dp_sync!(sys.dev.D, sys)
     fill!(ek.pair_u, 0.0); fill!(ek.phi, 0.0); fill!(ek.pair_w, 0.0); fill!(ek.wsum, 0.0)
     if _use_threads(N)
         nt = Threads.nthreads()
@@ -2108,7 +2140,9 @@ function rebuild_rigid_ekmc!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForce
         Rr = sys.recip
         # on the backend with :double; with :mixed the rebuild is the exact Float64 resynchronisation (host)
         # Re[Sᴴ diag(c) S] = Srᵀ diag(c ⊗ (1,1)) Sr with Sr the real (interleaved Re, Im) view: one real product
-        Ψ = if Rr.precision === :double
+        Ψ = if Rr isa PMERecip
+            recip_pair_matrix(Rr, sys)                 # SPME cross terms Q_m·Φ_n (PMERecip.jl)
+        elseif Rr.precision === :double
             Array(transpose(Rr.Sdr) * (repeat(Rr.cd; inner=2) .* Rr.Sdr))
         else
             Sr = _realview(Rr.S); transpose(Sr) * (repeat(Rr.c; inner=2) .* Sr)
@@ -2168,7 +2202,7 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
     molecule_committed!(sys, k)                         # reciprocal space S_k, ΔS_k, Stot, e_k; cell list (no-ops otherwise)
     eval_row!(ek.row_u, ek.row_w, sys, ff, k; recip=false)   # threaded when N ≥ PARALLEL_MIN_MOL
     if _has_recip(sys, ff)                              # Fourier row from the committed column S_k (no recomputation)
-        recip_row_add_committed!(ek.row_u, sys.recip, k)
+        recip_row_add_committed!(ek.row_u, sys.recip, sys, k)
         @inbounds ek.row_u[k] = 0.0
     end
     if ek.frac > 0                                      # fractional molecule: bare row kept, matrix entries scaled by λ
@@ -2602,7 +2636,12 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          local_solvent::Bool=false, solvent_kinds::Vector{Int}=Int[], solvent_a::Float64=NaN,
                          solvent_θ::Float64=NaN, solvent_nu::Float64=NaN, solvent_nuD::Float64=NaN,
                          neighbor_cells::Bool=false, solvent_flexible::Bool=false, solvent_site_a::Float64=NaN,
-                         solvent_φ::Float64=NaN)
+                         solvent_φ::Float64=NaN, device::Symbol=:none, device_precision::Symbol=:double)
+    _require_recip(sys, ff, "run_rigid_ekmc!")
+    Pext === nothing || sys.dev === nothing ||
+        error("run_rigid_ekmc!: device pair rows (attach_device_pairs!) are NVT only")
+    Pext === nothing || !_has_recip(sys, ff) ||
+        error("run_rigid_ekmc!: NPT with reciprocal-space Ewald needs the reciprocal virial, not implemented (DESIGN §13); use NVT")
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2724,6 +2763,12 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                                     ν=νs, νD=isnan(solvent_nuD) ? νs : solvent_nuD, frac=ladder_solute,
                                     site_a=isnan(solvent_site_a) ? local_site_a : solvent_site_a,
                                     φmax=isnan(solvent_φ) ? mc_δθ : solvent_φ)
+    end
+    if device !== :none                                  # device pair rows (DESIGN §15 G2): rows and solvent candidates
+        Pext === nothing || error("run_rigid_ekmc!: device pair rows are NVT only")
+        np = slmoves === nothing ? 1 : length(slmoves.kinds) * length(slmoves.mols) + 1
+        attach_device_pairs!(sys, ff; backend=device, precision=device_precision, max_poses=max(np, 64))
+        slmoves === nothing || slm_attach_device!(slmoves, sys, ff)
     end
     t_total = 0.0
     # Tan 2017 Appendix 4: during the first `adapt_dV_moves` volume moves, every `adapt_dV_window`

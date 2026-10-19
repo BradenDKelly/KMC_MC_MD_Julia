@@ -20,7 +20,7 @@ Chem. B 130 (2026) 4636, Table 1); experiment: methane 8.37 kJ/mol (same table),
 −21.3 kJ/mol (Ben-Naim & Marcus, J. Chem. Phys. 81 (1984) 2016).
 
 Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_events seed outdir
-Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
+Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf|ewald|pme), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
@@ -43,12 +43,14 @@ ekmc_events = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 100_000
 seed = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : 1
 outdir = length(ARGS) >= 6 ? ARGS[6] : joinpath(@__DIR__, "results", "spce_solute")
 mkpath(outdir)
-α_A = parse(Float64, get(ENV, "SPCE_ALPHA", "0.20"))
-cutoff = Symbol(get(ENV, "SPCE_CUTOFF", "molecule"))
-coulomb = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))
+coulomb_req = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))      # wolf | rf | ewald | pme (pme = Ewald real space + SPME mesh path)
+coulomb = coulomb_req === :pme ? :ewald : coulomb_req
+# Ewald (JOURNAL 121): α from GROMACS's ewald-rtol = 1e-5 at rc = 10 Å unless SPCE_ALPHA is given; site cut-off (required)
+α_A = haskey(ENV, "SPCE_ALPHA") ? parse(Float64, ENV["SPCE_ALPHA"]) : coulomb === :ewald ? MCm.ewald_alpha_for(10.0, 1e-5) : 0.20
+cutoff = Symbol(get(ENV, "SPCE_CUTOFF", coulomb === :ewald ? "site" : "molecule"))
 fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast path switch (approximate for weakly bound species; default off)          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)
-elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : "a$(α_A)"
+elec_tag = coulomb === :rf ? "rf$(isinf(ε_rf) ? "inf" : ε_rf)" : coulomb_req === :pme ? "pme" : coulomb === :ewald ? "ewald" : "a$(α_A)"
 λfac = parse(Float64, get(ENV, "SPCE_LAMBDA", "0"))      # 0 = stock eKMC (default, user 2026-10-12); >0 = λ-hybrid, λ = fac·⟨R⟩_MC
 tag = get(ENV, "SPCE_TAG", "")
 ckpt = get(ENV, "SPCE_CHECKPOINT", "")    # checkpoint file: eKMC continues from it if present (chained jobs); "" = off
@@ -147,6 +149,16 @@ function setup_and_mc(io)
     end
     mres = MCm.minimize_rigid!(sys, ff; nsteps=500)   # steepest descent before MC (JOURNAL entry 25)
     println(io, "# minimize_rigid!: $(mres.steps) steps, U_pair $(round(mres.U_start; sigdigits=6)) → $(round(mres.U_end; sigdigits=6)) (reduced), capped pairs left $(mres.n_capped)"); flush(io)
+    if coulomb_req === :pme
+        # SPME mesh path (PMERecip.jl): GROMACS defaults fourier-spacing 0.12 nm, pme-order 4 unless SPCE_PME_SPACING / _ORDER
+        sp_nm = parse(Float64, get(ENV, "SPCE_PME_SPACING", "0.12")); po = parse(Int, get(ENV, "SPCE_PME_ORDER", "4"))
+        R = MCm.attach_pme!(sys, ff; rtol=1e-5, spacing=10sp_nm / m.σ_angstrom, order=po)
+        println(io, "# SPME mesh path: α = $(round(α_A; digits=5)) 1/Å (ewald-rtol 1e-5 at rc = 10 Å), mesh $(R.K)³ (spacing ≤ $(sp_nm) nm), order $(po); exact Ewald image terms ($(MCm.n_kvectors(R)) k-vectors); no Widom insertion, no pressure"); flush(io)
+    elseif coulomb === :ewald
+        # reciprocal-space state from the minimised start; every MC / eKMC move after this keeps it current
+        R = MCm.attach_ewald!(sys, ff; rtol=1e-5, backend=Symbol(get(ENV, "SPCE_EWALD_BACKEND", "cpu")))
+        println(io, "# reciprocal-space Ewald: α = $(round(α_A; digits=5)) 1/Å (ewald-rtol 1e-5 at rc = 10 Å), $(MCm.n_kvectors(R)) k-vectors, backend $(get(ENV, "SPCE_EWALD_BACKEND", "cpu")); no Widom insertion (removal estimator only), no pressure (reciprocal virial not implemented)"); flush(io)
+    end
     const_E = MCm.wolf_constant_energy(sys, ff)
     water_only = MCm.RigidSystem(m.templates, fill(1, N), L, 1 / T, Xoshiro(0))
     ΔU_tail = MCm.lrc_energy(sys, ff) - MCm.lrc_energy(water_only, ff)        # tail energy of the one solute
@@ -182,7 +194,7 @@ function setup_and_mc(io)
         sys_mc = deepcopy(sys)
         t0 = time()
         mc = MCm.run_rigid_mc!(sys_mc, ff; sweeps=mc_sweeps, δ=δ, δθ=δθ, sample_every=2,
-                               block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=2, widom_per_sample=50,
+                               block_size=max(10, mc_sweeps ÷ 2 ÷ 25), widom_template=coulomb === :ewald ? 0 : 2, widom_per_sample=coulomb === :ewald ? 0 : 50,
                                inverse_widom_molecule=isol, R_every=20, reservoirs=reservoirs, δ_site=0.03,
                                torsion_φ=torsion_on ? δθ : 0.0)
         t_mc = time() - t0

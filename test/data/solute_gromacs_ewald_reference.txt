@@ -1,0 +1,6 @@
+# GROMACS 2024.3 rerun (gromacs_fe/ewald_ref_flex): coulombtype Ewald / PME 0.04 nm order 8, coulomb-modifier None, rc 1.0 nm, ewald-rtol 1e-5,
+# vdw-modifier None; Potential − Disper.-corr. (kJ/mol) of test/data/gromacs_<solute>_spce500.gro with gromacs_fe/<solute>_rf.top
+butanol_flex ewald_nomod -26577.722168
+butanol_flex pmefine_nomod -26577.722168
+caffeine_lpg ewald_nomod -26583.760170
+caffeine_lpg pmefine_nomod -26583.758217

@@ -21,3 +21,8 @@ include(joinpath(@__DIR__, "test_device_pairs.jl"))               # CPU backend 
         @test r.same && r.sync_ok
     end
 end
+
+@testset "Device pair rows inside eKMC on CUDA (:double): incremental = host rebuild (G2)" begin
+    CUDA.functional() || error("CUDA not functional on $(gethostname())")
+    dp_ekmc_check(:cuda)
+end

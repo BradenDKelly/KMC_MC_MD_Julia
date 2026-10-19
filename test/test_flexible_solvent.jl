@@ -1,5 +1,5 @@
 # Flexible solvent L-moves (DESIGN §14): every molecule of a liquid of flexible molecules carries translation, rotation,
-# single-site and torsion slots. V1: involution of every slot kind and exact incremental bookkeeping (RF and Ewald);
+# single-site and torsion slots. V1: involution of every slot kind and exact incremental bookkeeping (RF, Ewald, Wolf);
 # V2: flexible LJ-dimer liquid, eKMC vs Metropolis MC with site moves (U, P, ⟨U_intra⟩ within 3 combined standard errors).
 using Test, Random
 using MolSim
@@ -21,8 +21,8 @@ function ethanol_liquid(N, seed; coulomb=:rf, rc=7.0, density=0.4)
     return m, sys
 end
 
-@testset "Flexible solvent L-moves: every slot kind is an involution; incremental bookkeeping = rebuild (RF, Ewald)" begin
-    for coul in (:rf, :ewald)
+@testset "Flexible solvent L-moves: every slot kind is an involution; incremental bookkeeping = rebuild (RF, Ewald, Wolf)" begin
+    for coul in (:rf, :ewald, :wolf)
         m, sys = ethanol_liquid(30, 4; coulomb=coul)
         ff = m.ff; N = sys.n_mol
         ek = MCf.init_rigid_ekmc(sys, ff)

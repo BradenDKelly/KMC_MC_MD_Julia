@@ -393,6 +393,9 @@ Stot and its image energy. No-op without reciprocal space.
 function recip_commit!(sys, i::Int)
     R = sys.recip
     R === nothing && return nothing
+    return _recip_commit!(R, sys, i)                 # EwaldRecip below; PMERecip (mesh path) in PMERecip.jl
+end
+function _recip_commit!(R::EwaldRecip, sys, i::Int)
     recip_sf!(R.work, R, sys, i)
     col = view(R.S, :, i)
     @inbounds for kk in eachindex(R.work)
@@ -446,6 +449,7 @@ function recip_row_add_committed!(row::AbstractVector{Float64}, R::EwaldRecip, k
     R.cwd .= R.cd .* view(R.Sd, :, k)
     _recip_row_product!(row, R)
 end
+recip_row_add_committed!(row::AbstractVector{Float64}, R::EwaldRecip, sys, k::Int) = recip_row_add_committed!(row, R, k)
 
 """
     recip_removal(R, sys, i) -> Σ_{j≠i} ψ_ij + e_i
@@ -464,6 +468,7 @@ end
 
 "Committed total reciprocal-space contribution Σ_{m<n} ψ_mn + Σ_m e_m = ½ Σ c |Stot|² − Σ_m corr_m."
 recip_energy_total(R::EwaldRecip) = recip_half_norm(R, R.Stot) - sum(R.corr)
+recip_energy_total(R::EwaldRecip, sys) = recip_energy_total(R)
 
 """
     attach_ewald!(sys, ff; rtol=1e-5, n2max=0)

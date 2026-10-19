@@ -334,3 +334,140 @@ function dp_tasks!(D::DevicePairs, ps::AbstractVector{<:Integer}, js::AbstractVe
     _dp_launch!(D, nt, false)
     return view(D.hU, 1:nt), view(D.hW, 1:nt)
 end
+
+# --- eKMC hook-up (DESIGN §15 G2) ---
+
+"""
+    attach_device_pairs!(sys, ff; backend=:cpu, precision=:double, max_poses=64)
+
+Route the real-space + LJ rows of `ff` (`eval_row!`: eKMC events, candidate rebuilds, MC trials) through the device pair
+kernel: the device keeps the committed poses (synced in `molecule_committed!` and at eKMC rebuilds) and a row is one launch
+of N tasks for the moved molecule's current pose. Other force fields (e.g. an LJ-only copy) stay on the host. `precision =
+:double` reproduces `pair_energy_virial` to rounding (the debug rebuild, on the host, is the check); `:mixed` follows the
+GROMACS convention (DESIGN §15.3). NVT only (a volume change rescales every pose: `run_rigid_ekmc!` refuses Pext with it).
+"""
+function attach_device_pairs!(sys::RigidSystem, ff::SiteForceField; backend::Symbol=:cpu, precision::Symbol=:double,
+                              max_poses::Int=64)
+    D = DevicePairs(sys, ff; backend=backend, precision=precision, max_poses=max_poses)
+    dp_sync!(D, sys)
+    sys.dev = (D=D, ff=ff)
+    return D
+end
+detach_device_pairs!(sys::RigidSystem) = (sys.dev = nothing; nothing)
+
+"The DevicePairs of sys if it was attached for this force field, else nothing."
+@inline _dev_for(sys, ff) = (d = sys.dev; d !== nothing && d.ff === ff ? d.D : nothing)
+
+"row_u[j], row_w[j] of molecule k at its current pose with every committed j (row[k] = 0)."
+function _dp_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, D::DevicePairs, sys::RigidSystem, k::Int)
+    sys.L == D.prm.L || dp_sync!(D, sys)
+    dp_stage_pose!(D, 1, sys, k)
+    dp_upload_poses!(D, 1)
+    U, W = dp_rows!(D, 1)
+    @inbounds for j in 1:sys.n_mol
+        row_u[j] = U[j]; row_w[j] = W[j]
+    end
+    return nothing
+end
+
+"Upload staged poses a…b of the bank."
+function dp_upload_pose_range!(D::DevicePairs, a::Int, b::Int)
+    b < a && return D
+    n = b - a + 1
+    copyto!(D.pcom, 3 * (a - 1) + 1, D.hcom, 3 * (a - 1) + 1, 3 * n)
+    copyto!(D.poff, 3 * (a - 1) * D.maxs + 1, D.hoff, 3 * (a - 1) * D.maxs + 1, 3 * n * D.maxs)
+    copyto!(D.pmol, a, D.hmol, a, n); copyto!(D.pext, a, D.hext, a, n)
+    return D
+end
+
+"Explicit tasks already written to D.htp / D.htj (1…nt)."
+function _dp_tasks_staged!(D::DevicePairs, nt::Int)
+    nt <= length(D.htp) || error("device tasks: $nt tasks exceed max_tasks $(length(D.htp))")
+    copyto!(D.tp, 1, D.htp, 1, nt); copyto!(D.tj, 1, D.htj, 1, nt)
+    _dp_launch!(D, nt, false)
+    return view(D.hU, 1:nt)
+end
+
+"""
+    slm_attach_device!(S, sys, ff)
+
+Keep the K·M candidate poses of the solvent L-moves in the device pose bank (slots 2 … K·M + 1; slot 1 is `eval_row!`'s) so
+that a mover's rebuild is one launch of K·N tasks and the column updates after an event are one launch over every
+(candidate, moved molecule) pair within reach (the host rule of `_slm_column!`). Needs `attach_device_pairs!` with
+max_poses ≥ K·M + 1.
+"""
+function slm_attach_device!(S::SolventLocalMoves, sys::RigidSystem, ff::SiteForceField)
+    D = _dev_for(sys, ff)
+    D === nothing && error("slm_attach_device!: attach_device_pairs!(sys, ff) first")
+    need = length(S.kinds) * length(S.mols) + 1
+    D.P >= need || error("slm_attach_device!: the pose bank has $(D.P) slots, need $need (attach_device_pairs!(…; max_poses=$need))")
+    length(D.htp) >= length(S.kinds) * max(sys.n_mol, length(S.mols)) ||
+        error("slm_attach_device!: max_tasks too small")
+    S.dbase = 2
+    slm_rebuild_all!(S, sys, ff)
+    return S
+end
+
+function _slm_device_rows!(S::SolventLocalMoves, D::DevicePairs, ii::Int, N::Int)
+    K = length(S.kinds)
+    a = S.dbase + (ii - 1) * K
+    dp_upload_pose_range!(D, a, a + K - 1)
+    nt = 0
+    @inbounds for j in 1:K
+        S.act[j, ii] || continue
+        for m in 1:N
+            nt += 1; D.htp[nt] = a + j - 1; D.htj[nt] = m
+        end
+    end
+    U = _dp_tasks_staged!(D, nt)
+    t = 0
+    @inbounds for j in 1:K
+        S.act[j, ii] || continue
+        u = 0.0
+        for m in 1:N
+            t += 1
+            S.cp[j, m, ii] = U[t]
+            m == S.frac || (u += U[t])
+        end
+        S.cu[j, ii] = u
+        S.cs[j, ii] = S.frac > 0 ? S.cp[j, S.frac, ii] : 0.0
+    end
+    return nothing
+end
+
+function _slm_device_columns!(S::SolventLocalMoves, D::DevicePairs, sys, ff, m::Int, reach0::Float64)::Int
+    K = length(S.kinds); L = sys.L
+    nt = 0; nmov = 0
+    @inbounds for ii in eachindex(S.mols)
+        i = S.mols[ii]
+        i == m && continue
+        nonzero = false
+        for j in 1:K
+            S.cp[j, m, ii] != 0.0 && (nonzero = true; break)
+        end
+        if !nonzero
+            dx = _min_image(sys.com[1, m] - sys.com[1, i], L); dy = _min_image(sys.com[2, m] - sys.com[2, i], L)
+            dz = _min_image(sys.com[3, m] - sys.com[3, i], L)
+            r = reach0 + (ff.cutoff === :molecule ? S.cand_com[ii] : S.cand_site[ii])
+            dx * dx + dy * dy + dz * dz >= r * r && continue
+        end
+        nmov += 1
+        for j in 1:K
+            S.act[j, ii] || continue
+            nt += 1; D.htp[nt] = S.dbase + (ii - 1) * K + j - 1; D.htj[nt] = m
+        end
+    end
+    nt == 0 && return 0
+    U = _dp_tasks_staged!(D, nt)
+    @inbounds for t in 1:nt
+        p = Int(D.htp[t]) - S.dbase; ii = p ÷ K + 1; j = p - (ii - 1) * K + 1
+        u = U[t]
+        if m == S.frac
+            S.cs[j, ii] += u - S.cp[j, m, ii]
+        else
+            S.cu[j, ii] += u - S.cp[j, m, ii]
+        end
+        S.cp[j, m, ii] = u
+    end
+    return nmov
+end
