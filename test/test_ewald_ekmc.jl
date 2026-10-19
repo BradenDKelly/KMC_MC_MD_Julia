@@ -50,7 +50,7 @@ end
             uref = Uref - flat_energy(d, rc; drop=i)
             @test abs(u - uref) < 1e-6                         # K; |U| ≈ 5e5 K, so a 1e-12 relative difference
         end
-        @test isnan(MCe.pressure(sys, ff))                     # reciprocal virial not implemented: no silent pressure
+        @test isfinite(MCe.pressure(sys, ff))                  # reciprocal molecular virial (E6, JOURNAL 124)
         @test MCe.total_pair_energy_virial(sys, ff)[1] ≈ U rtol = 1e-12   # the MC sampling path (regression: it lacked the Fourier part)
         @info "Ewald RigidSystem vs flat, NIST config $cfg" U Uref MCe.n_kvectors(sys.recip)
     end
@@ -345,7 +345,7 @@ Base.copyto!(d::NoScalarArray, doff::Integer, s::Array, soff::Integer, n::Intege
     end
 end
 
-@testset "coulomb = :ewald guards: no reciprocal state, eKMC NPT without a reciprocal virial (regression, JOURNAL 121)" begin
+@testset "coulomb = :ewald guards: no reciprocal state is an error; pressures and NPT with Ewald and PME (regression, JOURNAL 121/124/125)" begin
     # without attach_ewald! only the real-space erfc terms would be evaluated, silently; eKMC NPT needs the pressure,
     # which has no reciprocal virial (pressure returns NaN): both must be errors
     α = MCe.ewald_alpha_for(4.5, 1e-5)
@@ -355,8 +355,30 @@ end
     MCe.random_rigid_system!(sys, m.ff)
     @test_throws ErrorException MCe.init_rigid_ekmc_run(sys, m.ff; events=10)
     @test_throws ErrorException MCe.run_rigid_mc!(sys, m.ff; sweeps=1, δ=0.1, δθ=0.3)
+    MCe.attach_pme!(sys, m.ff; K=12, order=4)                            # SPME mesh path: reciprocal virial (E6, JOURNAL 125)
+    @test isfinite(MCe.pressure(sys, m.ff))
+    @test MCe.init_rigid_ekmc_run(sys, m.ff; events=10, Pext=1e-3, max_dV=0.01).ev == 0
     MCe.attach_ewald!(sys, m.ff; rtol=1e-5, precision=:double)
-    @test_throws ErrorException MCe.init_rigid_ekmc_run(sys, m.ff; events=10, Pext=1e-3, max_dV=0.01)
     r = MCe.init_rigid_ekmc_run(sys, m.ff; events=10)                     # NVT with the reciprocal state: allowed
     @test r.ev == 0
+    @test isfinite(MCe.pressure(sys, m.ff))                              # Ewald: reciprocal virial (E6)
+end
+
+@testset "Ewald reciprocal molecular virial = −dE_rec/d ln L (COM scaling, fixed orientations; E6)" begin
+    # central difference in ln L with step h: truncation ≈ h²/6·|E‴| and rounding ≈ ε|E|/h; with |E‴| ~ |E| (ln L
+    # derivatives of a sum of terms ∝ L^−1 e^{−k²/4α²}) the bound at h = 1e-5 is ≈ 4e-11 |E| — tolerance 1e-8 |E| (absolute;
+    # W itself can be small compared with E)
+    for N in (30, 48)
+        α = MCe.ewald_alpha_for(4.5, 1e-5)
+        m = MCe.spce_model(; α_per_angstrom=α, rc_angstrom=4.5, coulomb=:ewald)
+        sys = MCe.RigidSystem([m.template], fill(1, N), cbrt(N / 0.0334) / m.σ_angstrom, m.ϵ_kelvin / 300.0, Xoshiro(N))
+        MCe.random_rigid_system!(sys, m.ff)
+        MCe.attach_ewald!(sys, m.ff; rtol=1e-5, precision=:double)
+        W = MCe.recip_virial(sys.recip, sys)
+        E(f) = (s2 = deepcopy(sys); s2.L *= f;
+                for i in 1:s2.n_mol; MCe.set_molecule!(s2, i, s2.com[:, i] .* f, s2.quat[:, i]); end;
+                MCe.recip_rebuild!(s2.recip, s2); MCe.recip_energy_total(s2.recip, s2))
+        h = 1e-5
+        @test abs(-(E(1 + h) - E(1 - h)) / (2h) - W) <= 1e-8 * abs(E(1.0))
+    end
 end

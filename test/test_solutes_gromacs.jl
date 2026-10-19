@@ -14,7 +14,7 @@ include(joinpath(@__DIR__, "test_solutes_gromacs_loader.jl"))
         startswith(l, "#") && continue
         f = split(l); ref[Symbol(f[1])] = parse(Float64, f[2])
     end
-    for sym in (:butanol_flex, :caffeine_lpg)
+    for sym in (:butanol_flex, :caffeine_lpg, :propanol_flex)
         m, sys, nw = load_solute_water_gro(sym, joinpath(@__DIR__, "data", "gromacs_$(sym)_spce500.gro"))
         ff = m.ff; kJ = m.ϵ_kelvin * 0.0083144626
         @test nw == 500

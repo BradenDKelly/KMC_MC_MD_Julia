@@ -58,7 +58,12 @@ mutable struct PMERecip
     last::Int                         # molecule of the last commit (0 after a rebuild)
     n_commit::Int
     precision::Symbol                 # :double
-    backend::Symbol                   # :cpu
+    backend::Symbol                   # :cpu, or the device of the gather engine (`dev`)
+    dev::Any                          # PMEDevice: stencil gathers on a KernelAbstractions device (nothing = host loops)
+    Gvh::Array{Float64,3}             # virial kernel G(1 − k²/2α²) on the rfft half grid, with the half-spectrum weights
+    wself::Vector{Float64}            # committed per-molecule mesh self-virial (−d(½Q_m·Φ_m)/d ln L)
+    wimg::Vector{Float64}             # committed per-molecule image-term virial (recip_virial_molecule)
+    gθ::Matrix{Float64}; gdθ::Matrix{Float64}; gθ1::Vector{Float64}   # scratch of _pme_grad
 end
 
 "Candidate stencils (sites of stored candidate poses): column c holds up to `nmax` sites."
@@ -67,8 +72,9 @@ mutable struct PMEStencils
     base::Array{Int,3}                # 3 × nmax × ncol
     θ::Array{Float64,4}               # p × 3 × nmax × ncol
     q::Matrix{Float64}                # nmax × ncol (0 = unused site)
+    dev::Any                          # device mirror (PMEColumns) for the gather engine; nothing = host only
 end
-PMEStencils(p::Int, nmax::Int, ncol::Int) = PMEStencils(nmax, zeros(Int, 3, nmax, ncol), zeros(p, 3, nmax, ncol), zeros(nmax, ncol))
+PMEStencils(p::Int, nmax::Int, ncol::Int) = PMEStencils(nmax, zeros(Int, 3, nmax, ncol), zeros(p, 3, nmax, ncol), zeros(nmax, ncol), nothing)
 
 n_kvectors(R::PMERecip) = n_kvectors(R.ew)
 pme_mesh_size(R::PMERecip) = R.K
@@ -95,7 +101,8 @@ function PMERecip(sys; α::Float64, ke::Float64, K::Int, p::Int, n2max::Int)
     R = PMERecip(sys.L, α, ke, K, p, ew, _pme_halfG(sys.L, α, ke, K, p), fplan, bplan, Q, zeros(K, K, K), zeros(K, K, K),
                  Fw, zeros(K, K, K), zeros(K, K, K), 0, zeros(K, K, K), zeros(K, K, K), 0,
                  zeros(Int, 3, nst), zeros(p, 3, nst), zeros(Int, 3, nmax), zeros(p, 3, nmax), zeros(p),
-                 zeros(N), zeros(N), zeros(N), 0, 0, :double, :cpu)
+                 zeros(N), zeros(N), zeros(N), 0, 0, :double, :cpu, nothing,
+                 _pme_virial_halfkernel(sys.L, α, ke, K, p), zeros(N), zeros(N), zeros(p, 3), zeros(p, 3), zeros(p))
     return R
 end
 
@@ -217,6 +224,7 @@ function recip_rebuild!(R::PMERecip, sys)
     if sys.L != R.L
         R.L = sys.L
         R.Gh = _pme_halfG(R.L, R.α, R.ke, R.K, R.p)
+        R.Gvh = _pme_virial_halfkernel(R.L, R.α, R.ke, R.K, R.p)
         R.ew.L = sys.L
         R.ew.c = _recip_weights(R.ew.L, R.ew.α, R.ew.ke, R.ew.nx, R.ew.ny, R.ew.nz); R.ew.cd = R.ew.c
     end
@@ -232,13 +240,22 @@ function recip_rebuild!(R::PMERecip, sys)
     _pme_potential!(R.Φ, R, R.Q)
     R.mk = 0
     pin = R.pin; R.pin = 0
-    for i in 1:N                                       # mesh self energies (total energy only): one FFT pair per molecule
-        Φi = pme_mol_potential!(R, sys, i)
-        R.mself[i] = 0.5 * _pme_gather(Φi, R.base, R.θ, sys.site_start[i], R, sys.templates[sys.tmpl[i]])
+    for i in 1:N                                       # mesh self energies and self-virials: one FFT pair per molecule
+        t = sys.templates[sys.tmpl[i]]
+        fill!(R.Qw, 0.0)
+        _pme_spread_mol!(R.Qw, R.base, R.θ, sys.site_start[i], R, t, 1.0)
+        _pme_selfvirial_potential!(R, sys, i)            # R.Φk = Φ_i, R.wself[i]
+        R.mk = i
+        R.mself[i] = 0.5 * _pme_gather(R.Φk, R.base, R.θ, sys.site_start[i], R, t)
+        R.wimg[i] = recip_virial_molecule(R.ew, sys, i)
     end
     R.mk = 0
     pin > 0 && pme_pin!(R, sys, pin)
     R.last = 0
+    if R.dev !== nothing
+        for i in 1:N; _pme_dev_molecule!(R, sys, i); end
+        R.dev.mk_up = -1; R.dev.n_up = -1
+    end
     return nothing
 end
 
@@ -254,18 +271,25 @@ function _recip_commit!(R::PMERecip, sys, i::Int)
     R.Φ .+= R.dΦ
     fill!(R.Qw, 0.0)
     _pme_spread_mol!(R.Qw, R.base, R.θ, off, R, t, 1.0)
-    _pme_potential!(R.Φk, R, R.Qw)
+    _pme_selfvirial_potential!(R, sys, i)                # R.Φk = Φ_i and its mesh self-virial (E6)
+    R.wimg[i] = recip_virial_molecule(R.ew, sys, i)
     R.mk = i
     i == R.pin && copyto!(R.Φpin, R.Φk)
     R.mself[i] = 0.5 * _pme_gather(R.Φk, R.base, R.θ, off, R, t)
     R.eimg[i], R.corr[i] = _pme_image_now(R, sys, i)
     R.last = i
     R.n_commit += 1
+    R.dev === nothing || _pme_dev_molecule!(R, sys, i)
     return nothing
 end
 
 "row[j] += ψ_kj = Q_j·Φ_k for every j, Φ_k from the potential mesh `Φk` of molecule k."
 function _pme_row!(row::AbstractVector{Float64}, R::PMERecip, sys, Φk::Array{Float64,3})
+    if R.dev !== nothing && Φk === R.Φk && R.mk > 0               # device gather over the N committed molecule columns
+        g = _pme_dev_gather!(R.dev, R.dev.mol, _pme_dev_sync_k!(R), sys.n_mol, R)
+        @inbounds for j in 1:sys.n_mol; row[j] += g[j]; end
+        return nothing
+    end
     @inbounds for j in 1:sys.n_mol
         row[j] += _pme_gather(Φk, R.base, R.θ, sys.site_start[j], R, sys.templates[sys.tmpl[j]])
     end
@@ -372,4 +396,242 @@ function attach_pme!(sys, ff; rtol::Float64=1e-5, spacing::Float64=NaN, K::Int=0
     sys.recip = R
     recip_rebuild!(R, sys)
     return R
+end
+
+# --- gather engine on a KernelAbstractions device (DESIGN §16, JOURNAL 123) ---
+# The event logic, the spreads and the FFTs stay on the host (mesh sizes of the target systems: K ≲ 40); the stencil
+# interpolations — the row of the moved molecule over all N committed molecules and the update of every stored solvent
+# candidate by ΔΦ — run as one launch each on the device, over device mirrors of the committed molecule stencils and of the
+# candidate stencils, with Φ_k and ΔΦ uploaded once per commit. Float64 throughout (:double; the host rebuild is the check).
+
+using KernelAbstractions
+const PKA = KernelAbstractions
+
+"Device mirror of a set of stencil columns (base 3 × nmax × ncol Int32, θ p × 3 × nmax × ncol, q nmax × ncol)."
+mutable struct PMEColumns
+    base::Any; θ::Any; q::Any; out::Any
+    hout::Vector{Float64}
+end
+
+mutable struct PMEDevice
+    backend::Symbol
+    kab::Any
+    Φk::Any; dΦ::Any                  # device copies of R.Φk (molecule mk_up) and R.dΦ (commit n_up)
+    mk_up::Int; n_up::Int
+    mol::PMEColumns                   # committed stencils, one column per molecule
+    nmax::Int
+    hb::Array{Int32,3}; hθ::Array{Float64,4}; hq::Matrix{Float64}   # host staging of one column
+end
+
+function _pme_columns(backend::Symbol, p::Int, nmax::Int, ncol::Int)
+    PMEColumns(_dp_array(backend, zeros(Int32, 3, nmax, ncol)), _dp_array(backend, zeros(p, 3, nmax, ncol)),
+               _dp_array(backend, zeros(nmax, ncol)), _dp_array(backend, zeros(ncol)), zeros(ncol))
+end
+
+@kernel function _pme_gather_kernel!(out, @Const(Φ), @Const(base), @Const(θ), @Const(q), K::Int32, p::Int32, nmax::Int32)
+    c = @index(Global, Linear)
+    acc = 0.0
+    @inbounds for a in 1:Int(nmax)
+        qa = q[a, c]
+        if qa != 0.0
+            bx = Int(base[1, a, c]); by = Int(base[2, a, c]); bz = Int(base[3, a, c]); KK = Int(K)
+            s = 0.0
+            for jz in 0:Int(p)-1
+                gz = bz - jz; gz < 0 && (gz += KK)
+                wz = θ[jz+1, 3, a, c]
+                for jy in 0:Int(p)-1
+                    gy = by - jy; gy < 0 && (gy += KK)
+                    wyz = wz * θ[jy+1, 2, a, c]
+                    for jx in 0:Int(p)-1
+                        gx = bx - jx; gx < 0 && (gx += KK)
+                        s += wyz * θ[jx+1, 1, a, c] * Φ[gx+1, gy+1, gz+1]
+                    end
+                end
+            end
+            acc += qa * s
+        end
+    end
+    @inbounds out[c] = acc
+end
+
+"Gather Φ (device) at columns 1…ncol of C; returns the host vector (first ncol entries valid)."
+function _pme_dev_gather!(D::PMEDevice, C::PMEColumns, Φ, ncol::Int, R::PMERecip)
+    ncol == 0 && return C.hout
+    k = _pme_gather_kernel!(D.kab, 64)
+    k(C.out, Φ, C.base, C.θ, C.q, Int32(R.K), Int32(R.p), Int32(size(C.q, 1)); ndrange=ncol)
+    PKA.synchronize(D.kab)
+    copyto!(C.hout, 1, C.out, 1, ncol)
+    return C.hout
+end
+
+"Upload column `col` of C from host stencils (base, θ) sites off+1 … off+n and charges qv (length ≤ nmax)."
+function _pme_dev_column!(D::PMEDevice, C::PMEColumns, col::Int, base, θ, off::Int, n::Int, qv, R::PMERecip)
+    fill!(D.hb, Int32(0)); fill!(D.hθ, 0.0); fill!(D.hq, 0.0)
+    @inbounds for a in 1:n
+        for d in 1:3
+            D.hb[d, a, 1] = Int32(base[d, off + a])
+            for j in 1:R.p; D.hθ[j, d, a, 1] = θ[j, d, off + a]; end
+        end
+        D.hq[a, 1] = qv[a]
+    end
+    nm = D.nmax
+    copyto!(C.base, 3 * nm * (col - 1) + 1, D.hb, 1, 3 * nm)
+    copyto!(C.θ, R.p * 3 * nm * (col - 1) + 1, D.hθ, 1, R.p * 3 * nm)
+    copyto!(C.q, nm * (col - 1) + 1, D.hq, 1, nm)
+    return nothing
+end
+
+function _pme_dev_molecule!(R::PMERecip, sys, i::Int)
+    t = sys.templates[sys.tmpl[i]]
+    _pme_dev_column!(R.dev, R.dev.mol, i, R.base, R.θ, sys.site_start[i], t.n_sites, t.site_q, R)
+end
+
+"Make the device copies of Φk (molecule R.mk) and dΦ (commit R.n_commit) current."
+function _pme_dev_sync_k!(R::PMERecip)
+    D = R.dev
+    tag = R.mk + R.n_commit * (length(R.eimg) + 1)   # Φk content = (molecule, commits so far): unique per content
+    D.mk_up == tag || (copyto!(D.Φk, R.Φk); D.mk_up = tag)
+    return D.Φk
+end
+function _pme_dev_sync_d!(R::PMERecip)
+    D = R.dev
+    D.n_up == R.n_commit || (copyto!(D.dΦ, R.dΦ); D.n_up = R.n_commit)
+    return D.dΦ
+end
+
+"""
+    pme_attach_device!(R, sys; backend=:cuda)
+
+Run the stencil gathers of the SPME mesh path (rows, solvent-candidate updates) on `backend` (:cpu = the KernelAbstractions CPU
+backend, the test oracle; :cuda with `using CUDA`).
+"""
+function pme_attach_device!(R::PMERecip, sys; backend::Symbol=:cuda)
+    nmax = maximum(t.n_sites for t in sys.templates); K = R.K
+    D = PMEDevice(backend, device_backend(backend), _dp_array(backend, zeros(K, K, K)), _dp_array(backend, zeros(K, K, K)),
+                  -1, -1, _pme_columns(backend, R.p, nmax, sys.n_mol), nmax,
+                  zeros(Int32, 3, nmax, 1), zeros(R.p, 3, nmax, 1), zeros(nmax, 1))
+    R.dev = D; R.backend = backend
+    for i in 1:sys.n_mol; _pme_dev_molecule!(R, sys, i); end
+    return D
+end
+
+"Device mirror of candidate stencils P (all columns uploaded)."
+function _pme_cand_dev!(P::PMEStencils, R::PMERecip)
+    D = R.dev
+    if P.dev === nothing || size(P.dev.q, 2) != size(P.q, 2) || size(P.dev.q, 1) != D.nmax
+        P.dev = _pme_columns(D.backend, R.p, D.nmax, size(P.q, 2))
+        for c in 1:size(P.q, 2); _pme_cand_dev_column!(P, c, R); end
+    end
+    return P.dev
+end
+function _pme_cand_dev_column!(P::PMEStencils, col::Int, R::PMERecip)
+    D = R.dev
+    n = min(P.nmax, D.nmax)
+    fill!(D.hb, Int32(0)); fill!(D.hθ, 0.0); fill!(D.hq, 0.0)
+    @inbounds for a in 1:n
+        for d in 1:3
+            D.hb[d, a, 1] = Int32(P.base[d, a, col])
+            for j in 1:R.p; D.hθ[j, d, a, 1] = P.θ[j, d, a, col]; end
+        end
+        D.hq[a, 1] = P.q[a, col]
+    end
+    C = P.dev; nm = D.nmax
+    copyto!(C.base, 3 * nm * (col - 1) + 1, D.hb, 1, 3 * nm)
+    copyto!(C.θ, R.p * 3 * nm * (col - 1) + 1, D.hθ, 1, R.p * 3 * nm)
+    copyto!(C.q, nm * (col - 1) + 1, D.hq, 1, nm)
+    return nothing
+end
+
+# --- reciprocal molecular virial of the mesh path (E6 for PME, JOURNAL 125) ---
+# W = −dH_rec/d ln L under the scaling of the molecular centres (orientations and internal coordinates fixed), for
+# H_rec = E(Q) − Σ_m E(Q_m) + Σ_m e_m with E(Q) = Σ_m G(m)|F[Q](m)|² (Essmann 1995). For each mesh energy:
+#   −dE/d ln L = Σ G (1 − k²/2α²) |F[Q]|²  (d ln G/d ln L = −1 + k²/2α², B(m) independent of L)
+#              + Σ_a q_a ∇_u Φ̃(u_a) · (K d_a / L)   (u_a = K r_a/L, du_a/d ln L = −K d_a/L, ∂E/∂u_a = q_a ∇_u Φ̃, Φ = ∂E/∂Q)
+# with the B-spline derivative dM_p(x)/dx = M_{p−1}(x) − M_{p−1}(x − 1) (Essmann Eq. 4.1); e_m: `recip_virial_molecule`.
+
+"Virial kernel G(1 − k²/2α²) on the rfft half grid, times the half-spectrum weight (1 for i1 = 0 and i1 = K/2, else 2)."
+function _pme_virial_halfkernel(L::Float64, α::Float64, ke::Float64, K::Int, p::Int)
+    G = pme_influence(PMEParams(L, α, ke, K, p))
+    H = zeros(K ÷ 2 + 1, K, K); tp = 2π / L
+    @inbounds for i3 in 0:K-1, i2 in 0:K-1, i1 in 0:K÷2
+        m1 = i1; m2 = i2 <= K ÷ 2 ? i2 : i2 - K; m3 = i3 <= K ÷ 2 ? i3 : i3 - K
+        k2 = tp^2 * (m1^2 + m2^2 + m3^2)
+        w = (i1 == 0 || 2i1 == K) ? 1.0 : 2.0
+        H[i1+1, i2+1, i3+1] = w * G[i1+1, i2+1, i3+1] * (1 - k2 / (2α^2))
+    end
+    return H
+end
+
+"∇_u of the B-spline interpolation of Φ at lab point (x, y, z) (u = K r/L); allocation-free (scratch in R)."
+function _pme_grad(Φ::Array{Float64,3}, R::PMERecip, x::Float64, y::Float64, z::Float64)
+    K = R.K; p = R.p; θ = R.gθ; dθ = R.gdθ; θ1 = R.gθ1
+    b1 = 0; b2 = 0; b3 = 0
+    @inbounds for d in 1:3
+        c = d == 1 ? x : (d == 2 ? y : z)
+        u = K * c / R.L; u -= K * floor(u / K); bb = floor(Int, u); bb >= K && (bb -= K)
+        d == 1 ? (b1 = bb) : (d == 2 ? (b2 = bb) : (b3 = bb))
+        t = u - bb
+        _bspline!(view(θ, :, d), t, p)
+        fill!(θ1, 0.0); _bspline!(view(θ1, 1:p-1), t, p - 1)      # θ1[j+1] = M_{p−1}(t + j), j = 0 … p−2
+        for j in 0:p-1
+            dθ[j+1, d] = (j <= p - 2 ? θ1[j+1] : 0.0) - (j >= 1 ? θ1[j] : 0.0)
+        end
+    end
+    g1 = 0.0; g2 = 0.0; g3 = 0.0
+    @inbounds for jz in 0:p-1
+        gz = b3 - jz; gz < 0 && (gz += K)
+        for jy in 0:p-1
+            gy = b2 - jy; gy < 0 && (gy += K)
+            for jx in 0:p-1
+                gx = b1 - jx; gx < 0 && (gx += K)
+                v = Φ[gx+1, gy+1, gz+1]
+                g1 += dθ[jx+1, 1] * θ[jy+1, 2] * θ[jz+1, 3] * v
+                g2 += θ[jx+1, 1] * dθ[jy+1, 2] * θ[jz+1, 3] * v
+                g3 += θ[jx+1, 1] * θ[jy+1, 2] * dθ[jz+1, 3] * v
+            end
+        end
+    end
+    return g1, g2, g3
+end
+
+"Σ_{sites of molecules mols} q_a ∇Φ̃(u_a)·(K d_a/L) (the stencil part of −dE/d ln L)."
+function _pme_grad_virial(R::PMERecip, Φ::Array{Float64,3}, sys, mols)
+    W = 0.0; s = R.K / R.L
+    for i in mols
+        t = sys.templates[sys.tmpl[i]]; s0 = sys.site_start[i]
+        @inbounds for a in 1:t.n_sites
+            q = t.site_q[a]
+            q == 0.0 && continue
+            dx = sys.site_off[1, s0 + a]; dy = sys.site_off[2, s0 + a]; dz = sys.site_off[3, s0 + a]
+            g1, g2, g3 = _pme_grad(Φ, R, sys.com[1, i] + dx, sys.com[2, i] + dy, sys.com[3, i] + dz)
+            W += q * s * (g1 * dx + g2 * dy + g3 * dz)
+        end
+    end
+    return W
+end
+
+"Φ_i (into R.Φk) of the charge mesh in R.Qw (molecule i alone) and its mesh self-virial into R.wself[i] (one FFT pair)."
+function _pme_selfvirial_potential!(R::PMERecip, sys, i::Int)
+    mul!(R.Fw, R.fplan, R.Qw)
+    w = 0.0
+    @inbounds for j in eachindex(R.Fw); w += R.Gvh[j] * abs2(R.Fw[j]); end
+    R.Fw .*= R.Gh
+    mul!(R.Φk, R.bplan, R.Fw)
+    R.wself[i] = w + _pme_grad_virial(R, R.Φk, sys, i:i)
+    return R.Φk
+end
+
+"""
+    recip_virial(R::PMERecip, sys) -> W_rec
+
+Molecular reciprocal virial of the mesh-path Hamiltonian (cross terms on the mesh + exact Ewald image terms): the full mesh
+energy's virial minus every molecule's own mesh virial plus the image-term virials; the per-molecule parts are maintained at
+each commit (from the FFT of Φ_k) and rebuild, so a pressure costs one rfft and the stencil gradients at every site.
+"""
+function recip_virial(R::PMERecip, sys)::Float64
+    mul!(R.Fw, R.fplan, R.Q)                              # full mesh: one rfft + the stencil gradients at every site
+    W = 0.0
+    @inbounds for j in eachindex(R.Fw); W += R.Gvh[j] * abs2(R.Fw[j]); end
+    W += _pme_grad_virial(R, R.Φ, sys, 1:sys.n_mol)
+    return W - sum(R.wself) + sum(R.wimg)                 # per-molecule parts maintained at every commit / rebuild
 end

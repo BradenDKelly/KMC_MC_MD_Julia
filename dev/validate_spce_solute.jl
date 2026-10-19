@@ -26,7 +26,7 @@ SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), S
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
 SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
 DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool), SPCE_TORSION (0; 1 = torsion moves in the conformer pool and the MC stage),
-SPCE_LOCAL_INTERNAL (0; 1 = rejection-free site + torsion slots of the solute with SPCE_LOCAL), SPCE_SOLVENT_LOCAL (0; 1 = rejection-free local moves of every
+SPCE_LOCAL_INTERNAL (0; 1 = rejection-free site + torsion slots of the solute with SPCE_LOCAL), SPCE_LOCAL_PHI (torsion slot half-angle in rad, default mc_δθ; π = uniform full rotation), SPCE_SOLVENT_LOCAL (0; 1 = rejection-free local moves of every
 water, SolventLocalMoves, ν = ν_D = the ladder ν). mc_sweeps = 0 runs the
 MC-free pipeline (DESIGN §11.3): SPCE_EKMC_BURNIN, SPCE_NU_PILOT events of stock eKMC replace the Metropolis stage;
 SPCE_NU_SOURCE=ekmc with mc_sweeps > 0 keeps MC only as the starting configuration and takes ν from an eKMC pilot.
@@ -266,7 +266,8 @@ function setup_and_mc(io)
                                 ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
                                 ladder_jump_max=jump_max, ladder_local=local_on, local_internal=internal_on, local_solvent=solvent_local,
                                 solvent_nu=solvent_local ? R_mc : NaN,   # water slots at the unscaled ⟨R⟩ even when SPCE_LADDER_NU boosts the solute
-                                ladder_eta=ladder_eta_fixed, track_dihedrals=(track_dih && flex) ? solute_dihedrals(m.solute) : NTuple{4,Int}[])
+                                ladder_eta=ladder_eta_fixed, track_dihedrals=(track_dih && flex) ? solute_dihedrals(m.solute) : NTuple{4,Int}[],
+                                local_φ=parse(Float64, get(ENV, "SPCE_LOCAL_PHI", "NaN")))   # solute torsion half-angle (rad); NaN = mc_δθ
     ladder_eta_fixed === nothing || println(io, "# ladder weights FIXED from SPCE_LADDER_ETA: ", ladder_eta_fixed)
     ladder_on && println(io, "# coupling ladder: λ = $(ladder_λ), ν = $(ladder_νfac)·⟨R⟩_MC = $(ladder_νfac * R_mc), Wang–Landau over the first $(round(Int, ladder_wlfrac * ekmc_events)) events; λ=0 hub $(ladder_jump); U, P, μ_water, mu_sol read at the coupled rung only")
     local_on && println(io, "# L-moves (DESIGN §11.2): slots $(r.lmoves.kinds) (1 T, 2 R, 3 C, 4 site, 5 torsion), a = $(round(r.lmoves.a * m.σ_angstrom; digits=3)) Å, θ_max = $(r.lmoves.θmax) rad, site a = $(round(r.lmoves.site_a * m.σ_angstrom; digits=3)) Å, φ_max = $(r.lmoves.φmax) rad, ν_L = ν_D = $(r.lmoves.ν); hub limited to rungs ≤ $(r.ladder.jump_max)")

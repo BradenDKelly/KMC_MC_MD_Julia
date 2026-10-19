@@ -1206,7 +1206,7 @@ U_tail(V) entering an NPT Metropolis acceptance (the two differ by ≈ (8π/3)ρ
 for water at r_c = 10 Å). Use `:thermodynamic` when comparing with `run_rigid_mc!` NPT densities.
 """
 function pressure(sys::RigidSystem, ff::SiteForceField, W::Float64; tail::Symbol=:virial)::Float64
-    !_has_recip(sys, ff) || return NaN      # reciprocal-space virial not implemented yet (DESIGN §13): no pressure
+    _has_recip(sys, ff) && (W += recip_virial(sys.recip, sys))   # reciprocal molecular virial (E6): Ewald and the PME split
     V = sys.L^3
     tail in (:virial, :thermodynamic) || error("pressure: tail must be :virial or :thermodynamic")
     P_tail = tail === :virial ? lrc_pressure(sys, ff) : lrc_energy(sys, ff) / V
@@ -1968,12 +1968,26 @@ eKMC pair bookkeeping (row i of energies and virials, φ_j, Σ_j w_ij, mobilitie
 symmetric, so the kernel preserves the canonical distribution (Metropolis et al. 1953).
 """
 function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField, i::Int,
-                        δ::Float64, δθ::Float64; rotate::Bool)::Bool
+                        δ::Float64, δθ::Float64; rotate::Bool, internal::Int=0, δs::Float64=0.0, φ::Float64=0.0)::Bool
     N = sys.n_mol
     ek.mc_trials += 1
     com_old = MVector{3,Float64}(sys.com[1, i], sys.com[2, i], sys.com[3, i])
     q_old = MVector{4,Float64}(sys.quat[1, i], sys.quat[2, i], sys.quat[3, i], sys.quat[4, i])
-    if rotate
+    B0 = nothing; dUin = 0.0
+    if internal != 0                                  # site (LM_S, cube δs) or torsion (LM_D, ±φ) trial of a flexible
+        t = sys.templates[sys.tmpl[i]]                # molecule; ΔU_intra is not scaled by λ (JOURNAL 124)
+        isflexible(t) || error("ekmc_mc_trial!: internal trial on a rigid molecule")
+        B0 = copy(sys.body[i]); u0 = flex_intra_energy(t, ff, B0)
+        if internal == LM_S
+            _place_internal!(sys, i, B0, com_old, q_old, LM_S, rand(sys.rng, 1:t.n_sites), (2rand(sys.rng) - 1) * δs,
+                             (2rand(sys.rng) - 1) * δs, (2rand(sys.rng) - 1) * δs, nothing)
+        else
+            tors = rotatable_bonds(t)
+            isempty(tors) && return false
+            _place_internal!(sys, i, B0, com_old, q_old, LM_D, 0, (2rand(sys.rng) - 1) * φ, 0.0, 0.0, tors[rand(sys.rng, 1:length(tors))])
+        end
+        dUin = flex_intra_energy(t, ff, sys.body[i]) - u0
+    elseif rotate
         set_molecule!(sys, i, com_old, quat_mul(small_rotation_quaternion(sys.rng, δθ), q_old))
     else
         set_molecule!(sys, i, MVector{3,Float64}(com_old[1] + (2rand(sys.rng) - 1) * δ,
@@ -1994,7 +2008,7 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
             ek.row_u[s] *= λ; ek.row_w[s] *= λ
         end
     end
-    ΔU = 0.0
+    ΔU = dUin
     @inbounds for j in 1:N
         j == i && continue
         ΔU += ek.row_u[j] - ek.pair_u[i, j]
@@ -2037,6 +2051,7 @@ function ekmc_mc_trial!(ek::RigidEKMCState, sys::RigidSystem, ff::SiteForceField
         ek.mc_accepted += 1
         return true
     end
+    B0 === nothing || _set_body!(sys, i, B0)
     set_molecule!(sys, i, com_old, q_old)
     return false
 end
@@ -2607,6 +2622,7 @@ mutable struct RigidEKMCRun
     # dih_hist[k][d][b] = kMC time at rung k with dihedral d (atoms dih_atoms[d], body frame) in bin b of DIH_BINS over (−π, π]
     dih_atoms::Vector{NTuple{4,Int}}
     dih_hist::Vector{Vector{Vector{Float64}}}
+    dih_mol::Int                        # without a ladder: the molecule whose dihedrals are tracked (one histogram, k = 1)
 end
 
 """
@@ -2615,7 +2631,7 @@ end
 Validate the options of `run_rigid_ekmc!` (same keywords) and build the run state at event 0.
 """
 function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
-                         track_dihedrals::Vector{NTuple{4,Int}}=NTuple{4,Int}[],
+                         track_dihedrals::Vector{NTuple{4,Int}}=NTuple{4,Int}[], track_molecule::Int=0,
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
@@ -2640,8 +2656,6 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     _require_recip(sys, ff, "run_rigid_ekmc!")
     Pext === nothing || sys.dev === nothing ||
         error("run_rigid_ekmc!: device pair rows (attach_device_pairs!) are NVT only")
-    Pext === nothing || !_has_recip(sys, ff) ||
-        error("run_rigid_ekmc!: NPT with reciprocal-space Ewald needs the reciprocal virial, not implemented (DESIGN §13); use NVT")
     N = sys.n_mol
     λ = mc_kernel_rate
     flex_mols = [i for i in 1:N if isflexible(sys.templates[sys.tmpl[i]])]
@@ -2793,7 +2807,8 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
     return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius, lmoves, slmoves,
-                        track_dihedrals, [[zeros(DIH_BINS) for _ in track_dihedrals] for _ in 1:(ladder === nothing ? 0 : nrungs(ladder))])
+                        track_dihedrals, [[zeros(DIH_BINS) for _ in track_dihedrals] for _ in 1:(ladder === nothing ? (track_molecule > 0 ? 1 : 0) : nrungs(ladder))],
+                        ladder === nothing ? track_molecule : 0)
 end
 
 """
@@ -2893,11 +2908,11 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             p_part_sum += pressure(sys, ff, ekmc_virial(ek); tail=tail_route) * dt; p_part_t += dt
         end
         ladder_prod && ladder_time!(ladder, sys.β * ek.frac_u, dt)
-        if ladder_prod && !isempty(r.dih_atoms)
-            Bf = sys.body[ladder.solute]
+        if !isempty(r.dih_atoms) && (ladder_prod || (r.dih_mol > 0 && ev > burnin_events))
+            Bf = sys.body[ladder === nothing ? r.dih_mol : ladder.solute]; kk = ladder === nothing ? 1 : ladder.k
             @inbounds for (d, (a1, a2, a3, a4)) in enumerate(r.dih_atoms)
                 φd = dihedral_angle(Bf, a1, a2, a3, a4)
-                r.dih_hist[ladder.k][d][clamp(floor(Int, (φd + π) / (2π) * DIH_BINS) + 1, 1, DIH_BINS)] += dt
+                r.dih_hist[kk][d][clamp(floor(Int, (φd + π) / (2π) * DIH_BINS) + 1, 1, DIH_BINS)] += dt
             end
         end
         k_before = ladder === nothing ? 0 : ladder.k           # rung occupied during dt (for Wang–Landau)

@@ -47,9 +47,10 @@ function dp_ekmc_check(backend::Symbol)
         MCd.rebuild_rigid_ekmc!(ek, sys, ff)
         return max(maximum(abs.(φ .- ek.phi)), maximum(abs.(P .- ek.pair_u)))
     end
-    for coul in (:rf, :ewald)
-        ff, sys = dp_water(60, 7; coul=coul, rc=6.0)
+    for coul in (:rf, :ewald, :pme)                            # :pme = Ewald real space on the device + SPME mesh on the host
+        ff, sys = dp_water(60, 7; coul=coul === :pme ? :ewald : coul, rc=6.0)
         coul === :ewald && MCd.attach_ewald!(sys, ff; rtol=1e-5, precision=:double)
+        coul === :pme && MCd.attach_pme!(sys, ff; K=16, order=4)
         MCd.attach_device_pairs!(sys, ff; backend=backend, precision=:double)
         ek = MCd.init_rigid_ekmc(sys, ff)
         S = MCd.SolventLocalMoves(sys, ff, collect(1:sys.n_mol); kinds=[MCd.LM_T, MCd.LM_R], a=0.05, θmax=0.2, ν=1.0, νD=1.0)

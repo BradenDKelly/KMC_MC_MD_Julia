@@ -24,10 +24,10 @@ end
 "Largest change of the committed mesh state (Q, Φ, image energies, stencils) under a rebuild."
 function pme_committed_drift(sys)
     R = sys.recip
-    Q = copy(R.Q); Φ = copy(R.Φ); e = copy(R.eimg); b = copy(R.base); θ = copy(R.θ)
+    Q = copy(R.Q); Φ = copy(R.Φ); e = copy(R.eimg); b = copy(R.base); θ = copy(R.θ); ws = copy(R.wself); wi = copy(R.wimg)
     MCp.recip_rebuild!(R, sys)
     return max(maximum(abs.(Q .- R.Q)), maximum(abs.(Φ .- R.Φ)), maximum(abs.(e .- R.eimg)), maximum(abs.(θ .- R.θ)),
-               b == R.base ? 0.0 : Inf)
+               maximum(abs.(ws .- R.wself)), maximum(abs.(wi .- R.wimg)), b == R.base ? 0.0 : Inf)
 end
 
 function pme_ek_drift(ek, sys, ff)
@@ -173,4 +173,56 @@ end
     @test MCp.slm_check!(S, sys, ff) < 1e-9
     @test pme_ek_drift(ek, sys, ff) < 1e-9
     @test pme_committed_drift(sys) < 1e-10
+end
+
+"SPME mesh path with the gather engine on `backend` (rows and solvent-candidate updates on the device): = host rebuild."
+function pme_device_check(backend::Symbol)
+    m, sys, _ = pme_water(36, 13)
+    ff = m.ff
+    N = sys.n_mol; s = N
+    MCp.pme_attach_device!(sys.recip, sys; backend=backend)
+    ek = MCp.init_rigid_ekmc(sys, ff)
+    ek.frac = s; ek.lam[s] = 0.6
+    MCp.rebuild_rigid_ekmc!(ek, sys, ff)
+    S = MCp.SolventLocalMoves(sys, ff, collect(1:N-1); kinds=[MCp.LM_T, MCp.LM_R, MCp.LM_T], a=0.1, θmax=0.3, ν=1.0,
+                              νD=1.0, frac=s)
+    for it in 1:60
+        if it % 2 == 0
+            MCp.slm_total_rate!(S, ek, sys.β); MCp.slm_fire!(S, sys, ff, ek, rand(sys.rng) * S.W)
+        else
+            k = it % 6 == 1 ? s : rand(sys.rng, 1:N-1)                # the fractional molecule too (cr_s updates)
+            MCp.set_molecule!(sys, k, sys.L .* rand(sys.rng, 3), MCp.uniform_random_quaternion(sys.rng))
+            MCp.update_rigid_ekmc_after_move!(ek, sys, ff, k); MCp.slm_moved!(S, sys, ff, k)
+        end
+        it == 30 && (k = rand(sys.rng, 1:N-1);                         # the same molecule twice in a row
+                     for _ in 1:2
+                         MCp.set_molecule!(sys, k, sys.L .* rand(sys.rng, 3), MCp.uniform_random_quaternion(sys.rng))
+                         MCp.update_rigid_ekmc_after_move!(ek, sys, ff, k); MCp.slm_moved!(S, sys, ff, k)
+                     end)
+    end
+    @test S.crP.dev !== nothing
+    @test MCp.slm_check!(S, sys, ff) < 1e-9
+    @test pme_ek_drift(ek, sys, ff) < 1e-9
+end
+
+@testset "SPME mesh path, gather engine on the KernelAbstractions CPU backend: incremental = host rebuild" begin
+    pme_device_check(:cpu)
+end
+
+@testset "SPME mesh path: reciprocal molecular virial = −dE_rec/d ln L (COM scaling; E6, JOURNAL 125)" begin
+    # the mesh-path Hamiltonian (SPME cross terms + exact image terms); central difference in ln L, h = 1e-5: truncation
+    # ≈ h²/6·|E‴| and rounding ≈ ε|E|/h with |E‴| ~ |E| ⇒ ≈ 4e-11 |E| — tolerance 1e-8 |E| (as the Ewald virial test)
+    for (N, K, p) in ((30, 16, 4), (40, 20, 6))
+        α = MCp.ewald_alpha_for(4.5, 1e-5)
+        m = MCp.spce_model(; α_per_angstrom=α, rc_angstrom=4.5, coulomb=:ewald)
+        sys = MCp.RigidSystem([m.template], fill(1, N), cbrt(N / 0.0334) / m.σ_angstrom, m.ϵ_kelvin / 300.0, Xoshiro(N))
+        MCp.random_rigid_system!(sys, m.ff)
+        MCp.attach_pme!(sys, m.ff; K=K, order=p)
+        W = MCp.recip_virial(sys.recip, sys)
+        E(f) = (s2 = deepcopy(sys); s2.L *= f;
+                for i in 1:s2.n_mol; MCp.set_molecule!(s2, i, s2.com[:, i] .* f, s2.quat[:, i]); end;
+                MCp.recip_rebuild!(s2.recip, s2); MCp.recip_energy_total(s2.recip, s2))
+        h = 1e-5
+        @test abs(-(E(1 + h) - E(1 - h)) / (2h) - W) <= 1e-8 * abs(E(1.0))
+    end
 end

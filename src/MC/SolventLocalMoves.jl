@@ -250,6 +250,9 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
         end
     end
     D === nothing || _slm_device_rows!(S, D, ii, N)       # the K candidate rows of this mover: one launch of K·N tasks
+    if pme && R.dev !== nothing && S.crP.dev !== nothing   # device mirror of this mover's K candidate columns
+        for j in 1:K; _pme_cand_dev_column!(S.crP, (ii - 1) * K + j, R); end
+    end
     if R !== nothing && !pme && S.crSd !== S.crS        # upload this mover's K candidate columns
         cols = (ii - 1) * K + 1:ii * K
         _upload!(view(S.crSd, :, cols), view(S.crS, :, cols), S.cr_stage_up)
@@ -328,12 +331,22 @@ function slm_moved!(S::SolventLocalMoves, sys, ff, m::Int)
         R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")
         own = S.pos[m]
         target = m == S.frac ? S.cr_s : S.cr_u
+        if R.dev !== nothing                            # one device launch over all K·M candidate columns
+            g = _pme_dev_gather!(R.dev, _pme_cand_dev!(S.crP, R), _pme_dev_sync_d!(R), K * M, R)
+            @inbounds for ii in eachindex(S.mols)
+                ii == own && continue
+                for j in 1:K
+                    S.act[j, ii] && (target[j, ii] += g[(ii - 1) * K + j])
+                end
+            end
+        else
         @inbounds for ii in eachindex(S.mols)
             ii == own && continue                       # m's own candidates were rebuilt above
             for j in 1:K
                 S.act[j, ii] || continue
                 target[j, ii] += pme_cand_gather(S.crP, (ii - 1) * K + j, R.dΦ, R)
             end
+        end
         end
     elseif R !== nothing                                # Fourier part of every candidate: crSᴴ (c ∘ ΔS_m)
         R.last == m || error("slm_moved!: reciprocal space last committed molecule $(R.last), not $m")

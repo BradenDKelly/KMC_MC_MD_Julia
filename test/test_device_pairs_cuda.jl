@@ -26,3 +26,9 @@ end
     CUDA.functional() || error("CUDA not functional on $(gethostname())")
     dp_ekmc_check(:cuda)
 end
+
+include(joinpath(@__DIR__, "test_pme_ekmc.jl"))                   # SPME mesh path (host), then its gather engine on CUDA
+@testset "SPME mesh path, gather engine on CUDA: incremental = host rebuild" begin
+    CUDA.functional() || error("CUDA not functional on $(gethostname())")
+    pme_device_check(:cuda)
+end

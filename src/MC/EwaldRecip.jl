@@ -487,3 +487,76 @@ function attach_ewald!(sys, ff; rtol::Float64=1e-5, n2max::Int=0, backend::Symbo
     set_recip_backend!(R, backend; precision=precision)
     return R
 end
+
+"""
+    recip_virial(R::EwaldRecip, sys) -> W_rec
+
+Molecular reciprocal-space virial W_rec = −dE_rec/d ln L for the scaling of the molecular centres at fixed orientations and
+internal coordinates (DESIGN §13.3 E6, JOURNAL 124), the convention of the real-space molecular virial (P = NkT/V + W/(3V)).
+With E_rec = ½ Σ_k c_k |S(k)|², d ln c_k/d ln L = −1 + k²/(2α²), and the site phases k·r_a = 2πn·s_m + k·d_a (s_m the scaled
+centre, d_a = r_a − R_m fixed) so that dS/d ln L = −i T, T(k) = Σ_a q_a (k·d_a) e^{ik·r_a}:
+    W_rec = Σ_k ½ c_k [ |S|² (1 − k²/(2α²)) − 2 Im(S^* T) ].
+The self and intramolecular erf terms do not change under this scaling. Committed state (Stot) at the current pose.
+"""
+function recip_virial(R::EwaldRecip, sys)::Float64
+    Nk = length(R.c)
+    T = zeros(ComplexF64, Nk)
+    tp = 2π / R.L; o = R.nmax + 1
+    @inbounds for i in 1:sys.n_mol
+        t = sys.templates[sys.tmpl[i]]; s0 = sys.site_start[i]
+        for a in 1:t.n_sites
+            q = t.site_q[a]
+            q == 0.0 && continue
+            dx = sys.site_off[1, s0 + a]; dy = sys.site_off[2, s0 + a]; dz = sys.site_off[3, s0 + a]
+            _powers!(R.ex, tp * (sys.com[1, i] + dx), R.nmax); _powers!(R.ey, tp * (sys.com[2, i] + dy), R.nmax)
+            _powers!(R.ez, tp * (sys.com[3, i] + dz), R.nmax)
+            for g in eachindex(R.gnx)
+                nx = R.gnx[g]; ny = R.gny[g]
+                qxy = q * (R.ex[o + nx] * R.ey[o + ny])
+                z0 = o + R.gnz0[g] - R.gstart[g]
+                for kk in R.gstart[g]:R.gstart[g+1]-1
+                    kd = tp * (nx * dx + ny * dy + R.nz[kk] * dz)
+                    T[kk] += (qxy * R.ez[z0 + kk]) * kd
+                end
+            end
+        end
+    end
+    W = 0.0
+    @inbounds for kk in 1:Nk
+        k2 = tp^2 * (R.nx[kk]^2 + R.ny[kk]^2 + R.nz[kk]^2)
+        S = R.Stot[kk]
+        W += 0.5 * R.c[kk] * (abs2(S) * (1 - k2 / (2 * R.α^2)) - 2 * imag(conj(S) * T[kk]))
+    end
+    return W
+end
+
+"Per-molecule part of `recip_virial`: −d e_m/d ln L of the image term of molecule i (½ Σ c |S_i|² part; corr is L-independent)."
+function recip_virial_molecule(R::EwaldRecip, sys, i::Int)::Float64
+    Nk = length(R.c)
+    S = zeros(ComplexF64, Nk); T = zeros(ComplexF64, Nk)
+    tp = 2π / R.L; o = R.nmax + 1
+    t = sys.templates[sys.tmpl[i]]; s0 = sys.site_start[i]
+    @inbounds for a in 1:t.n_sites
+        q = t.site_q[a]
+        q == 0.0 && continue
+        dx = sys.site_off[1, s0 + a]; dy = sys.site_off[2, s0 + a]; dz = sys.site_off[3, s0 + a]
+        _powers!(R.ex, tp * (sys.com[1, i] + dx), R.nmax); _powers!(R.ey, tp * (sys.com[2, i] + dy), R.nmax)
+        _powers!(R.ez, tp * (sys.com[3, i] + dz), R.nmax)
+        for g in eachindex(R.gnx)
+            nx = R.gnx[g]; ny = R.gny[g]
+            qxy = q * (R.ex[o + nx] * R.ey[o + ny])
+            z0 = o + R.gnz0[g] - R.gstart[g]
+            for kk in R.gstart[g]:R.gstart[g+1]-1
+                e = qxy * R.ez[z0 + kk]
+                S[kk] += e
+                T[kk] += e * (tp * (nx * dx + ny * dy + R.nz[kk] * dz))
+            end
+        end
+    end
+    W = 0.0
+    @inbounds for kk in 1:Nk
+        k2 = tp^2 * (R.nx[kk]^2 + R.ny[kk]^2 + R.nz[kk]^2)
+        W += 0.5 * R.c[kk] * (abs2(S[kk]) * (1 - k2 / (2 * R.α^2)) - 2 * imag(conj(S[kk]) * T[kk]))
+    end
+    return W
+end
