@@ -2,7 +2,7 @@
 # Σ_{m<n} Q_m·Φ_n + Σ_m ½Q_m·Φ_m equals the flat SPME energy (`pme_energy`); the energy of flexible solutes in SPC/E equals
 # the GROMACS PME rerun (fine mesh); every incremental update (MC commits, eKMC rows/φ/frac_u, solute and solvent L-move
 # candidates incl. flexible site/torsion slots) equals a rebuild.
-using Test, Random
+using Test, Random, Serialization
 using MolSim
 const MCp = MolSim.MC
 isdefined(@__MODULE__, :load_solute_water_gro) || include(joinpath(@__DIR__, "test_solutes_gromacs_loader.jl"))
@@ -225,4 +225,20 @@ end
         h = 1e-5
         @test abs(-(E(1 + h) - E(1 - h)) / (2h) - W) <= 1e-8 * abs(E(1.0))
     end
+end
+
+@testset "SPME state restored from a checkpoint in a NEW process (FFTW plans recreated; regression, JOURNAL 126)" begin
+    # FFTW plans are pointers into the process that made them; a checkpointed PMERecip used them after deserialization
+    # in the next chain piece and segfaulted on the first FFT
+    m, sys, _ = pme_water(20, 5)
+    U0 = MCp.total_pair_energy(sys, m.ff)
+    f = tempname()
+    open(io -> Serialization.serialize(io, (sys, m.ff)), f, "w")
+    proj = dirname(Base.active_project())
+    code = "using MolSim, Serialization; sys, ff = deserialize(\"$f\"); print(MolSim.MC.total_pair_energy(sys, ff))"
+    out = read(`$(Base.julia_cmd()) --startup-file=no --project=$proj -e $code`, String)
+    @test isapprox(parse(Float64, out), U0; rtol=1e-12)
+    s2 = deepcopy(sys)                                          # a deepcopy makes its own plans
+    @test s2.recip.fplan === nothing && MCp.total_pair_energy(s2, m.ff) == U0
+    rm(f; force=true)
 end

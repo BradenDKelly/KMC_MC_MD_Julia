@@ -13,6 +13,12 @@
 # solutes. Chains: SPCE_CHECKPOINT, SPCE_WALL_SECONDS, SPCE_CKPT_EVERY as dev/validate_spce_solute.jl.
 # Usage: julia -t 4 --project=. dev/mixture_ekmc.jl <mixEW|mixEM> <stock|ladder1|ladder2> <events> <seed> <outdir>
 using MolSim, Random, Printf, Dates, Serialization
+# MIX_DEVICE=cuda: device pair rows + solvent-candidate bank (DESIGN §15.5) and, with PME, the mesh gathers (§16) on the GPU;
+# needs an environment with CUDA (e.g. envs/molsim_gpu_*). Device state is never serialized: detached around checkpoints.
+const MIX_DEVICE = Symbol(get(ENV, "MIX_DEVICE", "none"))
+if MIX_DEVICE === :cuda
+    using CUDA
+end
 t_script = time()
 const MCm = MolSim.MC
 mix = ARGS[1]; mode = ARGS[2]; events = parse(Int, ARGS[3]); seed = parse(Int, ARGS[4]); outdir = ARGS[5]
@@ -151,13 +157,31 @@ else
     io = open(out, "w"); sys, r, ff, ctx = setup(io)
     isempty(ckpt) || save_checkpoint(ckpt, (sys, r, ff, ctx))
 end
+function dev_attach!(sys, r, ff)
+    MIX_DEVICE === :none && return nothing
+    S = r.slmoves
+    np = S === nothing ? 1 : length(S.kinds) * length(S.mols) + 1
+    MCm.attach_device_pairs!(sys, ff; backend=MIX_DEVICE, precision=:double, max_poses=max(np, 64))
+    S === nothing || MCm.slm_attach_device!(S, sys, ff)
+    sys.recip isa MCm.PMERecip && MCm.pme_attach_device!(sys.recip, sys; backend=MIX_DEVICE)
+    return nothing
+end
+function dev_detach!(sys, r)
+    sys.dev = nothing
+    S = r.slmoves
+    S === nothing || (S.dbase = 0; S.crP === nothing || (S.crP.dev = nothing))
+    sys.recip isa MCm.PMERecip && (sys.recip.dev = nothing; sys.recip.backend = :cpu)
+    return nothing
+end
+dev_attach!(sys, r, ff)
+MIX_DEVICE === :none || println(io, "# device $(MIX_DEVICE): pair rows, solvent-candidate bank$(sys.recip isa MCm.PMERecip ? ", PME mesh gathers" : "") ($(Dates.now()), host $(gethostname()))")
 while r.ev < r.events
     left = wall - (time() - t_script); left > 0 || break
     t0 = time()
     MCm.advance_rigid_ekmc!(r, sys, ff; wall_seconds=isempty(ckpt) ? left : min(left, ckpt_every))
     global ctx = merge(ctx, (; t_ek=ctx.t_ek + time() - t0))
     if r.ev < r.events && !isempty(ckpt)
-        save_checkpoint(ckpt, (sys, r, ff, ctx))
+        dev_detach!(sys, r); save_checkpoint(ckpt, (sys, r, ff, ctx)); dev_attach!(sys, r, ff)
         println(io, "# checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  eKMC wall time so far $(round(ctx.t_ek; digits=0)) s"); flush(io)
     end
 end

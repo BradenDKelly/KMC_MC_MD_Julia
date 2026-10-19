@@ -35,8 +35,8 @@ mutable struct PMERecip
     p::Int
     ew::EwaldRecip                    # exact Ewald image terms (recip_sf!, recip_corr, recip_half_norm only)
     Gh::Array{Float64,3}              # 2G on the rfft half grid: Φ = brfft(Gh ∘ rfft(Q), K)
-    fplan::Any
-    bplan::Any
+    fplan::Any                        # (process token, rfft plan) — see `_pme_fplan`
+    bplan::Any                        # (process token, brfft plan)
     Q::Array{Float64,3}               # committed total charge mesh
     Φ::Array{Float64,3}               # its potential
     Qw::Array{Float64,3}              # work mesh
@@ -96,7 +96,7 @@ function PMERecip(sys; α::Float64, ke::Float64, K::Int, p::Int, n2max::Int)
     nmax = maximum(t.n_sites for t in sys.templates)
     Q = zeros(K, K, K)
     Fw = zeros(ComplexF64, K ÷ 2 + 1, K, K)
-    fplan = plan_rfft(Q); bplan = plan_brfft(Fw, K)
+    fplan = (_pme_token(), plan_rfft(Q)); bplan = (_pme_token(), plan_brfft(Fw, K))
     N = sys.n_mol
     R = PMERecip(sys.L, α, ke, K, p, ew, _pme_halfG(sys.L, α, ke, K, p), fplan, bplan, Q, zeros(K, K, K), zeros(K, K, K),
                  Fw, zeros(K, K, K), zeros(K, K, K), 0, zeros(K, K, K), zeros(K, K, K), 0,
@@ -179,11 +179,35 @@ function _pme_spread_mol!(M::Array{Float64,3}, base, θ, off::Int, R::PMERecip, 
     return nothing
 end
 
+# FFTW plans hold pointers into the process that made them: a PMERecip restored from a checkpoint in another process must
+# not use them (segfault on the first FFT, JOURNAL 126). Plans are stored with a per-process token and recreated when the
+# token differs (or when a legacy checkpoint stored a bare plan).
+const _PME_TOKEN = Ref{UInt}(0)
+_pme_token() = (_PME_TOKEN[] == 0 && (_PME_TOKEN[] = rand(Random.RandomDevice(), UInt) | UInt(1)); _PME_TOKEN[])
+function _pme_fplan(R)
+    f = R.fplan
+    (f isa Tuple && f[1] == _pme_token()) && return f[2]
+    R.fplan = (_pme_token(), plan_rfft(R.Q)); R.bplan = (_pme_token(), plan_brfft(R.Fw, R.K))
+    return R.fplan[2]
+end
+_pme_bplan(R) = (_pme_fplan(R); R.bplan[2])
+# deepcopy must not duplicate the plan objects (two finalizers on one FFTW pointer): the copy gets no plans and makes its own
+function Base.deepcopy_internal(R::PMERecip, d::IdDict)
+    haskey(d, R) && return d[R]
+    C = ccall(:jl_new_struct_uninit, Any, (Any,), PMERecip)::PMERecip
+    d[R] = C
+    for f in fieldnames(PMERecip)
+        f in (:fplan, :bplan) && (setfield!(C, f, nothing); continue)
+        setfield!(C, f, Base.deepcopy_internal(getfield(R, f), d))
+    end
+    return C
+end
+
 "out = G⋆M (mesh potential of the charge mesh M)."
 function _pme_potential!(out::Array{Float64,3}, R::PMERecip, M::Array{Float64,3})
-    mul!(R.Fw, R.fplan, M)
+    mul!(R.Fw, _pme_fplan(R), M)
     R.Fw .*= R.Gh
-    mul!(out, R.bplan, R.Fw)
+    mul!(out, _pme_bplan(R), R.Fw)
     return out
 end
 
@@ -612,11 +636,11 @@ end
 
 "Φ_i (into R.Φk) of the charge mesh in R.Qw (molecule i alone) and its mesh self-virial into R.wself[i] (one FFT pair)."
 function _pme_selfvirial_potential!(R::PMERecip, sys, i::Int)
-    mul!(R.Fw, R.fplan, R.Qw)
+    mul!(R.Fw, _pme_fplan(R), R.Qw)
     w = 0.0
     @inbounds for j in eachindex(R.Fw); w += R.Gvh[j] * abs2(R.Fw[j]); end
     R.Fw .*= R.Gh
-    mul!(R.Φk, R.bplan, R.Fw)
+    mul!(R.Φk, _pme_bplan(R), R.Fw)
     R.wself[i] = w + _pme_grad_virial(R, R.Φk, sys, i:i)
     return R.Φk
 end
@@ -629,7 +653,7 @@ energy's virial minus every molecule's own mesh virial plus the image-term viria
 each commit (from the FFT of Φ_k) and rebuild, so a pressure costs one rfft and the stencil gradients at every site.
 """
 function recip_virial(R::PMERecip, sys)::Float64
-    mul!(R.Fw, R.fplan, R.Q)                              # full mesh: one rfft + the stencil gradients at every site
+    mul!(R.Fw, _pme_fplan(R), R.Q)                              # full mesh: one rfft + the stencil gradients at every site
     W = 0.0
     @inbounds for j in eachindex(R.Fw); W += R.Gvh[j] * abs2(R.Fw[j]); end
     W += _pme_grad_virial(R, R.Φ, sys, 1:sys.n_mol)
