@@ -78,6 +78,36 @@ end
     @test maximum(abs.(r.Uin .- fresh)) <= 1e-12 * maximum(abs.(fresh))
 end
 
+@testset "Flexible solvent L-moves in a rigid + flexible mixture (ethanol + SPC/E): inactive slots, bookkeeping = rebuild" begin
+    # Before: solvent_flexible refused a mixture of rigid and flexible movers. Now rigid movers keep only T/R slots (their
+    # LM_S/LM_D slots are inactive, rate 0); the incremental candidate energies equal a rebuild; no inactive slot ever fires.
+    m = MCf.spce_solute_model(:ethanol_flex; coulomb=:rf, epsilon_rf=Inf, cutoff=:site, rc_angstrom=7.0)
+    ff = m.ff; tw, te = m.templates[1], m.templates[2]
+    ne, nw = 12, 12
+    L = cbrt((ne * 46.07 + nw * 18.02) / 0.5 / 6.02214076e23 * 1e24) / m.σ_angstrom      # 0.5 g/cm³: random placement works
+    sys = MCf.RigidSystem([tw, te], vcat(fill(2, ne), fill(1, nw)), L, m.ϵ_kelvin / 300.0, Xoshiro(13))
+    MCf.random_rigid_system!(sys, ff); MCf.minimize_rigid!(sys, ff; nsteps=200)
+    res = MCf.build_reservoir([te], 1, ff, sys.β, Xoshiro(3); M=200, burnin_sweeps=50, stride_sweeps=5, δ=0.02)
+    r = MCf.init_rigid_ekmc_run(sys, ff; events=20_000, sample_every=20, block_events=2_000, reservoirs=[nothing, res],
+                                local_solvent=true, solvent_flexible=true, solvent_nu=1e-3, mc_δ=0.05, mc_δθ=0.15,
+                                solvent_site_a=0.01, solvent_φ=0.5, debug_check_every=5_000)
+    S = r.slmoves
+    @test length(S.mols) == ne + nw
+    for (ii, i) in enumerate(S.mols)
+        fl = MCf.isflexible(sys.templates[sys.tmpl[i]])
+        @test all(S.act[j, ii] == (fl || !(S.kinds[j] in (MCf.LM_S, MCf.LM_D))) for j in eachindex(S.kinds))
+    end
+    @test MCf.slm_check!(S, sys, ff) < 1e-9
+    nS0 = copy(S.n_move)
+    @test_logs min_level=Base.CoreLogging.Warn MCf.advance_rigid_ekmc!(r, sys, ff)
+    @test S.n_move[MCf.LM_S] > nS0[MCf.LM_S] && S.n_move[MCf.LM_D] > nS0[MCf.LM_D] && S.n_move[MCf.LM_T] > nS0[MCf.LM_T]
+    MCf.slm_total_rate!(S, r.ek, sys.β)
+    @test all(S.rates[.!S.act] .== 0.0)
+    @test MCf.slm_check!(S, sys, ff) < 1e-9
+    fresh = [MCf.intra_energy_molecule(sys, ff, i) for i in 1:sys.n_mol]
+    @test maximum(abs.(r.Uin .- fresh)) <= 1e-12 * maximum(abs.(fresh))
+end
+
 @testset "Flexible LJ-dimer liquid: eKMC + flexible solvent L-moves vs Metropolis MC (U, P, ⟨U_intra⟩)" begin
     N = 32; ρ = 0.3; T = 2.0; β = 1 / T
     sites = zeros(3, 2); sites[1, 1] = -0.3; sites[1, 2] = 0.3

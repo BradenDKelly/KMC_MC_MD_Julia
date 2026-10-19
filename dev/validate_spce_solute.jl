@@ -68,6 +68,9 @@ jump_max = parse(Int, get(ENV, "SPCE_JUMP_MAX", "0"))       # hub limited to run
 torsion_on = get(ENV, "SPCE_TORSION", "0") == "1"          # torsion moves: pool (φ uniform ±π) and MC stage (±δθ) (JOURNAL 79–80)
 internal_on = get(ENV, "SPCE_LOCAL_INTERNAL", "0") == "1"  # rejection-free site + torsion slots of the solute in solution (JOURNAL 80)
 solvent_local = get(ENV, "SPCE_SOLVENT_LOCAL", "0") == "1"   # rejection-free local moves of every water (DESIGN §11.2 stage 2)
+eta_env = get(ENV, "SPCE_LADDER_ETA", "")                    # fixed ladder weights η (comma list; with SPCE_LADDER_WL=0: no WL)
+ladder_eta_fixed = isempty(eta_env) ? nothing : parse.(Float64, split(eta_env, ","))
+track_dih = get(ENV, "SPCE_TRACK_DIH", "0") == "1"           # per-rung dihedral histograms of the fractional solute (diagnostic)
 res_mode = get(ENV, "SPCE_RESERVOIR", "mc")                 # conformer pool: mc (vacuum Metropolis) | ekmc (vacuum rejection-free, §11.3 E3)
 res_mode in ("mc", "ekmc") || error("SPCE_RESERVOIR must be mc or ekmc")
 # mc_sweeps = 0: MC-free pipeline (DESIGN §11.3, user 2026-10-14): E1 eKMC burn-in of SPCE_EKMC_BURNIN events (default
@@ -250,7 +253,9 @@ function setup_and_mc(io)
                                 ladder_eta_ramp=ladder_on ? (isnan(ladder_ramp_kJ) ? log(iw) : ladder_ramp_kJ / kJmol_per_eps / T) : 0.0,   # βμ guess: SPCE_LADDER_RAMP or the MC removal estimator
                                 ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
                                 ladder_jump_max=jump_max, ladder_local=local_on, local_internal=internal_on, local_solvent=solvent_local,
-                                solvent_nu=solvent_local ? R_mc : NaN)   # water slots at the unscaled ⟨R⟩ even when SPCE_LADDER_NU boosts the solute
+                                solvent_nu=solvent_local ? R_mc : NaN,   # water slots at the unscaled ⟨R⟩ even when SPCE_LADDER_NU boosts the solute
+                                ladder_eta=ladder_eta_fixed, track_dihedrals=(track_dih && flex) ? solute_dihedrals(m.solute) : NTuple{4,Int}[])
+    ladder_eta_fixed === nothing || println(io, "# ladder weights FIXED from SPCE_LADDER_ETA: ", ladder_eta_fixed)
     ladder_on && println(io, "# coupling ladder: λ = $(ladder_λ), ν = $(ladder_νfac)·⟨R⟩_MC = $(ladder_νfac * R_mc), Wang–Landau over the first $(round(Int, ladder_wlfrac * ekmc_events)) events; λ=0 hub $(ladder_jump); U, P, μ_water, mu_sol read at the coupled rung only")
     local_on && println(io, "# L-moves (DESIGN §11.2): slots $(r.lmoves.kinds) (1 T, 2 R, 3 C, 4 site, 5 torsion), a = $(round(r.lmoves.a * m.σ_angstrom; digits=3)) Å, θ_max = $(r.lmoves.θmax) rad, site a = $(round(r.lmoves.site_a * m.σ_angstrom; digits=3)) Å, φ_max = $(r.lmoves.φmax) rad, ν_L = ν_D = $(r.lmoves.ν); hub limited to rungs ≤ $(r.ladder.jump_max)")
     solvent_local && println(io, "# solvent L-moves: $(length(r.slmoves.mols)) movers × slots $(r.slmoves.kinds), ν = ν_D = $(r.slmoves.ν)")
@@ -312,6 +317,33 @@ function ekmc_report(io, ek, ctx)
     println(io, "# block means U/N (eKMC, reduced): ", join(round.(ek.U.block_means; digits=3), " "))
 end
 
+# one dihedral per rotatable bond j–k, ends = the heaviest other neighbour of j and of k (propanol: C–C–C–O, C–C–O–H)
+function solute_dihedrals(t)
+    adj = [Int[] for _ in 1:t.n_sites]
+    for b in t.bonded.bonds; push!(adj[b.i], b.j); push!(adj[b.j], b.i); end
+    out = NTuple{4,Int}[]
+    for (j, k, _) in MCm.rotatable_bonds(t)
+        ni = filter(!=(k), adj[j]); nl = filter(!=(j), adj[k])
+        (isempty(ni) || isempty(nl)) && continue
+        push!(out, (ni[argmax(t.site_mass[ni])], j, k, nl[argmax(t.site_mass[nl])]))
+    end
+    return out
+end
+# per-rung trans (|φ| > 120°) / gauche+ / gauche− fractions of the tracked dihedrals (time-weighted, production)
+function dihedral_report(io, r)
+    isempty(r.dih_atoms) && return
+    for (d, a) in enumerate(r.dih_atoms)
+        parts = String[]
+        for k in eachindex(r.dih_hist)
+            h = r.dih_hist[k][d]; tot = sum(h); tot > 0 || (push!(parts, "-"); continue)
+            c = [(-π + (b - 0.5) * 2π / MCm.DIH_BINS) for b in 1:MCm.DIH_BINS]
+            tr = sum(h[b] for b in eachindex(h) if abs(c[b]) > 2π / 3) / tot; gp = sum(h[b] for b in eachindex(h) if 0 < c[b] <= 2π / 3) / tot
+            push!(parts, @sprintf("%.3f/%.3f/%.3f", tr, gp, 1 - tr - gp))
+        end
+        println(io, "# dihedral $(a) trans/g+/g− per rung: ", join(parts, "  "))
+    end
+end
+
 # atomic checkpoint write: a job killed while writing leaves the previous checkpoint intact
 function save_checkpoint(path, state)
     tmp = path * ".tmp"
@@ -351,6 +383,7 @@ if r.ev < r.events
     println("checkpoint written at event $(r.ev) of $(r.events)"); exit(0)
 end
 ekmc_report(io, MCm.rigid_ekmc_results(r), ctx)
+dihedral_report(io, r)
 close(io)
 isempty(ckpt) || (save_checkpoint(ckpt, (sys, r, ff, ctx)); mv(ckpt, ckpt * ".final"; force=true))
 println(read(ctx.out, String))

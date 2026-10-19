@@ -136,3 +136,41 @@ function spce_solute_model(solute::Symbol; α_per_angstrom::Float64=0.20, rc_ang
     return (templates=[m.template, tmpl], water=m.template, solute=tmpl, ff=ff,
             σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=qs, mixing=p.mixing)
 end
+
+"""
+    spce_mixture_model(solutes::Vector{Symbol}; kwargs...) -> (templates = [water, solute₁, …], ff, …)
+
+SPC/E water and several solute species (the models of `spce_solute_model`) in one force field, for concentrated mixtures
+(ethanol + water, ethanol + methanol): LJ types numbered water O first, then each solute's types in order; reduced units of
+`spce_model`. All solutes must share one mixing rule. For one solute it equals `spce_solute_model` (same tables, same template).
+"""
+function spce_mixture_model(solutes::Vector{Symbol}; α_per_angstrom::Float64=0.20, rc_angstrom::Float64=10.0,
+                            use_lrc::Bool=true, cap_overlaps::Bool=true, shift_lj::Bool=false,
+                            cutoff::Symbol=:molecule, cap_factor::Float64=1000.0, coulomb::Symbol=:wolf,
+                            epsilon_rf::Float64=Inf)
+    m = spce_model(; α_per_angstrom=α_per_angstrom, rc_angstrom=rc_angstrom, use_lrc=use_lrc,
+                   cap_overlaps=cap_overlaps, shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor,
+                   coulomb=coulomb, epsilon_rf=epsilon_rf)
+    σ_A, ϵ_K, qs = m.σ_angstrom, m.ϵ_kelvin, m.q_scale
+    σ_types = [1.0]; ϵ_types = [1.0]; tmpls = RigidTemplate[]; mixing = nothing
+    for solute in solutes
+        p = trappe_ua_solute(solute)
+        mixing === nothing && (mixing = p.mixing)
+        p.mixing === mixing || error("spce_mixture_model: solutes with different mixing rules ($mixing, $(p.mixing))")
+        off = length(σ_types)
+        types = [t > 0 ? t + off : 0 for t in p.types]
+        bonded = nothing
+        if get(p, :flexible, false)
+            bt = haskey(p, :bonded) ? p.bonded : first(opls_methanol_bonded())
+            bonded = bonded_to_reduced(bt, σ_A, ϵ_K * 0.0083144626)
+        end
+        push!(tmpls, RigidTemplate(p.name, p.sites ./ σ_A, types, p.q .* qs, p.mass; bonded=bonded))
+        append!(σ_types, [σ / σ_A for (σ, _) in p.lj]); append!(ϵ_types, [ϵ / ϵ_K for (_, ϵ) in p.lj])
+    end
+    ff = SiteForceField(σ_types, ϵ_types; rc=rc_angstrom / σ_A, coulomb=coulomb,
+                        α=α_per_angstrom * σ_A, ke=1.0, use_lrc=use_lrc, cap_overlaps=cap_overlaps,
+                        shift_lj=shift_lj, cutoff=cutoff, cap_factor=cap_factor, mixing=mixing,
+                        epsilon_rf=epsilon_rf)
+    return (templates=vcat(m.template, tmpls), water=m.template, solutes=tmpls, ff=ff,
+            σ_angstrom=σ_A, ϵ_kelvin=ϵ_K, q_scale=qs, mixing=mixing)
+end

@@ -4,6 +4,8 @@
 # solute LJ type, σ/ϵ explicit), SPC/E [ moleculetype ] (settles), and one [ moleculetype ] per solute with explicit bonds,
 # angles, RB propers (type 3), periodic dihedrals (type 4, LigParGen impropers) and 1-4 [ pairs ] (nrexcl 3).
 # Usage: julia --project=. dev/gromacs_solute_itp.jl <out.itp> <solute:MOLTYPE> ...   e.g. butanol_flex:BUTF caffeine_lpg:CAFF
+# A solute may appear twice under different MOLTYPE names (GROMACS couple-moltype decouples every copy of a type, so the one
+# decoupled molecule of a mixture is its own type); `water:NAME` adds an extra SPC/E type (e.g. SOLX, the decoupled water).
 using MolSim, Printf
 const M = MolSim.MC
 
@@ -19,7 +21,8 @@ end
 
 out = ARGS[1]
 specs = [(Symbol(split(a, ":")[1]), String(split(a, ":")[2])) for a in ARGS[2:end]]
-mols = [(sym, mt, solute_source(sym)) for (sym, mt) in specs]
+water_copies = [mt for (sym, mt) in specs if sym === :water]
+mols = [(sym, mt, solute_source(sym)) for (sym, mt) in specs if sym !== :water]
 fl = unique([(m.bt.fudge_lj, m.bt.fudge_qq) for (_, _, m) in mols])
 length(fl) == 1 || error("solutes with different fudge factors cannot share one [ defaults ]")
 io = IOBuffer()
@@ -53,6 +56,25 @@ println(io, """
   2 1 3
   3 1 2
 """)
+for wt in water_copies
+    println(io, """[ moleculetype ]
+; name  nrexcl
+  $wt   2
+[ atoms ]
+  1  OW   1     $wt OW   1    -0.8476 15.9994
+  2  HW   1     $wt HW1  1     0.4238 1.008
+  3  HW   1     $wt HW2  1     0.4238 1.008
+[ constraints ]
+; a second SETTLE moleculetype is not allowed: rigid water as three constraints (as gromacs_fe/ff/opls_spce_solx.itp)
+  1  2  1  0.1
+  1  3  1  0.1
+  2  3  1  0.1632993
+[ exclusions ]
+  1 2 3
+  2 1 3
+  3 1 2
+""")
+end
 for (sym, mt, m) in mols
     bt = m.bt
     println(io, "[ moleculetype ]\n; name  nrexcl\n  $mt  3\n[ atoms ]")

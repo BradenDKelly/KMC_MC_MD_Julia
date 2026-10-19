@@ -65,6 +65,8 @@ mutable struct SolventLocalMoves
     tors::Vector{Vector{Tuple{Int,Int,Vector{Int}}}}   # rotatable bonds per template
     cand_site::Vector{Float64}          # M: largest distance of any interacting site of any candidate pose from the saved COM
     cand_com::Vector{Float64}           # M: largest COM displacement of any candidate (molecule cut-off reach)
+    act::BitMatrix                      # K × M: slot active (mixtures: no LM_S/LM_D on rigid movers, no LM_D without a
+                                        # rotatable bond; an inactive slot has rate 0 — the event is absent, balance untouched)
 end
 
 "Saved pose (COM, quaternion, body) of the molecule being evaluated; one per thread (the column updates are threaded)."
@@ -85,13 +87,15 @@ function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Fl
     any(==(LM_S), kinds) && !(site_a > 0) && error("SolventLocalMoves: LM_S slots need site_a > 0")
     any(==(LM_D), kinds) && !(φmax > 0) && error("SolventLocalMoves: LM_D slots need φmax > 0")
     tors = [isflexible(t) ? rotatable_bonds(t) : Tuple{Int,Int,Vector{Int}}[] for t in sys.templates]
-    for i in mols
+    act = trues(K, M)
+    for (ii, i) in enumerate(mols)
         t = sys.templates[sys.tmpl[i]]
         i == frac && error("SolventLocalMoves: the fractional molecule has its own LocalMoves")
-        if internal
-            isflexible(t) || error("SolventLocalMoves: site/torsion slots but molecule $i ($(t.name)) is rigid")
-            any(==(LM_D), kinds) && isempty(tors[sys.tmpl[i]]) && error("SolventLocalMoves: torsion slots but $(t.name) has no rotatable bond")
+        for (j, kd) in enumerate(kinds)
+            ((kd == LM_S || kd == LM_D) && !isflexible(t)) && (act[j, ii] = false)
+            (kd == LM_D && isflexible(t) && isempty(tors[sys.tmpl[i]])) && (act[j, ii] = false)
         end
+        any(view(act, :, ii)) || error("SolventLocalMoves: molecule $i ($(t.name)) has no usable slot")
     end
     pos = zeros(Int, N)
     for (ii, i) in enumerate(mols); pos[i] = ii; end
@@ -99,7 +103,7 @@ function SolventLocalMoves(sys, ff, mols::Vector{Int}; kinds::Vector{Int}, a::Fl
                           zeros(K, N, M), zeros(K, M), zeros(K, M), zeros(K, M), zeros(M), 0.0, zeros(Int, 5), 0, 0, 0,
                           zeros(N), zeros(N), Any[SLMPose() for _ in 1:Threads.nthreads()], zeros(ComplexF64, 0, K * M), zeros(K, M), zeros(K, M),
                           zeros(K * M), zeros(ComplexF64, 0, K * M), zeros(K * M), zeros(0, K * M), Float64[],
-                          zeros(ComplexF64, 0, K), site_a, φmax, zeros(Int, K, M), zeros(K, M), tors, zeros(M), zeros(M))
+                          zeros(ComplexF64, 0, K), site_a, φmax, zeros(Int, K, M), zeros(K, M), tors, zeros(M), zeros(M), act)
     for ii in 1:M
         _slm_draw!(S, sys, ii)
     end
@@ -111,6 +115,7 @@ function _slm_draw!(S::SolventLocalMoves, sys, ii::Int)
     rng = sys.rng
     i = S.mols[ii]
     for j in eachindex(S.kinds)
+        S.act[j, ii] || continue                         # inactive slot (mixtures): nothing drawn
         kd = S.kinds[j]
         if kd == LM_T
             for d in 1:3; S.dT[d, j, ii] = (2rand(rng) - 1) * S.a; end
@@ -174,6 +179,14 @@ function slm_rebuild_mol!(S::SolventLocalMoves, sys, ff, ii::Int)
     P = S.pose[1]
     rsite = 0.0; rcom = 0.0
     for j in eachindex(S.kinds)
+        if !S.act[j, ii]                                 # inactive slot: no candidate, rate 0 (slm_total_rate!)
+            @inbounds for m in 1:N; S.cp[j, m, ii] = 0.0; end
+            S.cu[j, ii] = 0.0; S.cs[j, ii] = 0.0; S.cin[j, ii] = 0.0
+            if R !== nothing
+                fill!(view(S.crS, :, (ii - 1) * K + j), zero(ComplexF64)); S.cr_u[j, ii] = 0.0; S.cr_s[j, ii] = 0.0
+            end
+            continue
+        end
         _slm_place!(S, sys, i, ii, j)
         # reach of the candidate poses (column updates, `_slm_column!`): exact, from the placed sites
         Dx = _min_image(sys.com[1, i] - P.com0[1], sys.L); Dy = _min_image(sys.com[2, i] - P.com0[2], sys.L)
@@ -243,6 +256,7 @@ function _slm_column!(S::SolventLocalMoves, sys, ff, ii::Int, m::Int, reach0::Fl
     end
     _slm_save!(S, sys, i, P)
     @inbounds for j in 1:K
+        S.act[j, ii] || continue
         _slm_place!(S, sys, i, ii, j, P)
         u, _ = pair_energy_virial(sys, ff, i, m)
         if m == S.frac
@@ -329,6 +343,9 @@ function slm_total_rate!(S::SolventLocalMoves, ek, β::Float64)
     @inbounds for ii in eachindex(S.mols)
         φ = ek.phi[S.mols[ii]]; w = 0.0
         for j in eachindex(S.kinds)
+            if !S.act[j, ii]
+                S.rates[j, ii] = 0.0; continue
+            end
             x = S.cu[j, ii] + S.cr_u[j, ii] + λ * (S.cs[j, ii] + S.cr_s[j, ii]) - φ + S.cin[j, ii]   # + ΔU_intra (S/D)
             r = S.ν * exp(min(-0.5 * β * x, MOBILITY_LOG_MAX))
             S.rates[j, ii] = r; w += r
@@ -347,7 +364,7 @@ function slm_fire!(S::SolventLocalMoves, sys, ff, ek, ξ::Float64)
         ξ < S.Wm[x] && (ii = x; break)
         ξ -= S.Wm[x]
     end
-    j = K
+    j = findlast(view(S.act, :, ii))                    # rounding fallback: the last ACTIVE slot (never a zero-rate one)
     @inbounds for y in 1:K
         ξ < S.rates[y, ii] && (j = y; break)
         ξ -= S.rates[y, ii]

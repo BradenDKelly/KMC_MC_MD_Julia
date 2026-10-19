@@ -916,6 +916,8 @@ selection of the overlapping molecule as the next mover certain.
 """
 const MOBILITY_LOG_MAX = 600.0
 @inline _mobility(β::Float64, φ::Float64) = exp(min(β * φ, MOBILITY_LOG_MAX))
+# bins of the per-rung dihedral histograms of a ladder run (`track_dihedrals` of init_rigid_ekmc_run; 10° each)
+const DIH_BINS = 36
 
 "Smallest number of molecules for which the pair-row loops are threaded."
 const PARALLEL_MIN_MOL = 96
@@ -2567,6 +2569,10 @@ mutable struct RigidEKMCRun
     mc_local_radius::Float64
     lmoves::Union{Nothing,LocalMoves}
     slmoves::Union{Nothing,SolventLocalMoves}
+    # optional diagnostic (production, ladder runs): time-weighted histograms of dihedrals of the fractional molecule per rung,
+    # dih_hist[k][d][b] = kMC time at rung k with dihedral d (atoms dih_atoms[d], body frame) in bin b of DIH_BINS over (−π, π]
+    dih_atoms::Vector{NTuple{4,Int}}
+    dih_hist::Vector{Vector{Vector{Float64}}}
 end
 
 """
@@ -2575,6 +2581,7 @@ end
 Validate the options of `run_rigid_ekmc!` (same keywords) and build the run state at event 0.
 """
 function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
+                         track_dihedrals::Vector{NTuple{4,Int}}=NTuple{4,Int}[],
                          Pext::Union{Nothing,Float64}=nothing, max_dV::Float64=0.0,
                          vol_every_sweeps::Int=10, sample_every::Int=10, block_events::Int=1000,
                          debug_check_every::Int=0, adapt_dV_moves::Int=0, adapt_dV_window::Int=100,
@@ -2697,13 +2704,14 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         νs = isnan(solvent_nu) ? ladder_nu : solvent_nu
         isfinite(νs) || error("run_rigid_ekmc!: local_solvent needs solvent_nu (or a ladder's ladder_nu)")
         if solvent_flexible
-            # DESIGN §14: every molecule but the fractional one, flexible ones with single-site and torsion slots
+            # DESIGN §14: every molecule but the fractional one, flexible ones with single-site and torsion slots. Mixtures of
+            # rigid and flexible movers (e.g. ethanol + SPC/E): the slot list is shared, a rigid mover's LM_S/LM_D slots and the
+            # LM_D slots of a molecule without a rotatable bond are inactive (rate 0, SolventLocalMoves.act)
             smols = [i for i in 1:N if i != ladder_solute]
-            all(i -> isflexible(sys.templates[sys.tmpl[i]]), smols) ||
-                error("run_rigid_ekmc!: solvent_flexible needs every mover flexible (rigid and flexible movers are not mixed)")
             skinds = if isempty(solvent_kinds)
-                tors = all(i -> !isempty(rotatable_bonds(sys.templates[sys.tmpl[i]])), smols)
-                vcat(fill(LM_T, 3), fill(LM_R, 3), fill(LM_S, 4), tors ? fill(LM_D, 2) : Int[])
+                flex = any(i -> isflexible(sys.templates[sys.tmpl[i]]), smols)
+                tors = any(i -> isflexible(sys.templates[sys.tmpl[i]]) && !isempty(rotatable_bonds(sys.templates[sys.tmpl[i]])), smols)
+                vcat(fill(LM_T, 3), fill(LM_R, 3), flex ? fill(LM_S, 4) : Int[], tors ? fill(LM_D, 2) : Int[])
             else
                 solvent_kinds
             end
@@ -2739,7 +2747,8 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
     next_vol = vol_period
     n_fast = 0; n_reloc = 0; n_bursts = 0
     ev = 0; n_full = 0
-    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius, lmoves, slmoves)
+    return RigidEKMCRun(events, Pext, sample_every, burnin_events, tail_route, λ, mc_δ, mc_δθ, species_mu, trace_molecule, overlap_fast_path, reservoirs, flex_mols, vol_period, adapt_dV_moves, adapt_dV_window, vol_pressure, vol_scheme, vol_equil_moves, ek, Uin, acc, acc_npt, ba_U, ba_P, ba_rho, ba_V, ba_RN, ba_Ui, ba_RNV, ba_RNs, nspec, n_spec, sp_sum, trace_phi, trace_dt, win_V, win_t, dV_history, reg_n, vol_moves, next_vol, n_fast, n_reloc, n_bursts, ev, n_full, reg_V, reg_P, reg_VV, reg_VP, p_part_sum, p_part_t, t_total, t_since_vol, max_dV_current, bar_species, bar, bar_members, ladder, mc_local_radius, lmoves, slmoves,
+                        track_dihedrals, [[zeros(DIH_BINS) for _ in track_dihedrals] for _ in 1:(ladder === nothing ? 0 : nrungs(ladder))])
 end
 
 """
@@ -2839,6 +2848,13 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             p_part_sum += pressure(sys, ff, ekmc_virial(ek); tail=tail_route) * dt; p_part_t += dt
         end
         ladder_prod && ladder_time!(ladder, sys.β * ek.frac_u, dt)
+        if ladder_prod && !isempty(r.dih_atoms)
+            Bf = sys.body[ladder.solute]
+            @inbounds for (d, (a1, a2, a3, a4)) in enumerate(r.dih_atoms)
+                φd = dihedral_angle(Bf, a1, a2, a3, a4)
+                r.dih_hist[ladder.k][d][clamp(floor(Int, (φd + π) / (2π) * DIH_BINS) + 1, 1, DIH_BINS)] += dt
+            end
+        end
         k_before = ladder === nothing ? 0 : ladder.k           # rung occupied during dt (for Wang–Landau)
         if ev > burnin_events && coupled_now
             if bar !== nothing
@@ -3211,7 +3227,8 @@ translations + 3 rotations), half-widths `solvent_a`/`solvent_θ` (default `mc_�
 (default `ladder_nu`; required without a ladder) and per-molecule refresh rate `solvent_nuD` (default `solvent_nu`); NVT only.
 `solvent_flexible=true` (with `local_solvent`) makes every molecule but the fractional one a mover, flexible molecules with
 single-site and torsion slots (DESIGN §14; default 3 T + 3 R + 4 S + 2 D, half-widths `solvent_site_a` (default
-`local_site_a`) and `solvent_φ` (default `mc_δθ`)); every mover must then be flexible.
+`local_site_a`) and `solvent_φ` (default `mc_δθ`)); rigid movers in a mixture keep only their T/R slots, molecules without a
+rotatable bond no torsion slots (inactive slots have rate 0).
 `neighbor_cells=true` evaluates the real-space rows (events, candidates) with a molecular cell list (`MolCells`); the rows are
 identical to the all-pairs ones, the rebuilds stay all-pairs.
 """

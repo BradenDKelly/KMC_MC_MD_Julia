@@ -214,3 +214,25 @@ end
     @test abs(a - b) <= 4 * sqrt(ea^2 + eb^2)
     @test abs(tT / ttot - fb) < 0.08
 end
+
+@testset "Ladder with fixed η (no Wang–Landau) and per-rung dihedral histograms (diagnostic): time bookkeeping exact" begin
+    m = MCm.spce_solute_model(:ethanol_flex; coulomb=:rf, epsilon_rf=Inf, cutoff=:site, rc_angstrom=7.0)
+    ff = m.ff; N = 30; Nt = N + 1
+    L = cbrt(N / 0.02) / m.σ_angstrom                                   # dilute enough for random placement
+    sys = MCm.RigidSystem(m.templates, vcat(fill(1, N), 2), L, m.ϵ_kelvin / 300.0, Xoshiro(17)); MCm.random_rigid_system!(sys, ff)
+    res = MCm.build_reservoir(m.templates, 2, ff, sys.β, Xoshiro(4); M=300, burnin_sweeps=50, stride_sweeps=5, δ=0.02, torsion=true)
+    λs = [0.0, 0.1, 0.4, 1.0]; η = [3.0, 2.0, 1.0, 0.0]
+    dih = [(1, 5, 8, 9), (2, 1, 5, 8)]
+    ν = MCm.estimate_relocation_rate(deepcopy(sys), ff; events=5_000)
+    r = MCm.init_rigid_ekmc_run(sys, ff; events=30_000, sample_every=10, block_events=3_000, reservoirs=[nothing, res],
+                                ladder_solute=Nt, ladder_lambda=λs, ladder_nu=ν, ladder_eta=η, ladder_wl_events=0,
+                                ladder_jump=true, ladder_local=true, track_dihedrals=dih)
+    MCm.advance_rigid_ekmc!(r, sys, ff)
+    sm = MCm.ladder_summary(r.ladder)
+    @test sm.η == η && sm.wl_stages == 0
+    @test length(r.dih_hist) == length(λs) && all(length(h) == length(dih) for h in r.dih_hist)
+    @test count(>(0), sm.t_rung) >= 2
+    for k in eachindex(λs), d in eachindex(dih)
+        @test isapprox(sum(r.dih_hist[k][d]), sm.t_rung[k]; rtol=1e-12)
+    end
+end
