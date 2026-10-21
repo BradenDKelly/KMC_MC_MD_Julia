@@ -4,8 +4,8 @@
 # One task = (pose p, molecule j). A pose is a molecule i at its committed pose or at a candidate pose (COM, site offsets,
 # extent); the task result is exactly the term of `pair_energy_virial(sys, ff, i, j)` with i at pose p: minimum image on
 # the COM, then the offsets; site or molecule cut-off; LJ (+ shift); RF, Wolf/DSF or Ewald real space; the overlap cap is
-# the FIRST overlapping site pair in the (n, m) loop order of pair_energy_virial (minimum linear index n·n_j + m over the
-# work-group), capped pairs carry no virial; then min(u, cap_min_u). A work-group of DP_GROUP work-items per task strides over
+# the FIRST overlapping site pair in the loop order of the lower-index molecule (`_canonical_ucap`; minimum linear index
+# n·n_j + m for i < j, m·n_i + n for i > j, over the work-group), capped pairs carry no virial; then min(u, cap_min_u). A work-group of DP_GROUP work-items per task strides over
 # the n_i·n_j site pairs and reduces in local memory in a fixed order (same result on every call). KernelAbstractions: the
 # same kernel runs on the CPU (test oracle against pair_energy_virial) and on CUDA (MolSimCUDAExt: `device_backend`).
 #
@@ -248,7 +248,7 @@ end
                     if tyn > 0 && tym > 0
                         k = (tyn - 1) * nt + tym
                         if prm.cap && r2 < @inbounds(rcap2[k])
-                            mi = min(mi, Int32(q))
+                            mi = min(mi, Int32(i < j ? q : m * ni + n))   # lower-index molecule's order (_canonical_ucap)
                         end
                         s6 = (@inbounds(σ2[k]) / r2)^3
                         au += @inbounds(e4[k]) * (s6 * s6 - s6)
@@ -286,8 +286,12 @@ end
     p, j = _dp_task(g, tp, tj, implicit, Nm)
     @inbounds i = Int(pmol[p])
     j == i && return 0.0, 0.0
-    if mi != typemax(Int32)                        # first overlapping site pair (loop order of pair_energy_virial)
-        nj = Int(@inbounds mn[j]); n = Int(mi) ÷ nj; m = Int(mi) - n * nj
+    if mi != typemax(Int32)                        # first overlapping site pair in the lower-index molecule's order
+        if i < j
+            nj = Int(@inbounds mn[j]); n = Int(mi) ÷ nj; m = Int(mi) - n * nj
+        else
+            ni = Int(@inbounds mn[i]); m = Int(mi) ÷ ni; n = Int(mi) - m * ni
+        end
         tyn = Int(@inbounds sty[Int(@inbounds mstart[i]) + n + 1]); tym = Int(@inbounds sty[Int(@inbounds mstart[j]) + m + 1])
         return @inbounds(ucap[(tyn - 1) * Int(prm.nt) + tym]), 0.0
     end

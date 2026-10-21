@@ -307,7 +307,8 @@ function site_cells_row!(row_u::Vector{Float64}, row_w::Vector{Float64}, c::Site
                         tj = sys.templates[sys.tmpl[j]]; m = s - sys.site_start[j]
                         tym = tj.site_type[m]
                         if capping && tyn > 0 && tym > 0 && r2 < ff.rcap2_mix[tyn, tym]
-                            key = (a - 1) * tj.n_sites + m       # all-pairs order: first (site of k, site of j)
+                            # first site pair in the lower-index molecule's loop order (_canonical_ucap)
+                            key = k < j ? (a - 1) * tj.n_sites + m : (m - 1) * tk.n_sites + a
                             key < c.capkey[j] && (c.capkey[j] = key; c.capu[j] = ff.ucap_mix[tyn, tym])
                         else
                             u, fr = _site_pair_uf(ff, tyn, qn, tym, tj.site_q[m], r2)

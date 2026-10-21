@@ -471,17 +471,20 @@ end
 
 """
     build_reservoir(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03,
-                    torsion=false, φmax=π)
+                    torsion=has_rotatable_bonds, φmax=π)
 
 Vacuum Metropolis MC on one molecule of `template_idx`: a sweep = one displacement attempt per site
 (uniform in a cube of half-side δ, reduced units). `M` conformations are stored every `stride_sweeps`
 sweeps after `burnin_sweeps`. `torsion=true` adds, per sweep, one rigid-fragment torsion attempt per rotatable bond
 (random bond, φ uniform in [−φmax, φmax], `rotatable_bonds`): single-site steps of δ do not cross heavy-atom torsion
-barriers (1-propanol C–C–C–O: 0 flips in 4e5 sweeps, JOURNAL 79).
+barriers (1-propanol C–C–C–O: 0 flips in 4e5 sweeps, JOURNAL 79). The default is on for any template with a rotatable
+bond: with `torsion=false` the pool of liquid-ethanol drivers was not Boltzmann over the torsions (C–C dihedral fraction
+|φ| < 120° 0.38 vs 1.00 for two seeds; 0.67 with torsions), which biases every relocation (JOURNAL 2026-10-20).
 """
 function build_reservoir(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
                          rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
-                         δ::Float64=0.03, torsion::Bool=false, φmax::Float64=Float64(π))
+                         δ::Float64=0.03, torsion::Bool=!isempty(rotatable_bonds(templates[template_idx])),
+                         φmax::Float64=Float64(π))
     t = templates[template_idx]
     isflexible(t) || error("build_reservoir: template $(t.name) is rigid")
     rb = torsion ? rotatable_bonds(t) : Tuple{Int,Int,Vector{Int}}[]
@@ -526,7 +529,7 @@ end
 
 """
     build_reservoir_ekmc(templates, template_idx, ff, β, rng; M=10_000, burnin_sweeps=2_000, stride_sweeps=20, δ=0.03,
-                         ν=1.0, νD=1.0)
+                         ν=1.0, νD=1.0, torsion=has_rotatable_bonds, φmax=π)
 
 Vacuum conformer reservoir by rejection-free continuous-time sampling (DESIGN §11.3 E3; no Metropolis step). The
 molecule carries one candidate displacement per site (d_n uniform in a cube of half-side δ, the L-move construction of
@@ -542,7 +545,8 @@ heavy-atom torsion barriers).
 """
 function build_reservoir_ekmc(templates::Vector{RigidTemplate}, template_idx::Int, ff::SiteForceField, β::Float64,
                               rng::AbstractRNG; M::Int=10_000, burnin_sweeps::Int=2_000, stride_sweeps::Int=20,
-                              δ::Float64=0.03, ν::Float64=1.0, νD::Float64=1.0, torsion::Bool=false, φmax::Float64=Float64(π))
+                              δ::Float64=0.03, ν::Float64=1.0, νD::Float64=1.0,
+                              torsion::Bool=!isempty(rotatable_bonds(templates[template_idx])), φmax::Float64=Float64(π))
     t = templates[template_idx]
     isflexible(t) || error("build_reservoir_ekmc: template $(t.name) is rigid")
     n = t.n_sites
@@ -753,6 +757,47 @@ end
 @inline _site_images(ff, L::Float64) = ff.cutoff !== :molecule && ff.rc < 0.5 * L
 
 """
+    _canonical_ucap(sys, ff, i, j, u_first) -> u_cap
+
+Cap energy of an overlapping molecule pair, independent of the argument order: the cap value of the FIRST overlapping
+LJ site pair in the site loop of the LOWER-index molecule (outer) against the higher one (inner). Called by
+`pair_energy` / `pair_energy_virial` / `capped_overlaps` when their loop (sites of i outer) has found an overlapping
+site pair whose cap is `u_first`; for i < j that already is the canonical pair, for i > j the loop is redone from j.
+Before this (JOURNAL 2026-10-20/21) the first pair of the caller's order was used, so u_ij ≠ u_ji whenever two
+different type pairs overlapped (ethanol: 286.35 vs 424.73) and the total energy of an overlapped state depended on
+summation order. The GPU rows (DevicePairs) and the site cell list (MolCells) apply the same rule.
+"""
+function _canonical_ucap(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int, u_first::Float64)::Float64
+    i < j && return u_first
+    L = sys.L
+    @inbounds begin
+        Rx = _min_image(sys.com[1, i] - sys.com[1, j], L)
+        Ry = _min_image(sys.com[2, i] - sys.com[2, j], L)
+        Rz = _min_image(sys.com[3, i] - sys.com[3, j], L)
+    end
+    tj = sys.templates[sys.tmpl[j]]; ti = sys.templates[sys.tmpl[i]]
+    sj = sys.site_start[j]; si = sys.site_start[i]
+    wrap = _site_images(ff, L) && _pair_wraps(Rx, Ry, Rz, sys.ext[j] + sys.ext[i], L)
+    @inbounds for n in 1:tj.n_sites
+        tyn = tj.site_type[n]
+        tyn > 0 || continue
+        ox, oy, oz = sys.site_off[1, sj + n], sys.site_off[2, sj + n], sys.site_off[3, sj + n]
+        for m in 1:ti.n_sites
+            tym = ti.site_type[m]
+            tym > 0 || continue
+            dx = Rx + sys.site_off[1, si + m] - ox
+            dy = Ry + sys.site_off[2, si + m] - oy
+            dz = Rz + sys.site_off[3, si + m] - oz
+            if wrap
+                dx = _min_image(dx, L); dy = _min_image(dy, L); dz = _min_image(dz, L)
+            end
+            dx * dx + dy * dy + dz * dz < ff.rcap2_mix[tyn, tym] && return ff.ucap_mix[tyn, tym]
+        end
+    end
+    return u_first                                   # unreachable up to rounding of the minimum image
+end
+
+"""
     pair_energy(sys, ff, i, j) -> u_ij
 
 Intermolecular energy of molecules i and j (site-based cutoff, overlap cap at the pair level).
@@ -793,7 +838,7 @@ function pair_energy(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int)::Floa
             tym = tj.site_type[m]
             if tyn > 0 && tym > 0
                 if ff.cap_overlaps && r2 < ff.rcap2_mix[tyn, tym]
-                    return ff.ucap_mix[tyn, tym]
+                    return _canonical_ucap(sys, ff, i, j, ff.ucap_mix[tyn, tym])
                 end
                 σ2 = ff.σ_mix[tyn, tym]^2
                 s6 = (σ2 / r2)^3
@@ -894,7 +939,7 @@ function pair_energy_virial(sys::RigidSystem, ff::SiteForceField, i::Int, j::Int
             fr = 0.0                       # −du/dr · r  (site pair)
             if tyn > 0 && tym > 0
                 if ff.cap_overlaps && r2 < ff.rcap2_mix[tyn, tym]
-                    return ff.ucap_mix[tyn, tym], 0.0
+                    return _canonical_ucap(sys, ff, i, j, ff.ucap_mix[tyn, tym]), 0.0
                 end
                 σ2 = ff.σ_mix[tyn, tym]^2
                 s6 = (σ2 / r2)^3
@@ -2302,7 +2347,7 @@ end
 Number of molecule pairs (k, j) that `pair_energy(sys, ff, k, j)` would return as capped (a LJ site pair
 closer than the overlap radius) and the sum of their cap energies, found without evaluating any energy:
 COM pre-filter against extent_k + extent_j + r_cap, then site distances with early exit (same site order
-as `pair_energy`, so the same cap value). O(N) distance checks, ≈ 20× cheaper than a row. Used by the
+as `pair_energy`, then `_canonical_ucap`, so the same cap value). O(N) distance checks, ≈ 20× cheaper than a row. Used by the
 overlap fast path of `run_rigid_ekmc!` (DESIGN §5c item 1).
 """
 function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
@@ -2343,7 +2388,7 @@ function capped_overlaps(sys::RigidSystem, ff::SiteForceField, k::Int)
             found && break
         end
         if found
-            n += 1; usum += ucap
+            n += 1; usum += _canonical_ucap(sys, ff, k, j, ucap)
         end
     end
     return n, usum

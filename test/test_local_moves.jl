@@ -132,7 +132,7 @@ end
 @testset "Conformer pools with torsion moves cross the 1-propanol C–C–C–O barrier; Metropolis = eKMC" begin
     m = lm_alcohol(:propanol_flex); β = m.ϵ_kelvin / 300.0
     trans(r) = (φ = [lm_dihed(c, 1, 5, 8, 11) for c in r.confs]; tr = abs.(φ) .> 2π / 3; (count(tr) / length(tr), count(i -> tr[i] != tr[i-1], 2:length(tr))))
-    r0 = MCm.build_reservoir(m.templates, 2, m.ff, β, Xoshiro(5); M=2000, burnin_sweeps=200, stride_sweeps=20, δ=0.03)
+    r0 = MCm.build_reservoir(m.templates, 2, m.ff, β, Xoshiro(5); M=2000, burnin_sweeps=200, stride_sweeps=20, δ=0.03, torsion=false)
     @test trans(r0)[2] < 20                                         # single-site moves alone: (almost) no flips (the bug)
     r_mc = MCm.build_reservoir(m.templates, 2, m.ff, β, Xoshiro(5); M=4000, burnin_sweeps=500, stride_sweeps=20, δ=0.03, torsion=true)
     r_ek = MCm.build_reservoir_ekmc(m.templates, 2, m.ff, β, Xoshiro(6); M=4000, burnin_sweeps=500, stride_sweeps=20, δ=0.03, torsion=true)
@@ -142,6 +142,20 @@ end
     @test na > 200 && nb > 200
     @test abs(a - b) <= 4 * sqrt(ea^2 + eb^2)
     @test abs(fa - fb) < 0.08
+end
+
+@testset "Conformer pools default to torsion moves for templates with rotatable bonds (JOURNAL 2026-10-20)" begin
+    # Regression: the default was torsion=false, so drivers that left it out (liquid-ethanol tests) relocated
+    # molecules into a pool that was not Boltzmann over the torsions. The default must equal torsion=true.
+    m = lm_alcohol(:ethanol_flex); β = m.ϵ_kelvin / 298.0
+    @test !isempty(MCm.rotatable_bonds(m.templates[2]))
+    kw = (M=50, burnin_sweeps=20, stride_sweeps=2, δ=0.03)
+    d = MCm.build_reservoir(m.templates, 2, m.ff, β, Xoshiro(11); kw...)
+    e = MCm.build_reservoir(m.templates, 2, m.ff, β, Xoshiro(11); kw..., torsion=true)
+    @test d.confs == e.confs
+    d = MCm.build_reservoir_ekmc(m.templates, 2, m.ff, β, Xoshiro(12); kw...)
+    e = MCm.build_reservoir_ekmc(m.templates, 2, m.ff, β, Xoshiro(12); kw..., torsion=true)
+    @test d.confs == e.confs
 end
 
 # one flexible solute and a few waters (SPC/E + alcohol), for the slot mechanics

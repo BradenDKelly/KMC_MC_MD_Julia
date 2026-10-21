@@ -45,7 +45,13 @@ if mode == "mc"
         sample!(1.0)
     end
 else
-    Rbar = M.init_rigid_ekmc(sys, ff).R / sys.n_mol        # mean molecular rate (the driver's ⟨R⟩ scale for ν)
+    # ν = ⟨R⟩ of the relaxed liquid from Metropolis samples, as the production drivers (validate_spce_solute.jl R_mc,
+    # mixture_ekmc.jl). The R of the minimised start (a quenched state, ~1e-12) starved the L-moves: one relocation then
+    # bounced through overlaps for ~1e5 events (dev/propanol_reloc_probe.jl, JOURNAL 2026-10-20).
+    mc = M.run_rigid_mc!(sys, ff; sweeps=500, δ=0.3 / m.σ_angstrom, δθ=0.3, reservoirs=[nothing, res], δ_site=0.03,
+                         torsion_φ=0.3, sample_every=1, block_size=50, R_every=10)
+    Rbar = M.mean(mc.R)
+    @printf("# ν = <R>_MC = %.4g (500 MC sweeps)\n", Rbar)
     # no ladder: the solute is an ordinary flexible molecule with the solvent-style rejection-free moves (T, R, site,
     # torsion slots, half-angle φ), every water with T/R slots — the move set validated on liquid ethanol (JOURNAL 117)
     r = M.init_rigid_ekmc_run(sys, ff; events=n, sample_every=100, block_events=max(1000, n ÷ 20), reservoirs=[nothing, res],
@@ -59,6 +65,8 @@ else
     end
     wsum = sum(pop[1, :])
     @printf("# eKMC: solvent L-moves fired per kind (T R C S D) %s; solute is mover %d\n", string(r.slmoves.n_move), r.slmoves.pos[isol])
+    @printf("# eKMC event breakdown: events %d, relocations %d, overlap bursts %d, solvent L-moves %d, refreshes %d\n", r.ev, r.n_reloc, r.n_bursts, sum(r.slmoves.n_move), r.slmoves.n_refresh)
+    changes .= -1                                         # eKMC mode samples histograms only; transitions are not counted
 end
 @printf("RESULT %s seed=%d n=%d φmax=%.3f time=%.0fs  ", mode, seed, n, φ, time() - t0)
 for k in 1:3

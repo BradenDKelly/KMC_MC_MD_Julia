@@ -98,3 +98,33 @@ end
     ff = MCc.SiteForceField([1.0], [1.0]; rc=4.0, coulomb=:rf)
     @test_throws ErrorException MCc.kT_overlap_cap(ff, [bad], 1.0; n_orient=500)
 end
+
+@testset "Overlap cap is symmetric in the molecule pair (all row paths; JOURNAL 2026-10-21)" begin
+    # Regression: the cap value was that of the first overlapping site pair in the CALLER's loop order, so with two
+    # different type pairs overlapping u_ij ≠ u_ji (ethanol molecules 3/5 below: 286.35 vs 424.73) and the total
+    # energy of an overlapped state depended on summation order. The configuration: 64 flexible ethanols at 1/8 of
+    # the liquid density, two of them relocated to random points with pool conformers (the bookkeeping check).
+    m = MCc.spce_solute_model(:ethanol_flex; coulomb=:rf, epsilon_rf=Inf, cutoff=:site, rc_angstrom=9.0)
+    t = m.templates[2]; ff = m.ff; β = m.ϵ_kelvin / 298.0; N = 64
+    L = cbrt(N / (0.785 / 46.07 * 6.02214076e23 / 1e24)) / m.σ_angstrom
+    sys = MCc.RigidSystem([t], fill(1, N), 2L, β, Xoshiro(104)); MCc.random_rigid_system!(sys, ff)
+    res = MCc.build_reservoir([t], 1, ff, β, Xoshiro(204); M=200, burnin_sweeps=500, stride_sweeps=20, δ=0.02, torsion=false)
+    rng = Xoshiro(7)
+    for _ in 1:2
+        k = rand(rng, 1:N)
+        MCc.set_conformation!(sys, k, MCc.draw_conformer(res, rng)); MCc.set_molecule!(sys, k, rand(rng, 3) .* sys.L, [1.0, 0, 0, 0])
+    end
+    caps = Set(ff.ucap_mix)
+    ncap = count(MCc.pair_energy(sys, ff, i, j) in caps for i in 1:N-1 for j in i+1:N)
+    @test ncap >= 1                                            # the configuration does contain overlapped pairs
+    @test all(MCc.pair_energy(sys, ff, i, j) ≈ MCc.pair_energy(sys, ff, j, i) for i in 1:N for j in 1:N if i != j)
+    @test all(MCc.pair_energy_virial(sys, ff, i, j)[1] ≈ MCc.pair_energy_virial(sys, ff, j, i)[1] for i in 1:N for j in 1:N if i != j)
+    @test MCc.total_pair_energy(sys, ff) ≈ sum(MCc.removal_energy(sys, ff, i) for i in 1:N) / 2
+    ref = [MCc.pair_energy(sys, ff, k, j) for k in 1:N, j in 1:N]
+    ru = zeros(N); rw = zeros(N)
+    s2 = deepcopy(sys); MCc.attach_cells!(s2, ff)              # site cell list rows
+    @test all(begin MCc.eval_row!(ru, rw, s2, ff, k); all(isapprox.(ru[1:N .!= k], ref[k, 1:N .!= k]; atol=1e-9)) end for k in 1:N)
+    s3 = deepcopy(sys); MCc.attach_device_pairs!(s3, ff; backend=:cpu, precision=:double)   # device kernel (CPU backend)
+    @test all(begin MCc.eval_row!(ru, rw, s3, ff, k); all(isapprox.(ru[1:N .!= k], ref[k, 1:N .!= k]; atol=1e-9)) end for k in 1:N)
+    @test MCc.capped_overlaps(sys, ff, 5)[2] ≈ sum(ref[5, j] for j in 1:N if j != 5 && ref[5, j] in caps)
+end
