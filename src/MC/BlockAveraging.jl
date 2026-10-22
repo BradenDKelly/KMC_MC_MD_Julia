@@ -75,3 +75,38 @@ function stderr(ba::BlockAverager)::Float64
     variance = sum_sq_diff / (n - 1)
     return sqrt(variance / n)
 end
+
+"""
+    statistical_inefficiency(x; mintime=3)::Float64
+
+Statistical inefficiency g of a time series, g = 1 + 2 Σ_{t≥1} (1 − t/N) C_t with C_t the normalised autocorrelation,
+summed until C_t ≤ 0 for t > mintime; g ≥ 1. Same estimator as pymbar.timeseries.statisticalInefficiency
+(fast=false, mintime=3): Chodera, Swope, Pitera, Seok & Dill, J. Chem. Theory Comput. 3 (2007) 26; Chodera,
+J. Chem. Theory Comput. 12 (2016) 1799. A series with zero variance returns 1.
+"""
+function statistical_inefficiency(x::AbstractVector{<:Real}; mintime::Int=3)::Float64
+    N = length(x)
+    N < 2 && return 1.0
+    m = sum(x) / N
+    d = [xi - m for xi in x]
+    σ2 = sum(abs2, d) / N
+    σ2 == 0 && return 1.0
+    g = 1.0
+    for t in 1:N-2
+        C = sum(d[i] * d[i+t] for i in 1:N-t) / (N - t) / σ2
+        C <= 0 && t > mintime && break
+        g += 2 * C * (1 - t / N)
+    end
+    return max(g, 1.0)
+end
+
+"""
+    stderr_corrected(ba::BlockAverager)::Float64
+
+Standard error of the mean corrected for correlation that survives the blocking: `stderr(ba) * sqrt(g)`, with g the
+statistical inefficiency of the block-mean series (`statistical_inefficiency`). Equals `stderr(ba)` when the block means
+are uncorrelated (g = 1). Returns NaN if there are fewer than 2 blocks. Used for the MC side of MC↔eKMC comparisons, whose
+blocks are shorter than the MC correlation time (JOURNAL 2026-10-22: SPC/E N=48 τ ≈ 400–550 sweeps vs 100-sweep blocks).
+"""
+stderr_corrected(ba::BlockAverager)::Float64 =
+    length(ba.block_means) < 2 ? NaN : stderr(ba) * sqrt(statistical_inefficiency(ba.block_means))

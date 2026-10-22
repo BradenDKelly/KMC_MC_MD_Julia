@@ -260,6 +260,8 @@ include("test_ekmc_energy_consistency.jl")
 include("test_electrostatics_nist.jl")
 
 # Rigid molecules (LJ sites + Wolf charges): identities, detailed balance, MC vs eKMC
+include("test_time_average.jl")
+include("test_statistical_inefficiency.jl")
 include("test_rigid_molecules.jl")
 
 # Intramolecular energies vs GROMACS (flexible molecules, DESIGN §7 T7.0)

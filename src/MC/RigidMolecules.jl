@@ -2548,14 +2548,25 @@ function ratio_jackknife_stderr(b::TimeWeightedBlockAverager; f=identity)
     θ̄ = sum(θ) / n
     return sqrt((n - 1) / n * sum((θk - θ̄)^2 for θk in θ))
 end
-function mean(b::TimeWeightedBlockAverager)
+"""
+    mean(b::TimeWeightedBlockAverager) = ratio_mean(b);  stderr(b) = ratio_jackknife_stderr(b)
+
+The kMC time average over the whole run, Σ_k X_k / Σ_k T_k, and its jackknife error. Until 2026-10-22 these were
+the equal-weight mean of the block ratios and its standard error, which is biased when the block times T_k differ:
+in relocation-dominated liquid ethanol T_k spans ~47 decades and the equal-weight mean of U was 1.2 kJ/mol high
+(JOURNAL 2026-10-21, 222217). For equal block times (MC samples, dt = 1) both definitions coincide. The old
+estimator is kept as `block_ratio_mean` / `block_ratio_stderr` for diagnostics only.
+"""
+mean(b::TimeWeightedBlockAverager) = ratio_mean(b)
+stderr(b::TimeWeightedBlockAverager) = ratio_jackknife_stderr(b)
+function block_ratio_mean(b::TimeWeightedBlockAverager)
     isempty(b.block_means) && return b.sum_t > 0 ? b.sum_x / b.sum_t : NaN
     return sum(b.block_means) / length(b.block_means)
 end
-function stderr(b::TimeWeightedBlockAverager)
+function block_ratio_stderr(b::TimeWeightedBlockAverager)
     n = length(b.block_means)
     n < 2 && return NaN
-    m = mean(b)
+    m = block_ratio_mean(b)
     return sqrt(sum((x - m)^2 for x in b.block_means) / (n - 1) / n)
 end
 

@@ -16,15 +16,18 @@ const MCs = MolSim.MC
     recip === :ewald ? MCs.attach_ewald!(sys, m.ff; rtol=1e-5) :   # :mixed (GROMACS convention), as in production
                        MCs.attach_pme!(sys, m.ff; spacing=1.2 / m.σ_angstrom, order=4)   # GROMACS defaults
     st = MCs.RigidMCStats()
-    for _ in 1:300, _ in 1:N
+    # MC equilibration from the random start: 4100 sweeps = the largest transient detected by automated equilibration
+    # detection (Chodera, JCTC 12 (2016) 1799) in probe 222240 (N=48 Ewald/PME, seeds 21/22: t0 = 0–3800 sweeps after the
+    # former 300) and in 222109_2 (N=216: 1700). JOURNAL 2026-10-22.
+    for _ in 1:4100, _ in 1:N
         MCs.mc_translate!(sys, m.ff, rand(sys.rng, 1:N), 0.1, st); MCs.mc_rotate!(sys, m.ff, rand(sys.rng, 1:N), 0.3, st)
     end
     mc = MCs.run_rigid_mc!(sys, m.ff; sweeps=3000, δ=0.1, δθ=0.3, sample_every=1, block_size=100)
     events = 600_000
-    ek = MCs.run_rigid_ekmc!(sys, m.ff; events=events, sample_every=10, block_events=events ÷ 25, burnin_events=events ÷ 10,
+    ek = MCs.run_rigid_ekmc!(sys, m.ff; events=events, sample_every=10, block_events=events ÷ 25, burnin_events=0,   # equilibrated start (MC end state): no event burn-in (JOURNAL 2026-10-22)
                              debug_check_every=events ÷ 5, local_solvent=true, solvent_nu=1e-3, mc_δ=0.1, mc_δθ=0.3)
-    @info "SPC/E $(recip) MC vs eKMC" MCs.mean(mc.U) MCs.stderr(mc.U) MCs.mean(ek.U) MCs.stderr(ek.U) MCs.mean(mc.P) MCs.stderr(mc.P) MCs.mean(ek.P) MCs.stderr(ek.P) ek.relocations
-    @test abs(MCs.mean(mc.U) - MCs.mean(ek.U)) <= 3 * sqrt(MCs.stderr(mc.U)^2 + MCs.stderr(ek.U)^2)
+    @info "SPC/E $(recip) MC vs eKMC" MCs.mean(mc.U) MCs.stderr_corrected(mc.U) MCs.mean(ek.U) MCs.stderr(ek.U) MCs.mean(mc.P) MCs.stderr_corrected(mc.P) MCs.mean(ek.P) MCs.stderr(ek.P) ek.relocations
+    @test abs(MCs.mean(mc.U) - MCs.mean(ek.U)) <= 3 * sqrt(MCs.stderr_corrected(mc.U)^2 + MCs.stderr(ek.U)^2)
     # pressure with the reciprocal molecular virial (E6: Ewald and the PME split)
-    @test abs(MCs.mean(mc.P) - MCs.mean(ek.P)) <= 3 * sqrt(MCs.stderr(mc.P)^2 + MCs.stderr(ek.P)^2)
+    @test abs(MCs.mean(mc.P) - MCs.mean(ek.P)) <= 3 * sqrt(MCs.stderr_corrected(mc.P)^2 + MCs.stderr(ek.P)^2)
 end

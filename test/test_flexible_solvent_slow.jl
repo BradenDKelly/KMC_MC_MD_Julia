@@ -31,20 +31,23 @@ end
     res = MCs.build_reservoir([t], 1, ff, β, Xoshiro(5); M=4000, burnin_sweeps=500, stride_sweeps=20, δ=0.02)
     nt = length(MCs.rotatable_bonds(t))
     δ, δθ, δs, φ = 0.05, 0.15, 0.01, 0.5                         # step sizes: efficiency choices
-    MCs.run_rigid_mc!(sys, ff; sweeps=1000, δ=δ, δθ=δθ, sample_every=100, block_size=5, reservoirs=[res],
-                      δ_site=δs, torsion_φ=φ)                    # common equilibration
-    mc = MCs.run_rigid_mc!(deepcopy(sys), ff; sweeps=12_000, δ=δ, δθ=δθ, sample_every=2, block_size=200,
+    # common equilibration: 1000 + 5600 sweeps. 5600 = largest t0 from automated equilibration detection (Chodera,
+    # JCTC 12 (2016) 1799) after the former 1000 in probe 222240_5–8 (ethanol RF, seeds 1–4: t0 = 0–5600; JOURNAL 2026-10-22)
+    MCs.run_rigid_mc!(sys, ff; sweeps=6600, δ=δ, δθ=δθ, sample_every=100, block_size=5, reservoirs=[res],
+                      δ_site=δs, torsion_φ=φ)
+    sysmc = deepcopy(sys)
+    mc = MCs.run_rigid_mc!(sysmc, ff; sweeps=12_000, δ=δ, δθ=δθ, sample_every=2, block_size=200,
                            reservoirs=[res], δ_site=δs, torsion_φ=φ)
     ν = 1e-3
     events = 3_000_000
-    ek = @test_logs min_level=Base.CoreLogging.Warn MCs.run_rigid_ekmc!(deepcopy(sys), ff; events=events, sample_every=20,
-            block_events=events ÷ 25, burnin_events=events ÷ 10, debug_check_every=events ÷ 6, reservoirs=[res],
+    ek = @test_logs min_level=Base.CoreLogging.Warn MCs.run_rigid_ekmc!(deepcopy(sysmc), ff; events=events, sample_every=20,   # starts from the MC end state
+            block_events=events ÷ 25, burnin_events=0, debug_check_every=events ÷ 6, reservoirs=[res],   # equilibrated start: no event burn-in (JOURNAL 2026-10-22)
             local_solvent=true, solvent_flexible=true, solvent_nu=ν, mc_δ=δ, mc_δθ=δθ, solvent_site_a=δs, solvent_φ=φ)
     S = ek.slmoves
     kJ = m.ϵ_kelvin * 0.0083144626
-    @info "liquid ethanol (RF, N=64): MC vs eKMC + flexible solvent L-moves (kJ/mol)" MCs.mean(mc.U) * kJ MCs.stderr(mc.U) * kJ MCs.mean(ek.U) * kJ MCs.stderr(ek.U) * kJ MCs.mean(mc.U_intra) * kJ MCs.stderr(mc.U_intra) * kJ MCs.mean(ek.U_intra) * kJ MCs.stderr(ek.U_intra) * kJ MCs.mean(mc.P) MCs.stderr(mc.P) MCs.mean(ek.P) MCs.stderr(ek.P) S.kinds S.n_move S.n_refresh ek.relocations nt
+    @info "liquid ethanol (RF, N=64): MC vs eKMC + flexible solvent L-moves (kJ/mol)" MCs.mean(mc.U) * kJ MCs.stderr_corrected(mc.U) * kJ MCs.mean(ek.U) * kJ MCs.stderr(ek.U) * kJ MCs.mean(mc.U_intra) * kJ MCs.stderr_corrected(mc.U_intra) * kJ MCs.mean(ek.U_intra) * kJ MCs.stderr(ek.U_intra) * kJ MCs.mean(mc.P) MCs.stderr_corrected(mc.P) MCs.mean(ek.P) MCs.stderr(ek.P) S.kinds S.n_move S.n_refresh ek.relocations nt
     @test nt >= 1 && MCs.LM_D in S.kinds && all(S.n_move[[MCs.LM_T, MCs.LM_R, MCs.LM_S, MCs.LM_D]] .> 0)
-    @test fss_within3σ(MCs.mean(mc.U), MCs.stderr(mc.U), MCs.mean(ek.U), MCs.stderr(ek.U))
-    @test fss_within3σ(MCs.mean(mc.U_intra), MCs.stderr(mc.U_intra), MCs.mean(ek.U_intra), MCs.stderr(ek.U_intra))
-    @test fss_within3σ(MCs.mean(mc.P), MCs.stderr(mc.P), MCs.mean(ek.P), MCs.stderr(ek.P))
+    @test fss_within3σ(MCs.mean(mc.U), MCs.stderr_corrected(mc.U), MCs.mean(ek.U), MCs.stderr(ek.U))
+    @test fss_within3σ(MCs.mean(mc.U_intra), MCs.stderr_corrected(mc.U_intra), MCs.mean(ek.U_intra), MCs.stderr(ek.U_intra))
+    @test fss_within3σ(MCs.mean(mc.P), MCs.stderr_corrected(mc.P), MCs.mean(ek.P), MCs.stderr(ek.P))
 end

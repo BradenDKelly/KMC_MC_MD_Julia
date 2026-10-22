@@ -359,7 +359,8 @@ end
     # unequal block times: ratio of sums ≠ mean of block ratios (the biased blocked estimator)
     b3 = MCm.TimeWeightedBlockAverager(1)
     push!(b3, 1.0, 1.0); push!(b3, 3.0, 9.0)
-    @test MCm.ratio_mean(b3) ≈ 2.8 && MCm.mean(b3) ≈ 2.0
+    @test MCm.ratio_mean(b3) ≈ 2.8 && MCm.block_ratio_mean(b3) ≈ 2.0
+    @test MCm.mean(b3) == MCm.ratio_mean(b3)            # mean is the time average since 2026-10-22 (test_time_average.jl)
     @test isnan(MCm.ratio_jackknife_stderr(MCm.TimeWeightedBlockAverager(1)))
 end
 
