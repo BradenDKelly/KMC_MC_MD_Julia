@@ -33,6 +33,13 @@ SPCE_NU_SOURCE=ekmc with mc_sweeps > 0 keeps MC only as the starting configurati
 """
 
 using MolSim, Random, StaticArrays, Printf, Dates, Serialization
+# SPCE_DEVICE=cuda: device pair rows + solvent-candidate bank (DESIGN §15.5) and, with PME, the mesh gathers (§16) on the GPU,
+# exactly as dev/mixture_ekmc.jl (MIX_DEVICE); eKMC stage only (MC stays on the host). Needs an environment with CUDA
+# (envs/molsim_gpu_*). Device state is never serialized: detached around checkpoints.
+const SPCE_DEVICE = Symbol(get(ENV, "SPCE_DEVICE", "none"))
+if SPCE_DEVICE === :cuda
+    using CUDA
+end
 t_script = time()   # SPCE_WALL_SECONDS counts from here, so a first piece's set-up (reservoir, MC or eKMC burn-in) is inside the budget
 const MCm = MolSim.MC
 
@@ -117,6 +124,25 @@ function tail_report(io, phi, dt, β, name)
     q(p) = β * phi[o2[searchsortedfirst(c, p)]]
     @printf(io, "# %s tail: samples=%d  Kish n_eff=%.1f  share of Σw from top 0.1%%/1%%/10%% of samples = %.3f/%.3f/%.3f  βu quantiles 5/50/95/99.9%% = %.2f/%.2f/%.2f/%.2f  max βu=%.2f\n",
             name, n, neff, frac(0.001), frac(0.01), frac(0.1), q(0.05), q(0.5), q(0.95), q(0.999), β * maximum(phi))
+end
+
+# device residency (SPCE_DEVICE=cuda) for an eKMC run r on sys: attached for the pilot and production, detached
+# around every serialize (CuArrays are not checkpointable)
+function dev_attach!(sys, r, ff)
+    SPCE_DEVICE === :none && return nothing
+    S = r.slmoves
+    np = S === nothing ? 1 : length(S.kinds) * length(S.mols) + 1
+    MCm.attach_device_pairs!(sys, ff; backend=SPCE_DEVICE, precision=:double, max_poses=max(np, 64))
+    S === nothing || MCm.slm_attach_device!(S, sys, ff)
+    sys.recip isa MCm.PMERecip && MCm.pme_attach_device!(sys.recip, sys; backend=SPCE_DEVICE)
+    return nothing
+end
+function dev_detach!(sys, r)
+    sys.dev = nothing
+    S = r.slmoves
+    S === nothing || (S.dbase = 0; S.crP === nothing || (S.crP.dev = nothing))
+    sys.recip isa MCm.PMERecip && (sys.recip.dev = nothing; sys.recip.backend = :cpu)
+    return nothing
 end
 
 function setup_and_mc(io)
@@ -240,7 +266,7 @@ function setup_and_mc(io)
         rp = MCm.init_rigid_ekmc_run(sys, ff; events=nb_in + nu_pilot, burnin_events=nb_in, sample_every=100,
                                      block_events=max(25, nu_pilot ÷ 25), species_mu=true, reservoirs=reservoirs,
                                      local_solvent=solvent_local, solvent_nu=solvent_local ? νs_pilot : NaN)
-        MCm.advance_rigid_ekmc!(rp, sys, ff)
+        dev_attach!(sys, rp, ff); MCm.advance_rigid_ekmc!(rp, sys, ff); dev_detach!(sys, rp)
         rpr = MCm.rigid_ekmc_results(rp)
         R_w = MCm.ratio_mean(rpr.RN_species[1]); R_s = MCm.ratio_mean(rpr.RN_species[2])
         R_mc = R_w * N / Nt + R_s / Nt                               # per-molecule ⟨R/N⟩ as ⟨R⟩_MC
@@ -376,6 +402,8 @@ else
     isempty(ckpt) || save_checkpoint(ckpt, (sys, r, ff, ctx))
     io = open(ctx.out, "a")
 end
+dev_attach!(sys, r, ff)
+SPCE_DEVICE === :none || println(io, "# device $(SPCE_DEVICE): pair rows, solvent-candidate bank$(sys.recip isa MCm.PMERecip ? ", PME mesh gathers" : "") ($(Dates.now()), host $(gethostname()))")
 # eKMC in slices of SPCE_CKPT_EVERY seconds with a checkpoint after each, so a requeued or killed job loses at most
 # one slice (Slurm requeued 205893_1 twice, JOURNAL entry 32); the slices do not change the trajectory (test_ekmc_checkpoint.jl)
 t_start = t_script
@@ -386,7 +414,7 @@ while r.ev < r.events
     MCm.advance_rigid_ekmc!(r, sys, ff; wall_seconds=isempty(ckpt) ? left : min(left, ckpt_every))
     global ctx = merge(ctx, (; t_ek=ctx.t_ek + time() - t0))
     if r.ev < r.events && !isempty(ckpt)
-        save_checkpoint(ckpt, (sys, r, ff, ctx))
+        dev_detach!(sys, r); save_checkpoint(ckpt, (sys, r, ff, ctx)); dev_attach!(sys, r, ff)
         println(io, "# checkpoint at event $(r.ev) of $(r.events)  $(Dates.now())  eKMC wall time so far $(round(ctx.t_ek; digits=0)) s"); flush(io)
     end
 end
@@ -398,5 +426,5 @@ end
 ekmc_report(io, MCm.rigid_ekmc_results(r), ctx)
 dihedral_report(io, r)
 close(io)
-isempty(ckpt) || (save_checkpoint(ckpt, (sys, r, ff, ctx)); mv(ckpt, ckpt * ".final"; force=true))
+isempty(ckpt) || (dev_detach!(sys, r); save_checkpoint(ckpt, (sys, r, ff, ctx)); mv(ckpt, ckpt * ".final"; force=true))
 println(read(ctx.out, String))
