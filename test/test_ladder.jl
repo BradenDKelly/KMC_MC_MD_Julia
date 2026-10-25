@@ -235,3 +235,61 @@ end
     @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
     @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
 end
+
+@testset "Coupling ladder: 1/t Wang–Landau schedule (Belardinelli & Pereyra 2007)" begin
+    λ = MCm.LADDER_LAMBDA_DEFAULT; K = length(λ)
+    # switch at a halving: flat visits with dt = 1; the flatness check at event 1000 halves f to 0.5, and with
+    # ν = 0.002 the 1/t value is K/(ν T) = 10/(0.002·1000) = 5 ≥ 0.5, so the run switches to f = 1/t there
+    ν = 0.002
+    L = MCm.CouplingLadder(1, λ, 100; ν=ν, wl_events=2000, wl_1t=true)
+    @test L.wl_1t && L.wl_f == 1.0 && !MCm.ladder_production(L)
+    for ev in 1:999
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test !L.wl_phase1t && L.wl_f == 1.0 && L.η[end] == 0.0
+    MCm.wl_update!(L, 1000, 1.0, 10)
+    @test L.wl_phase1t && L.wl_stages == 1 && L.wl_f ≈ K / (ν * 1000.0)
+    @test MCm.ladder_production(L) && MCm.adapting(L) && L.ev_frozen == 1000     # production starts at the switch, η keeps adapting
+    for ev in 1001:1999
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test L.wl_f ≈ K / (ν * 1999.0) && MCm.ladder_production(L)
+    for ev in 2000:2001                                                         # past the budget: unchanged schedule, no freeze
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test L.wl_f ≈ K / (ν * 2001.0) && MCm.adapting(L) && L.ev_frozen == 1000
+    # no halving before the budget: f = 1/t from the budget on
+    L2 = MCm.CouplingLadder(1, λ, 100; ν=2.0, wl_events=50, wl_1t=true)
+    for ev in 1:49
+        MCm.wl_update!(L2, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test !L2.wl_phase1t && L2.wl_f == 1.0 && !MCm.ladder_production(L2)
+    MCm.wl_update!(L2, 50, 1.0, 10)
+    @test L2.wl_phase1t && L2.wl_f ≈ K / (2.0 * 50.0) && MCm.ladder_production(L2) && L2.ev_frozen == 50
+    @test_throws ErrorException MCm.CouplingLadder(1, λ, 100; ν=2.0, wl_events=50, wl_1t=true, adapt_blocks=true)
+end
+
+@testset "Coupling ladder: 1/t Wang–Landau adapting through production; μ (occupancy, MBAR) = stock" begin
+    N = 32; T = 1.5; ρ = 0.4
+    S = dimer_system(1.0, N, T, ρ, 11)
+    events = 2_000_000
+    stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                reservoirs=[nothing, S.res])
+    r2 = stock.RN_species[2]
+    μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+    K = length(MCm.LADDER_LAMBDA_DEFAULT)
+    # start from flat η = 0 (far from the converged weights) so the adaptation has work to do
+    lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                              reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_wl_events=events ÷ 4,
+                              ladder_eta=zeros(K), ladder_wl_1t=true, debug_check_every=events ÷ 4)
+    Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+    @test Ld.wl_phase1t && MCm.adapting(Ld) && Ld.wl_f ≈ K / (Ld.ν * Ld.wl_T)    # still adapting at the end, on the 1/t schedule
+    @test Ld.ev_frozen > 0 && MCm.nblocks(Ld) >= 15 && all(sm.t_rung .> 0)
+    μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+    μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+    @info "ladder 1/t Wang–Landau (easy solute, η₀ = 0)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb sm.frac_rung sm.η sm.wl_stages Ld.wl_f
+    @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+    @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+    @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+end

@@ -2700,7 +2700,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
@@ -2777,7 +2777,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         ladder = CouplingLadder(ladder_solute, ladder_lambda, block_events; η=η0, ν=ladder_nu, wl_events=ladder_wl_events,
                                 wl_fmin=ladder_wl_fmin, wl_flat=ladder_wl_flat,
                                 csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac),
-                                adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp,
+                                adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp, wl_1t=ladder_wl_1t,
                                 jump=ladder_jump, jump_ν=isnan(ladder_jump_nu) ? ladder_nu : ladder_jump_nu,
                                 jump_max=ladder_jump_max > 0 ? ladder_jump_max : length(ladder_lambda))
         ek.frac = ladder_solute; ek.lam[ladder_solute] = 1.0
@@ -2954,8 +2954,8 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         end
         Rtot = R + λ + w_up + w_dn + w_hub + w_loc + w_ref + w_sl + w_slref   # total event rate incl. the MC-kernel event, the rung hops, the λ = 0 hub jumps and the L-moves
         # with a ladder the standard observables are read at the fully coupled rung only, after η is frozen
-        coupled_now = ladder === nothing || (coupled(ladder) && !adapting(ladder))
-        ladder_prod = ladder !== nothing && !adapting(ladder) && ev > burnin_events
+        coupled_now = ladder === nothing || (coupled(ladder) && ladder_production(ladder))
+        ladder_prod = ladder !== nothing && ladder_production(ladder) && ev > burnin_events
         u = rand(sys.rng); u = max(eps(Float64), min(u, 1.0 - eps(Float64)))
         dt = log(1 / u) / Rtot
         V = sys.L^3
@@ -3330,6 +3330,9 @@ accumulators give `ladder_mu_occupancy` and `ladder_mu_mbar`; `ladder_summary` r
 `ladder_adapt_blocks=true` re-flattens η at every production block boundary from the previous block's rung times (the
 occupancy estimator uses the η in force in each block; MBAR is η-independent) — for solvents where WL cannot converge
 within its budget (water, JOURNAL entry 45).
+`ladder_wl_1t=true` uses the 1/t Wang–Landau of Belardinelli & Pereyra (Phys. Rev. E 75 (2007) 046701) instead of
+halving-and-freeze: η keeps adapting (f = 1/t) through production, which starts after `ladder_wl_events`
+(`CouplingLadder`, `_wl_update_1t!`).
 `ladder_jump_max=m` limits the hub to rungs 3…m (both directions). `ladder_local=true` adds rejection-free local moves of the
 fractional molecule at every rung with λ > 0 (`LocalMoves`, DESIGN §11.2): `local_kinds` slots (default 3 translations,
 3 rotations, 2 conformer swaps if flexible), half-widths `local_a` (default `mc_δ`) and `local_θ` (default `mc_δθ`),
@@ -3361,7 +3364,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0,
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
@@ -3380,7 +3383,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             bar_species=bar_species, ladder_solute=ladder_solute, ladder_lambda=ladder_lambda, ladder_nu=ladder_nu,
                             ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
                             ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac,
-                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, mc_local_radius=mc_local_radius,
+                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, ladder_wl_1t=ladder_wl_1t, mc_local_radius=mc_local_radius,
                             ladder_jump=ladder_jump, ladder_jump_nu=ladder_jump_nu, ladder_jump_max=ladder_jump_max,
                             ladder_local=ladder_local, local_kinds=local_kinds, local_a=local_a, local_θ=local_θ,
                             local_nu=local_nu, local_nuD=local_nuD, local_internal=local_internal, local_site_a=local_site_a,

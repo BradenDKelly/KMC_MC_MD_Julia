@@ -23,10 +23,17 @@ At rung 1 the molecule is absent (m_s = 0, pose integrated out: weight V e^{−�
 ladder {0, 1} with zero sojourn at λ = 0 (DESIGN §10.4). u_s is the BARE (unscaled, capped) energy of s with the rest.
 The fractional-molecule idea is CFCMC (Shi & Maginn, J. Chem. Theory Comput. 3 (2007) 1451); the weights η are
 learned by Wang–Landau (Phys. Rev. Lett. 86 (2001) 2050) on the rung visits and then frozen, so the production
-run is a fixed Markov process with exact time weights.
+run is a fixed Markov process with exact time weights. Optional `wl_1t=true`: the 1/t Wang–Landau of Belardinelli &
+Pereyra (Phys. Rev. E 75 (2007) 046701; J. Chem. Phys. 127 (2007) 184105) instead: f halves on flatness until
+f ≤ 1/t, then f = 1/t for the rest of the run (no flatness check, no freeze), with t = ν·T_WL/K the number of
+visit-equivalents per rung (T_WL = kMC time since the start of Wang–Landau). Production starts at the switch
+to 1/t (forced when the `wl_events` budget is spent first) while η keeps adapting; MBAR is
+η-independent, and the occupancy estimator integrates the η in force at every event (below).
 
 Estimators of βμ_ex = −ln(Z_K / Z_1) (Z_1 = V Z_rest):
   occupancy  βμ_ex = (η_K − η_1) − ln(t_K / t_1)             (t_k = kMC time at rung k, production)
+             with wl_1t: e^{−βμ_ex} = ∫ 1_K e^{−η_K(t)} dt / ∫ 1_1 e^{−η_1(t)} dt (η in force at each event; exact
+             for constant η, and as η converges under the 1/t schedule)
   MBAR       over the rung histograms of βu_s (Shirts & Chodera, J. Chem. Phys. 129 (2008) 124105), reduced
              potentials u_k = βλ_k u_s; rung-1 samples are the recoupling landings (counts), rungs ≥ 2 the
              time-weighted histograms with Kish effective sample sizes.
@@ -82,12 +89,17 @@ mutable struct CouplingLadder
     res_max::Vector{Float64}
     pres_t::Float64
     pres_max::Vector{Float64}
+    # 1/t Wang–Landau (Belardinelli & Pereyra 2007): adaptation continues through production
+    wl_1t::Bool
+    wl_T::Float64                              # kMC time since the start of Wang–Landau
+    wl_phase1t::Bool                           # f = K/(ν·wl_T) from here on
+    occ_w::Vector{Vector{Float64}}             # per block, per rung: Σ Δt e^{−η_k} with the η in force (wl_1t occupancy)
 end
 function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η::Union{Nothing,Vector{Float64}}=nothing,
                         ν::Float64, wl_events::Int=0, wl_f0::Float64=1.0, wl_fmin::Float64=1e-3, wl_flat::Float64=0.8,
                         βu_min::Float64=-150.0, βu_max::Float64=1050.0, dβu::Float64=0.1,
                         csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0,
-                        jump::Bool=false, jump_ν::Float64=ν, jump_max::Int=length(λ))
+                        jump::Bool=false, jump_ν::Float64=ν, jump_max::Int=length(λ), wl_1t::Bool=false)
     K = length(λ)
     K >= 2 || error("CouplingLadder: at least two rungs")
     (λ[1] == 0.0 && λ[end] == 1.0 && issorted(λ) && allunique(λ)) || error("CouplingLadder: λ must increase from 0 to 1")
@@ -96,11 +108,13 @@ function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η:
     length(ηv) == K || error("CouplingLadder: η needs one weight per rung")
     nb = ceil(Int, (βu_max - βu_min) / dβu)
     3 <= jump_max <= K || error("CouplingLadder: jump_max must be in 3…K")
+    (wl_1t && adapt_blocks) && error("CouplingLadder: wl_1t and adapt_blocks are alternative adaptation schemes")
     CouplingLadder(solute, copy(λ), ηv, K, ν, wl_events > 0 ? wl_f0 : 0.0, wl_fmin, wl_flat, zeros(K), wl_events,
                    0, wl_events > 0 ? 0 : -1, block_events, 0, βu_min, dβu, nb,
                    Vector{Float64}[], Vector{Float64}[], Vector{Vector{Float64}}[], zeros(Int, K), 0, 0,
                    _hub_csol(csol === nothing ? ones(K) : copy(csol), jump), adapt_blocks, adapt_damp, Vector{Float64}[],
-                   jump, jump_ν, zeros(Int, K), jump_max, 0, 0.0, zeros(K), 0.0, zeros(K))
+                   jump, jump_ν, zeros(Int, K), jump_max, 0, 0.0, zeros(K), 0.0, zeros(K),
+                   wl_1t && wl_events > 0, 0.0, false, Vector{Float64}[])
 end
 # with the λ = 0 hub the fractional molecule is not relocated at rungs ≥ 3 (it moves through rung 1)
 function _hub_csol(c::Vector{Float64}, jump::Bool)
@@ -123,6 +137,8 @@ solute_rate_scale(λ::Vector{Float64}, ν::Float64, βμ_guess::Float64; frac::F
 nrungs(L::CouplingLadder) = length(L.λ)
 coupled(L::CouplingLadder) = L.k == nrungs(L)
 adapting(L::CouplingLadder) = L.wl_f > 0.0
+"Production accumulates: η frozen, or (1/t Wang–Landau) on the 1/t schedule while η keeps adapting."
+ladder_production(L::CouplingLadder) = !adapting(L) || (L.wl_1t && L.wl_phase1t)
 _lbin(L::CouplingLadder, βu::Float64) = clamp(floor(Int, (βu - L.βu_min) / L.dβu) + 1, 1, L.nbins)
 _lblock(L::CouplingLadder) = (L.n_ev - 1) ÷ L.block_events + 1
 function _ensure_lblock!(L::CouplingLadder, b::Int)
@@ -139,7 +155,7 @@ function _ensure_lblock!(L::CouplingLadder, b::Int)
                 L.η .-= L.η[end]
             end
         end
-        push!(L.t_rung, zeros(K)); push!(L.t2_rung, zeros(K)); push!(L.hist, [zeros(L.nbins) for _ in 1:K])
+        push!(L.t_rung, zeros(K)); push!(L.t2_rung, zeros(K)); push!(L.hist, [zeros(L.nbins) for _ in 1:K]); push!(L.occ_w, zeros(K))
         push!(L.η_blocks, copy(L.η))                       # η in force during this block
     end
 end
@@ -201,6 +217,7 @@ min_k t_k ≥ wl_flat · mean_k t_k; η is frozen (and shifted to η_K = 0) when
 """
 function wl_update!(L::CouplingLadder, ev::Int, dt::Float64, k::Int)
     adapting(L) || return nothing
+    L.wl_1t && return _wl_update_1t!(L, ev, dt, k)
     L.η[k] -= L.wl_f * L.ν * dt
     L.wl_hist[k] += dt
     L.wl_events_left -= 1
@@ -220,6 +237,38 @@ function wl_update!(L::CouplingLadder, ev::Int, dt::Float64, k::Int)
     return nothing
 end
 
+"""
+1/t Wang–Landau (Belardinelli & Pereyra, Phys. Rev. E 75 (2007) 046701) in the continuous-time form of `wl_update!`:
+η_k −= f·ν·dt; the usual halving on time-flatness (checked every 1000 events) until a halving gives f ≤ 1/t
+(t = ν·T_WL/K); from then on f = 1/t at every event, with no flatness check and no freeze. When the `wl_events`
+budget is spent before the switch, f = 1/t from there. Production starts at the switch (`ev_frozen`). η is shifted to η_K = 0 after every update (hop rates and both estimators
+depend on differences only), which keeps e^{−η} finite in the occupancy integral.
+"""
+function _wl_update_1t!(L::CouplingLadder, ev::Int, dt::Float64, k::Int)
+    K = nrungs(L)
+    L.η[k] -= L.wl_f * L.ν * dt
+    L.wl_T += dt
+    L.wl_events_left -= 1
+    f1t = K / (L.ν * L.wl_T)
+    if L.wl_phase1t
+        L.wl_f = f1t
+    else
+        sw = false
+        L.wl_hist[k] += dt
+        if ev % 1000 == 0
+            tt = sum(L.wl_hist)
+            if tt > 0 && minimum(L.wl_hist) >= L.wl_flat * tt / K
+                L.wl_f *= 0.5; L.wl_stages += 1; fill!(L.wl_hist, 0.0)
+                sw = L.wl_f <= f1t                                         # the switch is tested after each halving
+            end
+        end
+        sw |= L.wl_events_left <= 0                                        # budget spent before the switch
+        sw && (L.wl_phase1t = true; L.wl_f = f1t; L.ev_frozen = ev)        # production starts here (η keeps adapting)
+    end
+    L.η .-= L.η[end]
+    return nothing
+end
+
 "Production: residence time dt at the current rung with bare solute energy βu_s (rungs ≥ 2)."
 function ladder_time!(L::CouplingLadder, βu_s::Float64, dt::Float64)
     L.n_ev += 1
@@ -231,6 +280,7 @@ function ladder_time!(L::CouplingLadder, βu_s::Float64, dt::Float64)
     end
     L.res_t += dt; L.pres_t += dt
     L.t_rung[b][k] += dt; L.t2_rung[b][k] += dt * dt
+    L.wl_1t && (L.occ_w[b][k] += dt * exp(-L.η[k]))
     k > 1 && (L.hist[b][k][_lbin(L, βu_s)] += dt)
     return nothing
 end
@@ -261,6 +311,14 @@ end
 function _occupancy_solve(L::CouplingLadder, skip::Int)
     K = nrungs(L)
     s1 = 0.0; sK = 0.0
+    if L.wl_1t                                          # η in force at every event (∫ 1_k e^{−η_k(t)} dt)
+        for b in 1:nblocks(L)
+            b == skip && continue
+            s1 += L.occ_w[b][1]; sK += L.occ_w[b][K]
+        end
+        (s1 > 0 && sK > 0) || return NaN
+        return -log(sK / s1)
+    end
     for b in 1:nblocks(L)
         b == skip && continue
         η = b <= length(L.η_blocks) ? L.η_blocks[b] : L.η
@@ -393,6 +451,6 @@ function ladder_summary(L::CouplingLadder)
     pose_frac = [t[k] > 0 ? pmax[k] / t[k] : NaN for k in 1:K]
     return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_jump=copy(L.n_jump), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
             landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f,
-            adapt_blocks=L.adapt_blocks, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]),
+            adapt_blocks=L.adapt_blocks, wl_1t=L.wl_1t, wl_phase1t=L.wl_phase1t, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]),
             res_frac=res_frac, pose_frac=pose_frac)
 end

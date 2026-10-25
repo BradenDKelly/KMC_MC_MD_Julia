@@ -24,7 +24,7 @@ Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf|ewald|pme)
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
-SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
+SPCE_LADDER_LAMBDA rungs, SPCE_LADDER_NU ν/⟨R⟩_MC, SPCE_LADDER_WL fraction of events for Wang–Landau, SPCE_LADDER_RAMP μ guess in kJ/mol, SPCE_LADDER_ADAPT re-flatten η per block, SPCE_LADDER_WL1T 1/t Wang–Landau, SPCE_LADDER_JUMP λ = 0 hub jumps, SPCE_MC_LOCAL Å radius of local MC-kernel sweeps with SPCE_LAMBDA > 0), SPCE_TRACE (1; 0 drops the per-event solute trace), SPCE_LOCAL (0; 1 = rejection-free local moves of the fractional molecule,
 DESIGN §11.2), SPCE_JUMP_MAX (0; hub limited to rungs 3…m), SPCE_RESERVOIR (mc | ekmc conformer pool), SPCE_TORSION (0; 1 = torsion moves in the conformer pool and the MC stage),
 SPCE_LOCAL_INTERNAL (0; 1 = rejection-free site + torsion slots of the solute with SPCE_LOCAL), SPCE_LOCAL_PHI (torsion slot half-angle in rad, default mc_δθ; π = uniform full rotation), SPCE_SOLVENT_LOCAL (0; 1 = rejection-free local moves of every
 water, SolventLocalMoves, ν = ν_D = the ladder ν). mc_sweeps = 0 runs the
@@ -63,6 +63,7 @@ ladder_νfac = parse(Float64, get(ENV, "SPCE_LADDER_NU", "1.0"))      # ν = fac
 ladder_wlfrac = parse(Float64, get(ENV, "SPCE_LADDER_WL", "0.1"))    # fraction of the events spent on Wang–Landau
 ladder_ramp_kJ = parse(Float64, get(ENV, "SPCE_LADDER_RAMP", "NaN"))  # βμ_guess for the η ramp from this μ (kJ/mol); NaN = MC removal estimate
 ladder_adapt = get(ENV, "SPCE_LADDER_ADAPT", "0") == "1"   # re-flatten η at production block boundaries
+ladder_wl1t = get(ENV, "SPCE_LADDER_WL1T", "0") == "1"    # 1/t Wang–Landau (Belardinelli & Pereyra 2007): η keeps adapting through production
 ladder_jump = get(ENV, "SPCE_LADDER_JUMP", "0") == "1"     # λ = 0 hub: direct jumps 1 ↔ m ≥ 3, no fractional relocation at m ≥ 3 (JOURNAL 56)
 mc_local_A = parse(Float64, get(ENV, "SPCE_MC_LOCAL", "0"))   # Å: MC-kernel sweeps restricted to this radius around the solute (0 = full sweeps)
 local_on = get(ENV, "SPCE_LOCAL", "0") == "1"             # rejection-free local moves of the fractional molecule (DESIGN §11.2)
@@ -263,7 +264,7 @@ function setup_and_mc(io)
                                 bar_species=bar_on ? 2 : 0, ladder_solute=ladder_on ? isol : 0, ladder_lambda=ladder_λ,
                                 ladder_nu=ladder_on ? ladder_νfac * R_mc : NaN, ladder_wl_events=ladder_on ? round(Int, ladder_wlfrac * ekmc_events) : 0,
                                 ladder_eta_ramp=ladder_on ? (isnan(ladder_ramp_kJ) ? log(iw) : ladder_ramp_kJ / kJmol_per_eps / T) : 0.0,   # βμ guess: SPCE_LADDER_RAMP or the MC removal estimator
-                                ladder_adapt_blocks=ladder_adapt, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
+                                ladder_adapt_blocks=ladder_adapt, ladder_wl_1t=ladder_wl1t, mc_local_radius=mc_local_A / m.σ_angstrom, ladder_jump=ladder_jump,
                                 ladder_jump_max=jump_max, ladder_local=local_on, local_internal=internal_on, local_solvent=solvent_local,
                                 solvent_nu=solvent_local ? R_mc : NaN,   # water slots at the unscaled ⟨R⟩ even when SPCE_LADDER_NU boosts the solute
                                 ladder_eta=ladder_eta_fixed, track_dihedrals=(track_dih && flex) ? solute_dihedrals(m.solute) : NTuple{4,Int}[],
