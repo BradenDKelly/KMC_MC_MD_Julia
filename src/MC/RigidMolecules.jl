@@ -2313,6 +2313,31 @@ function update_rigid_ekmc_after_move!(ek::RigidEKMCState, sys::RigidSystem, ff:
 end
 
 """
+    ekmc_relabel_fractional!(ek, β, s, j)
+
+Identity relabelling at λ = 1 (CouplingLadder `relabel_rate`): s becomes a whole molecule and j the fractional one. At
+λ = 1 the stored matrices hold unscaled pair energies for both, so nothing is re-evaluated: the bare row of j is read
+from the matrix, frac_u = φ_j, frac_w = Σ_m w_jm, and the per-molecule rate scales of s and j are exchanged (the ladder's
+c_K goes to j, the species scale to s). Exact, O(N).
+"""
+function ekmc_relabel_fractional!(ek::RigidEKMCState, β::Float64, s::Int, j::Int)
+    (ek.frac == s && s != j && ek.lam[s] == 1.0 && ek.lam[j] == 1.0) ||
+        error("ekmc_relabel_fractional!: needs the fractional molecule $s at λ = 1 and another whole molecule j")
+    N = length(ek.phi)
+    @inbounds for m in 1:N
+        ek.bare_u[m] = ek.pair_u[j, m]; ek.bare_w[m] = ek.pair_w[j, m]
+    end
+    ek.frac = j
+    ek.frac_u = ek.phi[j]; ek.frac_w = ek.wsum[j]          # φ_j includes the image energy e_j (λ = 1)
+    ek.c[s], ek.c[j] = ek.c[j], ek.c[s]
+    ek.m[s] = _mob(ek, β, s); ek.m[j] = _mob(ek, β, j)
+    R = sum(ek.m)
+    ek.R = R
+    (R > 0.0 && isfinite(R)) || error("rigid eKMC: total rate R = $R after relabelling $s → $j")
+    return nothing
+end
+
+"""
     set_fractional_coupling!(ek, β, λ_new)
 
 Change the coupling of the fractional molecule from `ek.lam[frac]` to `λ_new` without moving anything: the scaled
@@ -2700,7 +2725,7 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false,
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false, ladder_relabel_nu::Float64=0.0,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
@@ -2777,11 +2802,17 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         ladder = CouplingLadder(ladder_solute, ladder_lambda, block_events; η=η0, ν=ladder_nu, wl_events=ladder_wl_events,
                                 wl_fmin=ladder_wl_fmin, wl_flat=ladder_wl_flat,
                                 csol=solute_rate_scale(ladder_lambda, ladder_nu, ladder_eta_ramp; frac=ladder_solute_rate_frac),
-                                adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp, wl_1t=ladder_wl_1t,
+                                adapt_blocks=ladder_adapt_blocks, adapt_damp=ladder_adapt_damp, wl_1t=ladder_wl_1t, relabel_ν=ladder_relabel_nu,
                                 jump=ladder_jump, jump_ν=isnan(ladder_jump_nu) ? ladder_nu : ladder_jump_nu,
                                 jump_max=ladder_jump_max > 0 ? ladder_jump_max : length(ladder_lambda))
         ek.frac = ladder_solute; ek.lam[ladder_solute] = 1.0
         ladder_jump && (ek.c[ladder_solute] = ladder.csol[end])     # hub: no relocation at the coupled rung either
+        if ladder_relabel_nu > 0.0                                   # identity relabelling at λ = 1 (CFCMC, `relabel_rate`)
+            bar_species > 0 && error("run_rigid_ekmc!: ladder relabelling is not implemented with the BAR estimator")
+            sys.recip isa PMERecip && error("run_rigid_ekmc!: ladder relabelling is not implemented for the SPME mesh path")
+            ladder.relabel_pool = [i for i in 1:N if sys.tmpl[i] == sys.tmpl[ladder_solute]]
+            length(ladder.relabel_pool) > 1 || error("run_rigid_ekmc!: ladder relabelling needs another molecule of the species")
+        end
         rebuild_rigid_ekmc!(ek, sys, ff)
     end
     # rejection-free local moves of the fractional molecule (DESIGN §11.2): default slots 3 T + 3 R (+ 2 C if flexible),
@@ -2943,8 +2974,8 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         ev += 1; n_full += 1          # n_full counts the states that get a full update (sampling stride for U, P)
         # weight of the current configuration: draw its Δt here and reuse it in the step
         R = ek.R                       # relocation rate Σ exp(βu_i) (the μ observable)
-        w_up = 0.0; w_dn = 0.0; w_hub = 0.0; w_loc = 0.0; w_ref = 0.0
-        ladder === nothing || ((w_up, w_dn) = hop_rates(ladder, sys.β, ek.frac_u); w_hub = hub_rate(ladder, sys.β, ek.frac_u))
+        w_up = 0.0; w_dn = 0.0; w_hub = 0.0; w_rl = 0.0; w_loc = 0.0; w_ref = 0.0
+        ladder === nothing || ((w_up, w_dn) = hop_rates(ladder, sys.β, ek.frac_u); w_hub = hub_rate(ladder, sys.β, ek.frac_u); w_rl = relabel_rate(ladder))
         if lmoves !== nothing && ek.lam[lmoves.mol] > 0.0     # L-moves and the refresh of their candidates (λ > 0 only)
             w_loc = lm_total_rate!(lmoves, sys, ff, sys.β, ek.lam[lmoves.mol], ek.frac_u); w_ref = lmoves.νD
         end
@@ -2952,7 +2983,7 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
         if slmoves !== nothing                                # solvent L-moves and their refreshes
             w_sl = slm_total_rate!(slmoves, ek, sys.β); w_slref = length(slmoves.mols) * slmoves.νD
         end
-        Rtot = R + λ + w_up + w_dn + w_hub + w_loc + w_ref + w_sl + w_slref   # total event rate incl. the MC-kernel event, the rung hops, the λ = 0 hub jumps and the L-moves
+        Rtot = R + λ + w_up + w_dn + w_hub + w_rl + w_loc + w_ref + w_sl + w_slref   # total event rate incl. the MC-kernel event, the rung hops, the λ = 0 hub jumps and the L-moves
         # with a ladder the standard observables are read at the fully coupled rung only, after η is frozen
         coupled_now = ladder === nothing || (coupled(ladder) && ladder_production(ladder))
         ladder_prod = ladder !== nothing && ladder_production(ladder) && ev > burnin_events
@@ -3066,28 +3097,43 @@ function advance_rigid_ekmc!(r::RigidEKMCRun, sys::RigidSystem, ff::SiteForceFie
             end
             ladder.k = knew
             ladder_prod && (ladder.n_jump[knew] += 1)
-        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc
+        elseif ladder !== nothing && ξev < λ + w_up + w_dn + w_hub + w_rl
+            # identity relabelling at λ = 1 (CFCMC, `relabel_rate`): s becomes whole, a uniform other molecule j of its
+            # species becomes fractional; no pose or energy changes, the candidate sets of s and j are redrawn
+            sfr = ladder.solute; pool = ladder.relabel_pool
+            j = sfr
+            while j == sfr; j = pool[rand(sys.rng, eachindex(pool))]; end
+            ekmc_relabel_fractional!(ek, sys.β, sfr, j)
+            ladder.solute = j
+            if lmoves !== nothing
+                lmoves.mol = j
+                lm_refresh!(lmoves, sys, isflexible(sys.templates[sys.tmpl[j]]) ? reservoirs[sys.tmpl[j]] : nothing)
+            end
+            slmoves === nothing || slm_relabel!(slmoves, sys, ff, sfr, j)
+            ladder.n_relabel += 1
+            ladder_prod && ladder_pose_moved!(ladder)
+        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_rl + w_loc
             # L-move of the fractional molecule (DESIGN §11.2): slot chosen ∝ its rate, inverse stored in the slot
             sfr = lmoves.mol
-            jfired = lm_fire!(lmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub))
+            jfired = lm_fire!(lmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub + w_rl))
             lmoves.kinds[jfired] in (LM_C, LM_S, LM_D) && (Uin[sfr] = flex_intra_energy(sys.templates[sys.tmpl[sfr]], ff, sys.body[sfr]))
             slmoves === nothing || slm_moved!(slmoves, sys, ff, sfr)
             if ladder_prod
                 lmoves.n_move_rung[ladder.k] += 1
                 ladder_pose_moved!(ladder)
             end
-        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc + w_ref
+        elseif lmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_rl + w_loc + w_ref
             sfr = lmoves.mol
             lm_refresh!(lmoves, sys, isflexible(sys.templates[sys.tmpl[sfr]]) ? reservoirs[sys.tmpl[sfr]] : nothing)
-        elseif slmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc + w_ref + w_sl
+        elseif slmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_rl + w_loc + w_ref + w_sl
             # solvent L-move (DESIGN §11.2 stage 2)
-            i_mv = slm_fire!(slmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub + w_loc + w_ref))
+            i_mv = slm_fire!(slmoves, sys, ff, ek, ξev - (λ + w_up + w_dn + w_hub + w_rl + w_loc + w_ref))
             # a site or torsion slot changed the mover's conformation: keep the U_intra observable current
             isflexible(sys.templates[sys.tmpl[i_mv]]) && (Uin[i_mv] = flex_intra_energy(sys.templates[sys.tmpl[i_mv]], ff, sys.body[i_mv]))
             if lmoves !== nothing
                 ek.lam[lmoves.mol] > 0.0 ? lm_molecule_moved!(lmoves, sys, ff, i_mv) : (lmoves.stale = true)
             end
-        elseif slmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_loc + w_ref + w_sl + w_slref
+        elseif slmoves !== nothing && ξev < λ + w_up + w_dn + w_hub + w_rl + w_loc + w_ref + w_sl + w_slref
             slm_refresh!(slmoves, sys, ff)
         else
             k = select_by_mobility(ek, sys.rng)
@@ -3331,8 +3377,11 @@ accumulators give `ladder_mu_occupancy` and `ladder_mu_mbar`; `ladder_summary` r
 occupancy estimator uses the η in force in each block; MBAR is η-independent) — for solvents where WL cannot converge
 within its budget (water, JOURNAL entry 45).
 `ladder_wl_1t=true` uses the 1/t Wang–Landau of Belardinelli & Pereyra (Phys. Rev. E 75 (2007) 046701) instead of
-halving-and-freeze: η keeps adapting (f = 1/t) through production, which starts after `ladder_wl_events`
-(`CouplingLadder`, `_wl_update_1t!`).
+halving-and-freeze: η keeps adapting (f = 1/t) through production, which starts at the switch to 1/t (forced at
+`ladder_wl_events`; `CouplingLadder`, `_wl_update_1t!`).
+`ladder_relabel_nu=ν_r > 0` adds the CFCMC identity relabelling at λ = 1 (Shi & Maginn 2007; `relabel_rate`): at rate ν_r the
+fractional molecule becomes whole and a uniformly drawn other molecule of its species becomes fractional (no energy
+change; exact). Host paths only: not with BAR, the SPME mesh path or the device bank.
 `ladder_jump_max=m` limits the hub to rungs 3…m (both directions). `ladder_local=true` adds rejection-free local moves of the
 fractional molecule at every rung with λ > 0 (`LocalMoves`, DESIGN §11.2): `local_kinds` slots (default 3 translations,
 3 rotations, 2 conformer swaps if flexible), half-widths `local_a` (default `mc_δ`) and `local_θ` (default `mc_δθ`),
@@ -3364,7 +3413,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                          bar_species::Int=0, ladder_solute::Int=0, ladder_lambda::Vector{Float64}=LADDER_LAMBDA_DEFAULT,
                          ladder_nu::Float64=NaN, ladder_eta::Union{Nothing,Vector{Float64}}=nothing, ladder_wl_events::Int=0,
                          ladder_wl_fmin::Float64=1e-3, ladder_wl_flat::Float64=0.8, ladder_eta_ramp::Float64=0.0,
-                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false,
+                         ladder_solute_rate_frac::Float64=0.1, ladder_adapt_blocks::Bool=false, ladder_adapt_damp::Float64=1.0, ladder_wl_1t::Bool=false, ladder_relabel_nu::Float64=0.0,
                          mc_local_radius::Float64=0.0, ladder_jump::Bool=false, ladder_jump_nu::Float64=NaN,
                          ladder_jump_max::Int=0, ladder_local::Bool=false, local_kinds::Vector{Int}=Int[],
                          local_a::Float64=NaN, local_θ::Float64=NaN, local_nu::Float64=NaN, local_nuD::Float64=NaN,
@@ -3383,7 +3432,7 @@ function run_rigid_ekmc!(sys::RigidSystem, ff::SiteForceField; events::Int,
                             bar_species=bar_species, ladder_solute=ladder_solute, ladder_lambda=ladder_lambda, ladder_nu=ladder_nu,
                             ladder_eta=ladder_eta, ladder_wl_events=ladder_wl_events, ladder_wl_fmin=ladder_wl_fmin, ladder_wl_flat=ladder_wl_flat,
                             ladder_eta_ramp=ladder_eta_ramp, ladder_solute_rate_frac=ladder_solute_rate_frac,
-                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, ladder_wl_1t=ladder_wl_1t, mc_local_radius=mc_local_radius,
+                            ladder_adapt_blocks=ladder_adapt_blocks, ladder_adapt_damp=ladder_adapt_damp, ladder_wl_1t=ladder_wl_1t, ladder_relabel_nu=ladder_relabel_nu, mc_local_radius=mc_local_radius,
                             ladder_jump=ladder_jump, ladder_jump_nu=ladder_jump_nu, ladder_jump_max=ladder_jump_max,
                             ladder_local=ladder_local, local_kinds=local_kinds, local_a=local_a, local_θ=local_θ,
                             local_nu=local_nu, local_nuD=local_nuD, local_internal=local_internal, local_site_a=local_site_a,

@@ -28,11 +28,12 @@ ckpt = get(ENV, "SPCE_CHECKPOINT", ""); wall = parse(Float64, get(ENV, "SPCE_WAL
 ckpt_every = parse(Float64, get(ENV, "SPCE_CKPT_EVERY", "1800"))
 gro = get(ENV, "MIX_GRO", "/shared/kmc_polyatomic/gromacs_fe/mixtures/$mix/nvt.gro")
 wl_1t = get(ENV, "MIX_LADDER_WL1T", "0") == "1"   # 1/t Wang–Landau (Belardinelli & Pereyra 2007): η keeps adapting through production
+relabel = parse(Float64, get(ENV, "MIX_LADDER_RELABEL", "0"))   # CFCMC identity relabelling at λ = 1, rate = relabel·ν_ladder (0 = off)
 pool_M = parse(Int, get(ENV, "MIX_POOL_M", "20000"))         # conformers per flexible species (20000 as the dilute runs; smaller only for smoke tests)
 coulomb_req = Symbol(get(ENV, "MIX_COULOMB", "rf"))          # rf (ε_rf = ∞) | ewald (α from ewald-rtol 1e-5 at 10 Å) | pme (SPME mesh path)
 coulomb_req in (:rf, :ewald, :pme, :wolf) || error("MIX_COULOMB must be rf, ewald, pme or wolf")   # wolf: α = 0.2/Å (as the dilute runs)
 coulomb = coulomb_req === :pme ? :ewald : coulomb_req
-out = joinpath(outdir, "mix_$(mix)_$(mode)_seed$(seed)$(coulomb_req === :rf ? "" : "_$(coulomb_req)")$(wl_1t ? "_wl1t" : "").txt")
+out = joinpath(outdir, "mix_$(mix)_$(mode)_seed$(seed)$(coulomb_req === :rf ? "" : "_$(coulomb_req)")$(wl_1t ? "_wl1t" : "")$(relabel > 0 ? "_rl" : "").txt")
 
 function setup(io)
     solutes = mix == "mixEW" ? [:ethanol_flex] : [:ethanol_flex, :methanol_itp]
@@ -113,9 +114,9 @@ function setup(io)
         r = MCm.init_rigid_ekmc_run(sys, ff; events=events, sample_every=100, block_events=max(25, events ÷ 25), species_mu=true,
                                     reservoirs=reservoirs, debug_check_every=events ÷ 10, mc_δ=δ, mc_δθ=δθ,
                                     ladder_solute=fr, ladder_nu=30.0 * R_mc, ladder_wl_events=round(Int, 0.35 * events),
-                                    ladder_eta_ramp=βμ_guess, ladder_jump=true, ladder_jump_max=3, ladder_local=true, ladder_wl_1t=wl_1t,
+                                    ladder_eta_ramp=βμ_guess, ladder_jump=true, ladder_jump_max=3, ladder_local=true, ladder_wl_1t=wl_1t, ladder_relabel_nu=relabel * 30.0 * R_mc,
                                     local_internal=MCm.isflexible(m.templates[tmpl[fr]]), local_solvent=true, solvent_flexible=true, solvent_nu=R_mc)
-        println(io, "# ladder: ν = 30·<R/N> = $(30.0 * R_mc), $(wl_1t ? "1/t Wang–Landau (adapting through production), production after" : "WL over") $(round(Int, 0.35 * events)) events, hub ≤ λ_3; solvent L-moves $(length(r.slmoves.mols)) movers × $(r.slmoves.kinds)")
+        println(io, "# ladder: ν = 30·<R/N> = $(30.0 * R_mc), $(wl_1t ? "1/t Wang–Landau (adapting through production), production after" : "WL over") $(round(Int, 0.35 * events)) events, hub ≤ λ_3$(relabel > 0 ? ", identity relabelling at λ = 1 at $(relabel)·ν" : ""); solvent L-moves $(length(r.slmoves.mols)) movers × $(r.slmoves.kinds)")
     end
     flush(io)
     frk = mode == "stock" ? 0 : tmpl[mode == "ladder1" ? 1 : 2]
@@ -141,6 +142,7 @@ function report(io, r, ctx)
         corr = (E_const[k] + ΔU_tail[k]) * kJ
         @printf(io, "RESULT ladder mu_ex %s = MBAR %.3f ± %.3f, occupancy %.3f ± %.3f kJ/mol (GROMACS-comparable); WL stages %d frozen at %d; rung t = %s\n",
                 names[k], mb * kJ + corr, emb * kJ, oc * kJ + corr, eoc * kJ, sm.wl_stages, sm.ev_frozen, join([@sprintf("%.3f", x) for x in sm.frac_rung], " "))
+        L.relabel_ν > 0 && println(io, "# ladder identity relabellings at λ = 1: $(sm.n_relabel)")
     end
     flush(io)
 end

@@ -94,12 +94,17 @@ mutable struct CouplingLadder
     wl_T::Float64                              # kMC time since the start of Wang–Landau
     wl_phase1t::Bool                           # f = K/(ν·wl_T) from here on
     occ_w::Vector{Vector{Float64}}             # per block, per rung: Σ Δt e^{−η_k} with the η in force (wl_1t occupancy)
+    # identity relabelling at the coupled rung (CFCMC, Shi & Maginn 2007): rate relabel_ν, target uniform in relabel_pool
+    relabel_ν::Float64
+    relabel_pool::Vector{Int}                  # the whole molecules of the fractional molecule's species (set by the run)
+    n_relabel::Int
 end
 function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η::Union{Nothing,Vector{Float64}}=nothing,
                         ν::Float64, wl_events::Int=0, wl_f0::Float64=1.0, wl_fmin::Float64=1e-3, wl_flat::Float64=0.8,
                         βu_min::Float64=-150.0, βu_max::Float64=1050.0, dβu::Float64=0.1,
                         csol::Union{Nothing,Vector{Float64}}=nothing, adapt_blocks::Bool=false, adapt_damp::Float64=1.0,
-                        jump::Bool=false, jump_ν::Float64=ν, jump_max::Int=length(λ), wl_1t::Bool=false)
+                        jump::Bool=false, jump_ν::Float64=ν, jump_max::Int=length(λ), wl_1t::Bool=false,
+                        relabel_ν::Float64=0.0)
     K = length(λ)
     K >= 2 || error("CouplingLadder: at least two rungs")
     (λ[1] == 0.0 && λ[end] == 1.0 && issorted(λ) && allunique(λ)) || error("CouplingLadder: λ must increase from 0 to 1")
@@ -109,12 +114,13 @@ function CouplingLadder(solute::Int, λ::Vector{Float64}, block_events::Int; η:
     nb = ceil(Int, (βu_max - βu_min) / dβu)
     3 <= jump_max <= K || error("CouplingLadder: jump_max must be in 3…K")
     (wl_1t && adapt_blocks) && error("CouplingLadder: wl_1t and adapt_blocks are alternative adaptation schemes")
+    relabel_ν >= 0 || error("CouplingLadder: relabel_ν must be ≥ 0")
     CouplingLadder(solute, copy(λ), ηv, K, ν, wl_events > 0 ? wl_f0 : 0.0, wl_fmin, wl_flat, zeros(K), wl_events,
                    0, wl_events > 0 ? 0 : -1, block_events, 0, βu_min, dβu, nb,
                    Vector{Float64}[], Vector{Float64}[], Vector{Vector{Float64}}[], zeros(Int, K), 0, 0,
                    _hub_csol(csol === nothing ? ones(K) : copy(csol), jump), adapt_blocks, adapt_damp, Vector{Float64}[],
                    jump, jump_ν, zeros(Int, K), jump_max, 0, 0.0, zeros(K), 0.0, zeros(K),
-                   wl_1t && wl_events > 0, 0.0, false, Vector{Float64}[])
+                   wl_1t && wl_events > 0, 0.0, false, Vector{Float64}[], relabel_ν, Int[], 0)
 end
 # with the λ = 0 hub the fractional molecule is not relocated at rungs ≥ 3 (it moves through rung 1)
 function _hub_csol(c::Vector{Float64}, jump::Bool)
@@ -139,6 +145,15 @@ coupled(L::CouplingLadder) = L.k == nrungs(L)
 adapting(L::CouplingLadder) = L.wl_f > 0.0
 "Production accumulates: η frozen, or (1/t Wang–Landau) on the 1/t schedule while η keeps adapting."
 ladder_production(L::CouplingLadder) = !adapting(L) || (L.wl_1t && L.wl_phase1t)
+"""
+Rate of the identity relabelling at the coupled rung: the fractional molecule s becomes whole and a whole molecule j of
+the same species, drawn uniformly from the other members of `relabel_pool`, becomes the fractional one (CFCMC: Shi &
+Maginn, J. Chem. Theory Comput. 3 (2007) 1451). At λ_K = 1 the two labellings are the same configuration with the same
+energy and the same η_K, and the rate ν/(n − 1) per target is the same in both directions, so detailed balance holds
+with no energy evaluation. Purpose: the coupled end samples the environments of all n molecules of the species instead
+of one molecule's slowly decorrelating environment (JOURNAL 2026-10-25, the coupled-end gap in dense mixtures).
+"""
+relabel_rate(L::CouplingLadder) = (L.relabel_ν > 0.0 && coupled(L) && length(L.relabel_pool) > 1) ? L.relabel_ν : 0.0
 _lbin(L::CouplingLadder, βu::Float64) = clamp(floor(Int, (βu - L.βu_min) / L.dβu) + 1, 1, L.nbins)
 _lblock(L::CouplingLadder) = (L.n_ev - 1) ÷ L.block_events + 1
 function _ensure_lblock!(L::CouplingLadder, b::Int)
@@ -451,6 +466,6 @@ function ladder_summary(L::CouplingLadder)
     pose_frac = [t[k] > 0 ? pmax[k] / t[k] : NaN for k in 1:K]
     return (t_rung=t, frac_rung=t ./ max(sum(t), eps()), n_hop=copy(L.n_hop), n_jump=copy(L.n_jump), n_recouple=L.n_recouple, n_decouple=L.n_decouple,
             landings=land, η=copy(L.η), wl_stages=L.wl_stages, ev_frozen=L.ev_frozen, wl_f=L.wl_f,
-            adapt_blocks=L.adapt_blocks, wl_1t=L.wl_1t, wl_phase1t=L.wl_phase1t, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]),
+            adapt_blocks=L.adapt_blocks, wl_1t=L.wl_1t, wl_phase1t=L.wl_phase1t, n_relabel=L.n_relabel, η_first=isempty(L.η_blocks) ? copy(L.η) : copy(L.η_blocks[1]),
             res_frac=res_frac, pose_frac=pose_frac)
 end
