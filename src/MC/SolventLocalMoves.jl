@@ -372,15 +372,14 @@ end
 The ladder's identity relabelling at λ = 1 (`relabel_rate`, CouplingLadder.jl): molecule s stops being the fractional one
 and j becomes it. No pose changes. Every mover's split of its candidate energies moves s into the "rest" and j into the
 fractional part: cu += cp[:, s] − cp[:, j], cs = cp[:, j] (and with reciprocal-space Ewald cr_u += F_s − F_j, cr_s = F_j,
-F_m = Σ_k c_k Re[S_cand^* S_m] for every candidate). If j was a mover, s takes its slot with a fresh candidate set drawn as
+F_m = Σ_k c_k Re[S_cand^* S_m] for every candidate; on the SPME mesh path F_m = Q_c·Φ_m, and the pinned potential moves
+to j). If j was a mover, s takes its slot with a fresh candidate set drawn as
 by a refresh (the augmenting candidate variables of the two molecules are redrawn from their own densities, which keeps the
-stationary distribution). Host paths only (the device bank and the SPME mesh path are not implemented: error).
+stationary distribution). With the device bank (`slm_attach_device!`) cp/cu/cs live on the host as well; the new slot's rows are one device launch.
 """
 function slm_relabel!(S::SolventLocalMoves, sys, ff, s::Int, j::Int)
     S.frac == s || error("slm_relabel!: fractional molecule is $(S.frac), not $s")
-    S.dbase > 0 && error("slm_relabel!: not implemented for the device bank")
     R = _has_recip(sys, ff) ? sys.recip : nothing
-    R isa PMERecip && error("slm_relabel!: not implemented for the SPME mesh path")
     K = length(S.kinds)
     own = 0
     if S.pos[j] > 0                                     # j was a mover: s takes its slot
@@ -395,7 +394,27 @@ function slm_relabel!(S::SolventLocalMoves, sys, ff, s::Int, j::Int)
             S.cs[jj, ii] = S.cp[jj, j, ii]
         end
     end
-    if R !== nothing                                    # Fourier split: F_m for every candidate, m = s and j
+    if R isa PMERecip                                   # mesh split: F_m = Q_c·Φ_m for every candidate, m = s and j
+        Φs = pme_pin!(R, sys, s)
+        @inbounds for ii in eachindex(S.mols)
+            ii == own && continue
+            for jj in 1:K
+                S.act[jj, ii] || continue
+                col = (ii - 1) * K + jj
+                S.cr_u[jj, ii] += pme_cand_gather(S.crP, col, Φs, R)
+            end
+        end
+        Φj = pme_mol_potential!(R, sys, j)
+        @inbounds for ii in eachindex(S.mols)
+            ii == own && continue
+            for jj in 1:K
+                S.act[jj, ii] || continue
+                fj = pme_cand_gather(S.crP, (ii - 1) * K + jj, Φj, R)
+                S.cr_u[jj, ii] -= fj; S.cr_s[jj, ii] = fj
+            end
+        end
+        pme_pin!(R, sys, j)
+    elseif R !== nothing                                # Fourier split: F_m for every candidate, m = s and j
         F = Dict{Int,Vector{Float64}}()
         for m in (s, j)
             Sm = Vector{ComplexF64}(view(R.S, :, m))

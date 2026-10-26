@@ -314,7 +314,7 @@ function relabel_now!(r, sys, ff, j, res)
     return s
 end
 
-@testset "Coupling ladder: identity relabelling at λ = 1 is exact bookkeeping (LJ flexible dimers; Ewald water)" begin
+@testset "Coupling ladder: identity relabelling at λ = 1 is exact bookkeeping (LJ flexible dimers, host and device bank; Ewald and SPME water)" begin
     N = 24; T = 1.5; ρ = 0.4; nd = 4
     S = dimer_system(1.0, N, T, ρ, 7; nd=nd)
     ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=5_000)
@@ -335,6 +335,20 @@ end
     @test r.ladder.n_relabel > 20 && r.ek.frac == r.ladder.solute == r.slmoves.frac == r.lmoves.mol
     @test MCm.slm_check!(r.slmoves, sys, S.ff) < 1e-9
     @test relabel_drift(r, sys, S.ff) < 1e-9
+    # device candidate bank (attach_device_pairs! on the KernelAbstractions CPU backend): same system and run
+    sd = deepcopy(S.sys)
+    rd = MCm.init_rigid_ekmc_run(sd, S.ff; events=20_000, sample_every=1, block_events=2_000, species_mu=true,
+                                 reservoirs=[nothing, S.res], ladder_solute=N + 1, ladder_nu=ν, ladder_jump=true,
+                                 ladder_local=true, local_solvent=true, solvent_flexible=true, solvent_nu=ν / N,
+                                 mc_δ=0.15, mc_δθ=0.4, ladder_relabel_nu=5ν, device=:cpu, device_precision=:double)
+    @test rd.slmoves.dbase > 0
+    relabel_now!(rd, sd, S.ff, N + 3, S.res)
+    @test rd.slmoves.pos[N + 1] > 0 && rd.slmoves.pos[N + 3] == 0
+    @test MCm.slm_check!(rd.slmoves, sd, S.ff) < 1e-9
+    MCm.advance_rigid_ekmc!(rd, sd, S.ff; until=20_000)
+    @test rd.ladder.n_relabel > 0 && rd.ek.frac == rd.ladder.solute == rd.slmoves.frac
+    @test MCm.slm_check!(rd.slmoves, sd, S.ff) < 1e-9
+    @test relabel_drift(rd, sd, S.ff) < 1e-9
     # reciprocal-space Ewald (Fourier split cr_u / cr_s of every solvent candidate): SPC/E, ladder on water 1
     Nw = 40; α = MCm.ewald_alpha_for(4.5, 1e-5)
     m = MCm.spce_model(; α_per_angstrom=α, rc_angstrom=4.5, coulomb=:ewald)
@@ -354,6 +368,23 @@ end
     MCm.advance_rigid_ekmc!(rw, sw, m.ff; until=4_000)
     @test MCm.slm_check!(rw.slmoves, sw, m.ff) < 1e-9
     @test relabel_drift(rw, sw, m.ff) < 1e-9
+    # SPME mesh path (split Q_c·Φ_m of every solvent candidate; pinned potential moves to the new fractional molecule)
+    sp = MCm.RigidSystem([m.template], fill(1, Nw), cbrt(Nw / 0.0334) / m.σ_angstrom, m.ϵ_kelvin / 300.0, Xoshiro(3))
+    MCm.random_rigid_system!(sp, m.ff); MCm.attach_pme!(sp, m.ff; K=20, order=4)
+    for _ in 1:30, _ in 1:Nw
+        MCm.mc_translate!(sp, m.ff, rand(sp.rng, 1:Nw), 0.1, st); MCm.mc_rotate!(sp, m.ff, rand(sp.rng, 1:Nw), 0.3, st)
+    end
+    rp = MCm.init_rigid_ekmc_run(sp, m.ff; events=4_000, sample_every=1, block_events=500, ladder_solute=1, ladder_nu=1e-3,
+                                 ladder_jump=true, ladder_local=true, local_solvent=true, solvent_nu=1e-3, mc_δ=0.05, mc_δθ=0.2,
+                                 ladder_relabel_nu=1e-2)
+    relabel_now!(rp, sp, m.ff, 17, nothing)
+    @test rp.slmoves.pos[1] > 0 && rp.slmoves.pos[17] == 0 && sp.recip.pin == 17
+    @test MCm.slm_check!(rp.slmoves, sp, m.ff) < 1e-9
+    @test relabel_drift(rp, sp, m.ff) < 1e-9
+    MCm.advance_rigid_ekmc!(rp, sp, m.ff; until=4_000)
+    @test rp.ladder.n_relabel > 0 && rp.ek.frac == rp.ladder.solute == rp.slmoves.frac
+    @test MCm.slm_check!(rp.slmoves, sp, m.ff) < 1e-9
+    @test relabel_drift(rp, sp, m.ff) < 1e-9
     @test_throws ErrorException MCm.CouplingLadder(1, MCm.LADDER_LAMBDA_DEFAULT, 100; ν=1.0, relabel_ν=-1.0)
 end
 

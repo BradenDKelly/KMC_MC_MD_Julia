@@ -2809,7 +2809,6 @@ function init_rigid_ekmc_run(sys::RigidSystem, ff::SiteForceField; events::Int,
         ladder_jump && (ek.c[ladder_solute] = ladder.csol[end])     # hub: no relocation at the coupled rung either
         if ladder_relabel_nu > 0.0                                   # identity relabelling at λ = 1 (CFCMC, `relabel_rate`)
             bar_species > 0 && error("run_rigid_ekmc!: ladder relabelling is not implemented with the BAR estimator")
-            sys.recip isa PMERecip && error("run_rigid_ekmc!: ladder relabelling is not implemented for the SPME mesh path")
             ladder.relabel_pool = [i for i in 1:N if sys.tmpl[i] == sys.tmpl[ladder_solute]]
             length(ladder.relabel_pool) > 1 || error("run_rigid_ekmc!: ladder relabelling needs another molecule of the species")
         end
@@ -3381,7 +3380,7 @@ halving-and-freeze: η keeps adapting (f = 1/t) through production, which starts
 `ladder_wl_events`; `CouplingLadder`, `_wl_update_1t!`).
 `ladder_relabel_nu=ν_r > 0` adds the CFCMC identity relabelling at λ = 1 (Shi & Maginn 2007; `relabel_rate`): at rate ν_r the
 fractional molecule becomes whole and a uniformly drawn other molecule of its species becomes fractional (no energy
-change; exact). Host paths only: not with BAR, the SPME mesh path or the device bank.
+change; exact). Not with BAR.
 `ladder_jump_max=m` limits the hub to rungs 3…m (both directions). `ladder_local=true` adds rejection-free local moves of the
 fractional molecule at every rung with λ > 0 (`LocalMoves`, DESIGN §11.2): `local_kinds` slots (default 3 translations,
 3 rotations, 2 conformer swaps if flexible), half-widths `local_a` (default `mc_δ`) and `local_θ` (default `mc_δθ`),
