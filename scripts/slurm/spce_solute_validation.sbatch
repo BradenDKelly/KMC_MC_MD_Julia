@@ -24,10 +24,11 @@ N=${N:-500}
 MC_SWEEPS=${MC_SWEEPS:-8000}        # 2000 equilibration + 8000 production sweeps
 EKMC_EVENTS=${EKMC_EVENTS:-100000000}  # stock eKMC events (SPCE_LAMBDA=0 default); a hybrid run needs ~1e5–1e7
 SEED=${SLURM_ARRAY_TASK_ID:-1}
-export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-0}
+# SPCE_ALPHA is passed through only when set: the driver picks α (Wolf 0.20, Ewald/PME from ewald-rtol; JOURNAL 2026-11-06)
+export SPCE_CUTOFF=${SPCE_CUTOFF:-molecule} SPCE_LAMBDA=${SPCE_LAMBDA:-0}
 mkdir -p "$OUT"
 
-echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED alpha=$SPCE_ALPHA cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA start=$(date)"
+echo "host=$(hostname) solute=$SOLUTE N=$N mc_sweeps=$MC_SWEEPS ekmc_events=$EKMC_EVENTS seed=$SEED alpha=${SPCE_ALPHA:-driver} cutoff=$SPCE_CUTOFF lambda=$SPCE_LAMBDA start=$(date)"
 export SPCE_COULOMB=${SPCE_COULOMB:-wolf} SPCE_EPS_RF=${SPCE_EPS_RF:-0}
 cd "$PROJECT" || exit 1
 "$JULIA" -t "${SLURM_CPUS_PER_TASK:-1}" --project="$PROJECT" dev/validate_spce_solute.jl "$SOLUTE" "$N" "$MC_SWEEPS" "$EKMC_EVENTS" "$SEED" "$OUT"

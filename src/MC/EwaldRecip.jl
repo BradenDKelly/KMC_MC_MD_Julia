@@ -163,6 +163,27 @@ function ewald_alpha_for(rc::Float64, rtol::Float64)::Float64
 end
 
 """
+    solute_alpha(coulomb, requested; rc=10.0, rtol=1e-5, override=false) -> α (Å⁻¹)
+
+Splitting parameter of the solute drivers. Ewald and PME (`coulomb === :ewald`) take the GROMACS `ewald-rtol` value
+`ewald_alpha_for(rc, rtol)`: at a fixed real-space cut-off a different α is a different (truncated) model, not the same
+Ewald sum (JOURNAL 2026-11-06: α = 0.2 Å⁻¹ at r_c = 10 Å, inherited from the Wolf default of the chain scripts, bound
+molecules ≈ 1.2 kJ/mol more strongly than GROMACS). A requested α that differs is an error unless `override`. Wolf
+takes the requested α, default 0.20 Å⁻¹.
+"""
+function solute_alpha(coulomb::Symbol, requested::Union{Nothing,Float64}; rc::Float64=10.0, rtol::Float64=1e-5,
+                      override::Bool=false)::Float64
+    if coulomb === :ewald
+        α = ewald_alpha_for(rc, rtol)
+        (requested === nothing || isapprox(requested, α; rtol=1e-6)) && return α
+        override && return requested
+        error("α = $(requested) Å⁻¹ with Ewald/PME differs from the ewald-rtol $(rtol) value $(round(α; digits=5)) Å⁻¹ " *
+              "at r_c = $(rc) Å; set the override (SPCE_ALPHA_OVERRIDE=1) to use it deliberately")
+    end
+    return requested === nothing ? 0.20 : requested
+end
+
+"""
     ewald_n2max_for(L, α, rtol) -> n2max
 
 Spherical reciprocal cut-off balanced with the real-space one (Kolafa & Perram, Mol. Simul. 9 (1992) 351; Frenkel & Smit

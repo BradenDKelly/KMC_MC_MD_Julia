@@ -20,7 +20,7 @@ Chem. B 130 (2026) 4636, Table 1); experiment: methane 8.37 kJ/mol (same table),
 −21.3 kJ/mol (Ben-Naim & Marcus, J. Chem. Phys. 81 (1984) 2016).
 
 Usage: julia --project=. dev/validate_spce_solute.jl solute N mc_sweeps ekmc_events seed outdir
-Env: SPCE_ALPHA (0.20), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf|ewald|pme), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
+Env: SPCE_ALPHA (Wolf 0.20; Ewald/PME from ewald-rtol 1e-5, other values need SPCE_ALPHA_OVERRIDE=1), SPCE_CUTOFF (molecule), SPCE_COULOMB (wolf|rf|ewald|pme), SPCE_LAMBDA (100; λ = fac·⟨R⟩_MC, 0 = pure
 eKMC), SPCE_SOLUTE_SHARE (0.5; share of relocation bursts given to the solute by rate scaling), SPCE_TAG,
 SPCE_CHECKPOINT (path; checkpoint/restart of the eKMC stage for chained jobs), SPCE_WALL_SECONDS (eKMC wall budget
 of one invocation), SPCE_CKPT_EVERY (1800 s between checkpoints), SPCE_BAR (0; 1 = Bennett/landing-Widom on the solute), SPCE_LADDER (0; 1 = coupling ladder on the solute,
@@ -52,8 +52,9 @@ outdir = length(ARGS) >= 6 ? ARGS[6] : joinpath(@__DIR__, "results", "spce_solut
 mkpath(outdir)
 coulomb_req = Symbol(get(ENV, "SPCE_COULOMB", "wolf"))      # wolf | rf | ewald | pme (pme = Ewald real space + SPME mesh path)
 coulomb = coulomb_req === :pme ? :ewald : coulomb_req
-# Ewald (JOURNAL 121): α from GROMACS's ewald-rtol = 1e-5 at rc = 10 Å unless SPCE_ALPHA is given; site cut-off (required)
-α_A = haskey(ENV, "SPCE_ALPHA") ? parse(Float64, ENV["SPCE_ALPHA"]) : coulomb === :ewald ? MCm.ewald_alpha_for(10.0, 1e-5) : 0.20
+# Ewald/PME (JOURNAL 121): α from GROMACS's ewald-rtol = 1e-5 at rc = 10 Å; a different SPCE_ALPHA needs SPCE_ALPHA_OVERRIDE=1; site cut-off (required)
+α_A = MCm.solute_alpha(coulomb, haskey(ENV, "SPCE_ALPHA") ? parse(Float64, ENV["SPCE_ALPHA"]) : nothing;
+                       override=get(ENV, "SPCE_ALPHA_OVERRIDE", "0") == "1")
 cutoff = Symbol(get(ENV, "SPCE_CUTOFF", coulomb === :ewald ? "site" : "molecule"))
 fast_path = get(ENV, "SPCE_FAST_PATH", "0") == "1"            # overlap fast path switch (approximate for weakly bound species; default off)          # wolf | rf (GROMACS reaction field, SPCE_EPS_RF: 0 = ∞)
 ε_rf = (x = parse(Float64, get(ENV, "SPCE_EPS_RF", "0")); x == 0 ? Inf : x)

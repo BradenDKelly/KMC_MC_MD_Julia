@@ -26,7 +26,8 @@ N=${N:-500}
 MC_SWEEPS=${MC_SWEEPS:-4000}
 EKMC_EVENTS=${EKMC_EVENTS:-1000000000}
 SEED=${SLURM_ARRAY_TASK_ID:-1}
-export SPCE_ALPHA=${SPCE_ALPHA:-0.20} SPCE_CUTOFF=${SPCE_CUTOFF:-site} SPCE_LAMBDA=${SPCE_LAMBDA:-0}
+# SPCE_ALPHA is passed through only when set: the driver picks α (Wolf 0.20, Ewald/PME from ewald-rtol; JOURNAL 2026-11-06)
+export SPCE_CUTOFF=${SPCE_CUTOFF:-site} SPCE_LAMBDA=${SPCE_LAMBDA:-0}
 export SPCE_COULOMB=${SPCE_COULOMB:-rf} SPCE_EPS_RF=${SPCE_EPS_RF:-0} SPCE_TRACE=${SPCE_TRACE:-0}
 # eKMC budget per piece: 4 h minus 30 min for Julia start-up, the first piece's reservoir + MC (~6 min) and the checkpoint
 export SPCE_WALL_SECONDS=${SPCE_WALL_SECONDS:-12600}
