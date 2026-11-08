@@ -7,20 +7,21 @@ const MCm = MolSim.MC
 
 within3σ(a, ea, c, ec) = abs(a - c) <= 3 * sqrt(ea^2 + ec^2)
 
-function dimer_system(ε_s, N, T, ρ, seed)
+function dimer_system(ε_s, N, T, ρ, seed; nd::Int=1)
     sites = zeros(3, 2); sites[1, 1] = -0.3; sites[1, 2] = 0.3
     solv = MCm.RigidTemplate("LJ2", sites, [1, 1], [0.0, 0.0], [1.0, 1.0])
     bt = MCm.BondedTerms(2; bonds=[MCm.HarmonicBond(1, 2, 0.6, 400.0)])
     dimer = MCm.RigidTemplate("flexdimer", sites, [2, 2], [0.0, 0.0], [1.0, 1.0]; bonded=bt)
     ff = MCm.SiteForceField([1.0, 1.1], [1.0, ε_s]; rc=2.5, coulomb=:none)
-    β = 1 / T; L = cbrt(N / ρ); Nt = N + 1
+    β = 1 / T; L = cbrt(N / ρ); Nt = N + nd
     res = MCm.build_reservoir([solv, dimer], 2, ff, β, Xoshiro(3); M=5000, burnin_sweeps=500, stride_sweeps=10, δ=0.05)
-    sys = MCm.RigidSystem([solv, dimer], vcat(fill(1, N), 2), L, β, Xoshiro(seed)); MCm.random_rigid_system!(sys, ff)
+    sys = MCm.RigidSystem([solv, dimer], vcat(fill(1, N), fill(2, nd)), L, β, Xoshiro(seed)); MCm.random_rigid_system!(sys, ff)
     MCm.minimize_rigid!(sys, ff; nsteps=200)
     st = MCm.RigidMCStats()
     for _ in 1:300, _ in 1:Nt
         MCm.mc_translate!(sys, ff, rand(sys.rng, 1:Nt), 0.15, st); MCm.mc_rotate!(sys, ff, rand(sys.rng, 1:Nt), 0.4, st)
-        MCm.mc_site_move!(sys, ff, Nt, 0.05, st); MCm.mc_conformer_swap!(sys, ff, Nt, res, st)
+        d = nd == 1 ? Nt : rand(sys.rng, N+1:Nt)                # nd = 1: the stream of the single-solute tests unchanged
+        MCm.mc_site_move!(sys, ff, d, 0.05, st); MCm.mc_conformer_swap!(sys, ff, d, res, st)
     end
     return (; solv, dimer, ff, res, sys, L, β, Nt)
 end
@@ -231,6 +232,179 @@ end
     μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T); μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
     @info "ladder + hub + L-moves + solvent L-moves (ε_s = 2)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb lad.slmoves.n_move lad.lmoves.n_move sm.frac_rung
     @test sum(lad.slmoves.n_move) > 1000 && all(sm.t_rung .> 0)
+    @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+    @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+    @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+end
+
+@testset "Coupling ladder: 1/t Wang–Landau schedule (Belardinelli & Pereyra 2007)" begin
+    λ = MCm.LADDER_LAMBDA_DEFAULT; K = length(λ)
+    # switch at a halving: flat visits with dt = 1; the flatness check at event 1000 halves f to 0.5, and with
+    # ν = 0.002 the 1/t value is K/(ν T) = 10/(0.002·1000) = 5 ≥ 0.5, so the run switches to f = 1/t there
+    ν = 0.002
+    L = MCm.CouplingLadder(1, λ, 100; ν=ν, wl_events=2000, wl_1t=true)
+    @test L.wl_1t && L.wl_f == 1.0 && !MCm.ladder_production(L)
+    for ev in 1:999
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test !L.wl_phase1t && L.wl_f == 1.0 && L.η[end] == 0.0
+    MCm.wl_update!(L, 1000, 1.0, 10)
+    @test L.wl_phase1t && L.wl_stages == 1 && L.wl_f ≈ K / (ν * 1000.0)
+    @test MCm.ladder_production(L) && MCm.adapting(L) && L.ev_frozen == 1000     # production starts at the switch, η keeps adapting
+    for ev in 1001:1999
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test L.wl_f ≈ K / (ν * 1999.0) && MCm.ladder_production(L)
+    for ev in 2000:2001                                                         # past the budget: unchanged schedule, no freeze
+        MCm.wl_update!(L, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test L.wl_f ≈ K / (ν * 2001.0) && MCm.adapting(L) && L.ev_frozen == 1000
+    # no halving before the budget: f = 1/t from the budget on
+    L2 = MCm.CouplingLadder(1, λ, 100; ν=2.0, wl_events=50, wl_1t=true)
+    for ev in 1:49
+        MCm.wl_update!(L2, ev, 1.0, (ev - 1) % K + 1)
+    end
+    @test !L2.wl_phase1t && L2.wl_f == 1.0 && !MCm.ladder_production(L2)
+    MCm.wl_update!(L2, 50, 1.0, 10)
+    @test L2.wl_phase1t && L2.wl_f ≈ K / (2.0 * 50.0) && MCm.ladder_production(L2) && L2.ev_frozen == 50
+    @test_throws ErrorException MCm.CouplingLadder(1, λ, 100; ν=2.0, wl_events=50, wl_1t=true, adapt_blocks=true)
+end
+
+@testset "Coupling ladder: 1/t Wang–Landau adapting through production; μ (occupancy, MBAR) = stock" begin
+    N = 32; T = 1.5; ρ = 0.4
+    S = dimer_system(1.0, N, T, ρ, 11)
+    events = 2_000_000
+    stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                                reservoirs=[nothing, S.res])
+    r2 = stock.RN_species[2]
+    μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+    K = length(MCm.LADDER_LAMBDA_DEFAULT)
+    # start from flat η = 0 (far from the converged weights) so the adaptation has work to do
+    lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                              reservoirs=[nothing, S.res], ladder_solute=S.Nt, ladder_nu=ν, ladder_wl_events=events ÷ 4,
+                              ladder_eta=zeros(K), ladder_wl_1t=true, debug_check_every=events ÷ 4)
+    Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+    @test Ld.wl_phase1t && MCm.adapting(Ld) && Ld.wl_f ≈ K / (Ld.ν * Ld.wl_T)    # still adapting at the end, on the 1/t schedule
+    @test Ld.ev_frozen > 0 && MCm.nblocks(Ld) >= 15 && all(sm.t_rung .> 0)
+    μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T)
+    μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+    @info "ladder 1/t Wang–Landau (easy solute, η₀ = 0)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb sm.frac_rung sm.η sm.wl_stages Ld.wl_f
+    @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
+    @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
+    @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
+end
+
+# ---- identity relabelling at λ = 1 (CFCMC, Shi & Maginn 2007; CouplingLadder `relabel_rate`) ----
+# exactness: after a relabel the incremental state equals a full rebuild (φ, pair matrix, bare row, R; solvent L-move
+# candidate splits cu/cs and, with Ewald, cr_u/cr_s), immediately and after a run with frequent relabels
+function relabel_drift(r, sys, ff)
+    ek = r.ek
+    φ = copy(ek.phi); P = copy(ek.pair_u); fu = ek.frac_u; bu = copy(ek.bare_u); R = ek.R; c = copy(ek.c)
+    MCm.rebuild_rigid_ekmc!(ek, sys, ff)
+    @test ek.c == c
+    return max(maximum(abs.(φ .- ek.phi)), maximum(abs.(P .- ek.pair_u)), abs(fu - ek.frac_u), maximum(abs.(bu .- ek.bare_u)),
+               abs(R - ek.R) / ek.R)
+end
+function relabel_now!(r, sys, ff, j, res)
+    s = r.ladder.solute
+    MCm.ekmc_relabel_fractional!(r.ek, sys.β, s, j); r.ladder.solute = j
+    r.lmoves === nothing || (r.lmoves.mol = j; MCm.lm_refresh!(r.lmoves, sys, res))
+    r.slmoves === nothing || MCm.slm_relabel!(r.slmoves, sys, ff, s, j)
+    return s
+end
+
+@testset "Coupling ladder: identity relabelling at λ = 1 is exact bookkeeping (LJ flexible dimers, host and device bank; Ewald and SPME water)" begin
+    N = 24; T = 1.5; ρ = 0.4; nd = 4
+    S = dimer_system(1.0, N, T, ρ, 7; nd=nd)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=5_000)
+    sys = deepcopy(S.sys)
+    r = MCm.init_rigid_ekmc_run(sys, S.ff; events=50_000, sample_every=1, block_events=2_000, species_mu=true,
+                                reservoirs=[nothing, S.res], ladder_solute=N + 1, ladder_nu=ν, ladder_jump=true,
+                                ladder_local=true, local_solvent=true, solvent_flexible=true, solvent_nu=ν / N,
+                                mc_δ=0.15, mc_δθ=0.4, ladder_relabel_nu=5ν)
+    @test r.ladder.relabel_pool == collect(N+1:N+nd) && MCm.coupled(r.ladder) && MCm.relabel_rate(r.ladder) == 5ν
+    c_frac = r.ek.c[N + 1]; c_whole = r.ek.c[N + 3]
+    s = relabel_now!(r, sys, S.ff, N + 3, S.res)
+    @test s == N + 1 && r.ek.frac == N + 3 && r.slmoves.frac == N + 3 && r.lmoves.mol == N + 3
+    @test r.slmoves.pos[N + 1] > 0 && r.slmoves.pos[N + 3] == 0 && r.ek.c[N + 3] == c_frac && r.ek.c[N + 1] == c_whole
+    @test r.ek.frac_u ≈ r.ek.phi[N + 3] rtol = 1e-14
+    @test MCm.slm_check!(r.slmoves, sys, S.ff) < 1e-9
+    @test relabel_drift(r, sys, S.ff) < 1e-10
+    MCm.advance_rigid_ekmc!(r, sys, S.ff; until=50_000)
+    @test r.ladder.n_relabel > 20 && r.ek.frac == r.ladder.solute == r.slmoves.frac == r.lmoves.mol
+    @test MCm.slm_check!(r.slmoves, sys, S.ff) < 1e-9
+    @test relabel_drift(r, sys, S.ff) < 1e-9
+    # device candidate bank (attach_device_pairs! on the KernelAbstractions CPU backend): same system and run
+    sd = deepcopy(S.sys)
+    rd = MCm.init_rigid_ekmc_run(sd, S.ff; events=20_000, sample_every=1, block_events=2_000, species_mu=true,
+                                 reservoirs=[nothing, S.res], ladder_solute=N + 1, ladder_nu=ν, ladder_jump=true,
+                                 ladder_local=true, local_solvent=true, solvent_flexible=true, solvent_nu=ν / N,
+                                 mc_δ=0.15, mc_δθ=0.4, ladder_relabel_nu=5ν, device=:cpu, device_precision=:double)
+    @test rd.slmoves.dbase > 0
+    relabel_now!(rd, sd, S.ff, N + 3, S.res)
+    @test rd.slmoves.pos[N + 1] > 0 && rd.slmoves.pos[N + 3] == 0
+    @test MCm.slm_check!(rd.slmoves, sd, S.ff) < 1e-9
+    MCm.advance_rigid_ekmc!(rd, sd, S.ff; until=20_000)
+    @test rd.ladder.n_relabel > 0 && rd.ek.frac == rd.ladder.solute == rd.slmoves.frac
+    @test MCm.slm_check!(rd.slmoves, sd, S.ff) < 1e-9
+    @test relabel_drift(rd, sd, S.ff) < 1e-9
+    # reciprocal-space Ewald (Fourier split cr_u / cr_s of every solvent candidate): SPC/E, ladder on water 1
+    Nw = 40; α = MCm.ewald_alpha_for(4.5, 1e-5)
+    m = MCm.spce_model(; α_per_angstrom=α, rc_angstrom=4.5, coulomb=:ewald)
+    sw = MCm.RigidSystem([m.template], fill(1, Nw), cbrt(Nw / 0.0334) / m.σ_angstrom, m.ϵ_kelvin / 300.0, Xoshiro(3))
+    MCm.random_rigid_system!(sw, m.ff); MCm.attach_ewald!(sw, m.ff; rtol=1e-5, precision=:double)
+    st = MCm.RigidMCStats()
+    for _ in 1:30, _ in 1:Nw
+        MCm.mc_translate!(sw, m.ff, rand(sw.rng, 1:Nw), 0.1, st); MCm.mc_rotate!(sw, m.ff, rand(sw.rng, 1:Nw), 0.3, st)
+    end
+    rw = MCm.init_rigid_ekmc_run(sw, m.ff; events=4_000, sample_every=1, block_events=500, ladder_solute=1, ladder_nu=1e-3,
+                                 ladder_jump=true, ladder_local=true, local_solvent=true, solvent_nu=1e-3, mc_δ=0.05, mc_δθ=0.2,
+                                 ladder_relabel_nu=1e-2)
+    relabel_now!(rw, sw, m.ff, 17, nothing)
+    @test rw.slmoves.pos[1] > 0 && rw.slmoves.pos[17] == 0
+    @test MCm.slm_check!(rw.slmoves, sw, m.ff) < 1e-9
+    @test relabel_drift(rw, sw, m.ff) < 1e-9
+    MCm.advance_rigid_ekmc!(rw, sw, m.ff; until=4_000)
+    @test MCm.slm_check!(rw.slmoves, sw, m.ff) < 1e-9
+    @test relabel_drift(rw, sw, m.ff) < 1e-9
+    # SPME mesh path (split Q_c·Φ_m of every solvent candidate; pinned potential moves to the new fractional molecule)
+    sp = MCm.RigidSystem([m.template], fill(1, Nw), cbrt(Nw / 0.0334) / m.σ_angstrom, m.ϵ_kelvin / 300.0, Xoshiro(3))
+    MCm.random_rigid_system!(sp, m.ff); MCm.attach_pme!(sp, m.ff; K=20, order=4)
+    for _ in 1:30, _ in 1:Nw
+        MCm.mc_translate!(sp, m.ff, rand(sp.rng, 1:Nw), 0.1, st); MCm.mc_rotate!(sp, m.ff, rand(sp.rng, 1:Nw), 0.3, st)
+    end
+    rp = MCm.init_rigid_ekmc_run(sp, m.ff; events=4_000, sample_every=1, block_events=500, ladder_solute=1, ladder_nu=1e-3,
+                                 ladder_jump=true, ladder_local=true, local_solvent=true, solvent_nu=1e-3, mc_δ=0.05, mc_δθ=0.2,
+                                 ladder_relabel_nu=1e-2)
+    relabel_now!(rp, sp, m.ff, 17, nothing)
+    @test rp.slmoves.pos[1] > 0 && rp.slmoves.pos[17] == 0 && sp.recip.pin == 17
+    @test MCm.slm_check!(rp.slmoves, sp, m.ff) < 1e-9
+    @test relabel_drift(rp, sp, m.ff) < 1e-9
+    MCm.advance_rigid_ekmc!(rp, sp, m.ff; until=4_000)
+    @test rp.ladder.n_relabel > 0 && rp.ek.frac == rp.ladder.solute == rp.slmoves.frac
+    @test MCm.slm_check!(rp.slmoves, sp, m.ff) < 1e-9
+    @test relabel_drift(rp, sp, m.ff) < 1e-9
+    @test_throws ErrorException MCm.CouplingLadder(1, MCm.LADDER_LAMBDA_DEFAULT, 100; ν=1.0, relabel_ν=-1.0)
+end
+
+@testset "Coupling ladder + hub + L-moves + identity relabelling (4 flexible dimers): μ = stock, U = stock" begin
+    N = 32; T = 1.5; ρ = 0.4; nd = 4
+    S = dimer_system(1.0, N, T, ρ, 11; nd=nd)
+    events = 1_000_000
+    stock = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=2 * events, sample_every=1, block_events=events ÷ 12, species_mu=true,
+                                reservoirs=[nothing, S.res])
+    r2 = stock.RN_species[2]
+    μ_st, eμ_st = T * log(MCm.ratio_mean(r2)), T * MCm.ratio_jackknife_stderr(r2; f=log)
+    ν = MCm.estimate_relocation_rate(deepcopy(S.sys), S.ff; events=20_000)
+    lad = MCm.run_rigid_ekmc!(deepcopy(S.sys), S.ff; events=events, sample_every=1, block_events=events ÷ 25, species_mu=true,
+                              reservoirs=[nothing, S.res], ladder_solute=N + 1, ladder_nu=ν, ladder_wl_events=events ÷ 3,
+                              ladder_eta_ramp=μ_st / T, ladder_jump=true, ladder_local=true, local_solvent=true, solvent_flexible=true,
+                              solvent_nu=ν / N, mc_δ=0.15, mc_δθ=0.4, ladder_relabel_nu=ν, debug_check_every=events ÷ 4)
+    Ld = lad.ladder; sm = MCm.ladder_summary(Ld)
+    μ_oc, eμ_oc = MCm.ladder_mu_occupancy(Ld, T); μ_mb, eμ_mb = MCm.ladder_mu_mbar(Ld, T)
+    @info "ladder + hub + L-moves + relabelling (4 dimers)" μ_st eμ_st μ_oc eμ_oc μ_mb eμ_mb sm.n_relabel sm.frac_rung
+    @test sm.n_relabel > 1000 && all(sm.t_rung .> 0)
     @test within3σ(μ_oc, eμ_oc, μ_st, eμ_st)
     @test within3σ(μ_mb, eμ_mb, μ_st, eμ_st)
     @test within3σ(MCm.mean(lad.U), MCm.stderr(lad.U), MCm.mean(stock.U), MCm.stderr(stock.U))
